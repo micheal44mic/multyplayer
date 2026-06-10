@@ -114,6 +114,7 @@ export class StampCache {
     /** @type {Map<number, Stamp>} */
     this.map = new Map();
     this.max = maxEntries;
+    this.bytes = 0; // i formati giganti hanno maschere da MB: bound anche in byte
     this.heap = heap;
     this.generated = 0; // contatore per HUD
   }
@@ -144,11 +145,14 @@ export class StampCache {
     this.generated++;
 
     this.map.set(key, s);
-    if (this.map.size > this.max) {
-      // evict del meno recente (primo della Map); lo slot wasm torna libero
+    this.bytes += s.size * s.size;
+    // evict dei meno recenti (primi della Map); lo slot wasm torna libero.
+    // Bound per entry E per byte: l'entry appena inserita è l'ultima, mai evicted.
+    while (this.map.size > 1 && (this.map.size > this.max || this.bytes > (96 << 20))) {
       const oldest = this.map.keys().next().value;
       const old = this.map.get(oldest);
       this.map.delete(oldest);
+      this.bytes -= old.size * old.size;
       if (this.heap && old.ptr) this.heap.free(old.ptr, old.size * old.size);
     }
     return s;
@@ -161,6 +165,7 @@ export class StampCache {
       }
     }
     this.map.clear();
+    this.bytes = 0;
   }
 
   // memory.grow ha staccato il buffer wasm: rigenera le viste delle maschere.

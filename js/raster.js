@@ -81,6 +81,7 @@ export class Rasterizer {
     // LRU bounded; ver/sig invalidano quando cambiano texture o parametri.
     /** @type {Map<number, {ver: number, lum: Uint8Array, lumPtr: number, rgbx: Uint8Array|null, rgbxPtr: number}>} */
     this._tiles = new Map();
+    this._tileCap = 48;      // dimensionata sul pennello in beginStroke
     this._texVer = 0;
     this._texSig = '';
     this._tileLevel = 0;     // livello mip della grana ancorata (per stroke)
@@ -90,6 +91,7 @@ export class Rasterizer {
     // stamp -> bake per stamp (LRU), poi il dab texturizzato è un dab normale.
     /** @type {Map<import('./brush.js').Stamp, {ver: number, mask: Uint8Array, ptr: number, rgb: Uint8Array|null}>} */
     this._baked = new Map();
+    this._bakedBytes = 0; // i formati giganti hanno maschere da MB: bound in byte
     // strumentazione per l'HUD: tempo speso nel lavoro texture (fill di tile
     // e bake di maschere) nell'ultimo run
     this.lastTexMs = 0;
@@ -168,6 +170,10 @@ export class Rasterizer {
       const sig = `${texTag(snap.tex)}|${snap.texMoving ? 'm' : this._tileLevel}|${snap.texScale}|` +
         `${fnv(snap.texLut)}|${snap.texColorLut ? fnv(snap.texColorLut) : 0}`;
       if (sig !== this._texSig) { this._texSig = sig; this._texVer++; }
+      // la cache dei tile deve contenere almeno l'impronta del pennello (un
+      // dab gigante tocca ~(diam/256+2)² chunk) con margine di avanzamento
+      const cols = Math.ceil(snap.diam / CHUNK) + 2;
+      this._tileCap = Math.max(48, cols * cols * 2);
     }
   }
 
@@ -199,7 +205,7 @@ export class Rasterizer {
       }
     }
     this._tiles.set(chunk.key, t);
-    if (this._tiles.size > 48) {
+    while (this._tiles.size > this._tileCap) {
       const k = this._tiles.keys().next().value;
       const old = this._tiles.get(k);
       this._tiles.delete(k);
@@ -268,10 +274,11 @@ export class Rasterizer {
       this._baked.delete(stamp);
     } else {
       b = { ver: 0, mask: new Uint8Array(stamp.size * stamp.size), ptr: 0, rgb: null };
+      this._bakedBytes += stamp.size * stamp.size;
     }
     const t0 = performance.now();
     const n = stamp.size * stamp.size;
-    if (needRgb && b.rgb === null) b.rgb = new Uint8Array(n * 3);
+    if (needRgb && b.rgb === null) { b.rgb = new Uint8Array(n * 3); this._bakedBytes += n * 3; }
     this._textureMask(stamp.mask, b.mask, stamp.size, 0, 0, needRgb ? b.rgb : null);
     b.ver = this._texVer;
     if (this.heap) {
@@ -279,10 +286,12 @@ export class Rasterizer {
       this.heap.u8(b.ptr, n).set(b.mask);
     }
     this._baked.set(stamp, b);
-    if (this._baked.size > 64) {
+    // bound per entry E per byte (l'entry appena inserita è l'ultima: mai evicted)
+    while (this._baked.size > 1 && (this._baked.size > 64 || this._bakedBytes > (64 << 20))) {
       const k = this._baked.keys().next().value;
       const old = this._baked.get(k);
       this._baked.delete(k);
+      this._bakedBytes -= old.mask.length + (old.rgb ? old.rgb.length : 0);
       if (this.heap && old.ptr) this.heap.free(old.ptr, old.mask.length);
     }
     this._tileFillPx += n;

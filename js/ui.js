@@ -36,10 +36,45 @@ const BRUSH_DEFAULTS = (() => {
  * @property {(v: number) => void} [set]
  * @property {(v: number) => string} [fmt]
  * @property {boolean} [log]
+ * @property {(v: number) => number} [snap] quantizza il valore dello slider
+ * @property {(cur: number, dir: number) => number} [stepFn] passo custom per stepper/scorciatoie
  * @property {() => boolean} [dep]
  * @property {HTMLInputElement} [_input]
  * @property {() => void} [_refresh]
  */
+
+// Dimensione pennello: continua fino a 500 px, poi tappe fisse per i formati
+// giganti (sfondi). 500 è inclusa così appena oltre il limite continuo lo
+// slider non salta subito a 1000.
+const SIZE_STOPS = [500, 1000, 1200, 1600, 2000];
+const SIZE_MAX = 2000;
+
+/** Snap: sotto 500 libero, sopra alla tappa più vicina (in scala log, come lo slider). @param {number} v */
+function snapSize(v) {
+  if (v <= 500) return v;
+  let best = SIZE_MAX, bd = Infinity;
+  for (const s of SIZE_STOPS) {
+    const d = Math.abs(Math.log(v / s));
+    if (d < bd) { bd = d; best = s; }
+  }
+  return best;
+}
+
+/** Passo relativo (stepper e tasti [ ]): ~10% sotto 500, di tappa in tappa sopra. @param {number} cur @param {number} dir */
+function stepSize(cur, dir) {
+  if (dir > 0) {
+    if (cur >= 500) {
+      for (const s of SIZE_STOPS) if (s > cur) return s;
+      return SIZE_MAX;
+    }
+    return Math.min(500, Math.max(cur + 1, Math.round(cur * 1.1)));
+  }
+  if (cur > 500) {
+    for (let i = SIZE_STOPS.length - 1; i >= 0; i--) if (SIZE_STOPS[i] < cur) return SIZE_STOPS[i];
+    return 500;
+  }
+  return Math.max(1, Math.min(cur - 1, Math.round(cur / 1.1)));
+}
 
 // Icone delle tab (path 24x24, fill currentColor).
 const ICONS = {
@@ -56,7 +91,7 @@ const ICONS = {
 /** @type {{id: string, label: string, icon: string, rows: RowDef[]}[]} */
 const TABS = [
   { id: 'base', label: 'Base', icon: ICONS.base, rows: [
-    { id: 'size', label: 'Dimensione', min: 1, max: 512, step: 1, get: () => brush.size, set: v => brush.size = v, fmt: v => v + ' px', log: true },
+    { id: 'size', label: 'Dimensione', min: 1, max: SIZE_MAX, step: 1, get: () => brush.size, set: v => brush.size = v, fmt: v => v + ' px', log: true, snap: snapSize, stepFn: stepSize },
     { id: 'opacity', label: 'Opacità', min: 1, max: 100, step: 1, get: () => brush.opacity * 100, set: v => brush.opacity = v / 100, fmt: v => v + '%' },
     { id: 'soft', label: 'Morbidezza', min: 0, max: 100, step: 1, get: () => (1 - brush.hardness) * 100, set: v => brush.hardness = 1 - v / 100, fmt: v => v + '%' },
     { id: 'smooth', label: 'Stabilizzazione', min: 0, max: 100, step: 1, get: () => brush.smoothing * 100, set: v => brush.smoothing = v / 100, fmt: v => v + '%' },
@@ -377,23 +412,34 @@ export class UI {
       input.value = String(def.get());
     }
     const refresh = () => {
-      const v = def.log ? Math.exp(parseFloat(input.value)) : parseFloat(input.value);
+      let v = def.log ? Math.exp(parseFloat(input.value)) : parseFloat(input.value);
+      if (def.snap) v = def.snap(v);
       val.textContent = def.fmt(def.step >= 1 ? Math.round(v) : v);
     };
     input.addEventListener('input', () => {
       let v = def.log ? Math.exp(parseFloat(input.value)) : parseFloat(input.value);
+      if (def.snap) v = def.snap(v);
       if (def.step >= 1) v = Math.round(v);
       def.set(clamp(v, def.min, def.max));
       refresh();
       this._settingChanged();
     });
+    // con lo snap il cursore si allinea alla tappa a fine drag
+    if (def.snap) {
+      input.addEventListener('change', () => {
+        input.value = String(def.log ? Math.log(def.get()) : def.get());
+      });
+    }
     refresh();
 
-    // stepper -/+ (passo singolo; per i log almeno uno step, ~10% altrimenti)
+    // stepper -/+ (passo singolo; per i log almeno uno step, ~10% altrimenti;
+    // stepFn: passo custom, es. le tappe dei formati giganti)
     /** @param {number} dir */
     const stepBy = (dir) => {
       let v;
-      if (def.log) {
+      if (def.stepFn) {
+        v = def.stepFn(def.get(), dir);
+      } else if (def.log) {
         const cur = def.get();
         const raw = dir > 0 ? cur * 1.1 : cur / 1.1;
         v = dir > 0 ? Math.max(cur + def.step, raw) : Math.min(cur - def.step, raw);
@@ -545,8 +591,8 @@ export class UI {
       else if (k === 'escape') this.toggleStudio(false);
       else if (k === '`' || k === '\\') app.hud.toggle();
       else if (k === '0') app.camera.reset();
-      else if (k === '[') { brush.size = clamp(Math.round(brush.size / 1.15), 1, 512); this.syncSliders(); this._settingChanged(); }
-      else if (k === ']') { brush.size = clamp(Math.round(brush.size * 1.15) , 1, 512); this.syncSliders(); this._settingChanged(); }
+      else if (k === '[') { brush.size = stepSize(brush.size, -1); this.syncSliders(); this._settingChanged(); }
+      else if (k === ']') { brush.size = stepSize(brush.size, 1); this.syncSliders(); this._settingChanged(); }
       else if (k === '+' || k === '=') app.camera.zoomAt(app.camera.w / 2, app.camera.h / 2, 1.25);
       else if (k === '-') app.camera.zoomAt(app.camera.w / 2, app.camera.h / 2, 0.8);
     });
