@@ -190,22 +190,17 @@ export class ChunkStore {
 
 // Itera i chunk che intersecano il bbox mondo [x0,y0]..[x1,y1] (px, inclusivo).
 // cb(chunk, rettangolo locale nel chunk: lx0, ly0, lx1, ly1, origine mondo del chunk)
-// clip: se presente, solo i chunk con chiave nel set (pass finale del taper:
-// si riscrive la sola punta; il check precede getOrCreate, fuori dal clip non
-// si crea nulla).
 /**
  * @param {ChunkStore} store
  * @param {number} x0 @param {number} y0 @param {number} x1 @param {number} y1
  * @param {boolean} create
  * @param {(chunk: Chunk, lx0: number, ly0: number, lx1: number, ly1: number, ox: number, oy: number) => void} cb
- * @param {Set<number>|null} [clip]
  */
-export function forEachChunkInRect(store, x0, y0, x1, y1, create, cb, clip = null) {
+export function forEachChunkInRect(store, x0, y0, x1, y1, create, cb) {
   const cx0 = x0 >> CHUNK_SHIFT, cy0 = y0 >> CHUNK_SHIFT;
   const cx1 = x1 >> CHUNK_SHIFT, cy1 = y1 >> CHUNK_SHIFT;
   for (let cy = cy0; cy <= cy1; cy++) {
     for (let cx = cx0; cx <= cx1; cx++) {
-      if (clip !== null && !clip.has(chunkKey(cx, cy))) continue;
       const chunk = create ? store.getOrCreate(cx, cy) : store.get(cx, cy);
       if (!chunk) continue;
       const ox = cx << CHUNK_SHIFT, oy = cy << CHUNK_SHIFT;

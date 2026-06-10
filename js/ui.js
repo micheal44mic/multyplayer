@@ -134,13 +134,6 @@ const TABS = [
     { id: 'jsat', label: 'Jitter saturazione', min: 0, max: 100, step: 1, get: () => brush.jitterSat * 100, set: v => brush.jitterSat = v / 100, fmt: v => v + '%' },
   ] },
   { id: 'more', label: 'Altro', icon: ICONS.more, rows: [
-    // Dinamica ibis-style: % dello spessore base agli estremi del tratto.
-    // La lunghezza della punta dipende dalla velocità (tratto lento = estremi
-    // tondi, frustata = punte lunghe); vedi stroke.js.
-    { sec: 'Dinamica del tratto' },
-    { id: 'tstart', label: 'Spessore iniziale', min: 0, max: 100, step: 1, get: () => brush.taperStart * 100, set: v => brush.taperStart = v / 100, fmt: v => v + '%' },
-    { id: 'tend', label: 'Spessore finale', min: 0, max: 100, step: 1, get: () => brush.taperEnd * 100, set: v => brush.taperEnd = v / 100, fmt: v => v + '%' },
-    { id: 'vthick', label: 'Velocità → spessore', min: 0, max: 100, step: 1, get: () => brush.speedThickness * 100, set: v => brush.speedThickness = v / 100, fmt: v => v + '%' },
     { sec: 'Renderer' },
     { renderer: true },
   ] },
