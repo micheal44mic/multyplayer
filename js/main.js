@@ -65,9 +65,13 @@ export class App {
 
     this.input = new InputManager(this.canvas, this.camera, {
       isPanTool: () => brush.tool === 'pan',
-      onStrokeStart: (x, y, p) => this.startStroke(x, y, p),
-      onStrokePoint: (x, y, p) => this.engine.move(x, y, p),
-      onStrokeEnd: (x, y, p) => { this.engine.end(x, y, p); this.pendingCommit = true; },
+      onStrokeStart: (x, y, p, t) => this.startStroke(x, y, p, t),
+      onStrokePoint: (x, y, p, t) => this.engine.move(x, y, p, t),
+      onStrokeEnd: (x, y, p, t) => {
+        this.engine.end(x, y, p, t);
+        if (this.engine.endPassNeeded) this._endPass();
+        this.pendingCommit = true;
+      },
       onStrokeCancel: () => this.cancelStroke(),
     });
 
@@ -123,8 +127,8 @@ export class App {
     this.renderer.resize(w, h, dpr);
   }
 
-  /** @param {number} x @param {number} y @param {number} p */
-  startStroke(x, y, p) {
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  startStroke(x, y, p, t) {
     // chiudi del tutto l'eventuale tratto precedente: drena la sua coda
     // (col suo snapshot), poi completa il commit in modo sincrono
     if (this.strokeLive) {
@@ -132,7 +136,8 @@ export class App {
       if (this.pendingCommit) this._beginCommit();
     }
     if (this.commitJob) this._runCommit(Infinity);
-    this.engine.begin(x, y, p, brush);
+    // zoom camera = scala della velocità: la dinamica legge il gesto fisico
+    this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom);
     this.raster.beginStroke(this.engine.snap);
     this.strokeLive = true;
     this.pendingCommit = false;
@@ -149,6 +154,17 @@ export class App {
   _dropStrokeBuffer() {
     // i chunk tornano al pool (texture riusata) o liberano la texture
     this.strokeStore.releaseAll((c) => this.renderer.disposeChunkTex(c));
+  }
+
+  // Pass finale del taper al pen-up: live il tratto è pieno fino alla punta
+  // (zero ritardo); qui si svuota il buffer del tratto e lo si ridisegna
+  // intero con il cono finale. Sincrono e prima del present: nessun lampeggio.
+  _endPass() {
+    this.queue.clear();
+    this._dropStrokeBuffer();
+    this.raster.beginStroke(this.engine.snap);
+    this.engine.replay();
+    this.raster.run(this.queue, Infinity);
   }
 
   // Avvia il commit incrementale: composito sul layer spalmato sui frame.
@@ -254,6 +270,8 @@ export class App {
 
     // 1. input (gesture + conversione in punti stroke)
     this.input.drain();
+    // a mano ferma il dot di pen-down matura (cresce fino a piena dimensione)
+    if (this.engine.active) this.engine.tick(performance.now());
     const t1 = performance.now();
 
     // 2. (il sampling avviene dentro drain via engine.move) — misurato insieme

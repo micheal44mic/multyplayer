@@ -1,7 +1,9 @@
-// Preview del pennello (Brush Studio): un tratto a S con taper di pressione,
-// renderizzato con la STESSA pipeline del canvas (StrokeEngine -> Rasterizer
-// JS) su un mini ChunkStore dedicato. Seed fisso: trascinare uno slider non
-// fa "ballare" scatter e jitter tra un re-render e l'altro.
+// Preview del pennello (Brush Studio): un tratto a S con tempi sintetici
+// (veloce agli estremi, lento al centro) così la dinamica ibis-style mostra
+// punte agli estremi e corpo pieno al centro. Renderizzato con la STESSA
+// pipeline del canvas (StrokeEngine -> Rasterizer JS) su un mini ChunkStore
+// dedicato. Seed fisso: trascinare uno slider non fa "ballare" scatter e
+// jitter tra un re-render e l'altro.
 //
 // La dimensione del tratto è quella vera finché entra in altezza; oltre,
 // scala: tutti i parametri del pennello sono relativi al diametro, quindi
@@ -9,7 +11,7 @@
 
 import { brush, StampCache } from './brush.js';
 import { ChunkStore, CHUNK, CHUNK_SHIFT } from './store.js';
-import { DabQueue, StrokeEngine } from './stroke.js';
+import { DabQueue, StrokeEngine, TAPER_MS } from './stroke.js';
 import { Rasterizer } from './raster.js';
 
 const SEED = 0x51ed270b;
@@ -56,20 +58,45 @@ export class BrushPreview {
 
     /** @type {(t: number) => number} */
     const px = (t) => x0 + (x1 - x0) * t;
+    // S-curve con inviluppo sin(πt): pendenza nulla agli estremi, così la
+    // punta esce dritta e non "a gancio".
     /** @type {(t: number) => number} */
-    const py = (t) => cy - amp * Math.sin(t * Math.PI * 2) * 0.9; // S-curve
-    /** @type {(t: number) => number} */
-    const pp = (t) => Math.max(0.03, Math.pow(Math.sin(t * Math.PI), 0.7)); // taper
+    const py = (t) => cy - amp * Math.sin(t * Math.PI * 2) * Math.sin(t * Math.PI) * 1.15;
+
+    // Tempi sintetici deterministici: veloce agli estremi, lento al centro —
+    // la dinamica (taper temporale × velocità) disegna punte agli estremi e
+    // corpo pieno al centro, come una pennellata vera.
+    const times = new Float64Array(POINTS + 1);
+    {
+      let len = 0;
+      for (let i = 1; i <= POINTS; i++) {
+        len += Math.hypot(px(i / POINTS) - px((i - 1) / POINTS), py(i / POINTS) - py((i - 1) / POINTS));
+      }
+      const vEnd = Math.max(0.2, 0.11 * len / TAPER_MS); // punta ~11% del tratto
+      const vMid = vEnd * 0.35;
+      for (let i = 1; i <= POINTS; i++) {
+        const u = (i - 0.5) / POINTS;
+        const v = vEnd + (vMid - vEnd) * Math.sin(u * Math.PI);
+        const ds = Math.hypot(px(i / POINTS) - px((i - 1) / POINTS), py(i / POINTS) - py((i - 1) / POINTS));
+        times[i] = times[i - 1] + ds / v;
+      }
+    }
 
     this.queue.clear();
     const engine = this.engine;
-    engine.begin(px(0), py(0), pp(0), { ...brush, size: sizePx, tool: 'brush' }, SEED);
+    engine.begin(px(0), py(0), 1, 0, { ...brush, size: sizePx, tool: 'brush' }, SEED, 1);
     this.raster.beginStroke(engine.snap);
     for (let i = 1; i <= POINTS; i++) {
-      const t = i / POINTS;
-      engine.move(px(t), py(t), pp(t));
+      engine.move(px(i / POINTS), py(i / POINTS), 1, times[i]);
     }
-    engine.end(x1, py(1), pp(1));
+    engine.end(x1, py(1), 1, times[POINTS]);
+    if (engine.endPassNeeded) {
+      // pass finale come nell'app: si scarta il live e si ridisegna col cono
+      this.queue.clear();
+      this.store.releaseAll(() => { /* store CPU-only */ });
+      this.raster.beginStroke(engine.snap);
+      engine.replay();
+    }
     this.raster.run(this.queue, Infinity);
 
     // --- 2. composito chunk -> ImageData (unpremultiply) -----------------

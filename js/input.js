@@ -3,17 +3,19 @@
 
 const EV_DOWN = 1, EV_MOVE = 2, EV_UP = 3, EV_CANCEL = 4;
 const PT_MOUSE = 0, PT_PEN = 1, PT_TOUCH = 2;
-const FIELDS = 7; // type, id, x, y, pressure, ptrType, buttons
+const FIELDS = 8; // type, id, x, y, pressure, ptrType, buttons, time
 const CAP = 8192;
 
 /** @typedef {import('./camera.js').Camera} Camera */
 
 /**
+ * t: timeStamp dell'evento (orologio di performance.now()) — serve alla
+ * dinamica velocità/taper dello stroke engine.
  * @typedef {Object} InputHooks
  * @property {() => boolean} isPanTool
- * @property {(x: number, y: number, p: number) => void} onStrokeStart
- * @property {(x: number, y: number, p: number) => void} onStrokePoint
- * @property {(x: number, y: number, p: number) => void} onStrokeEnd
+ * @property {(x: number, y: number, p: number, t: number) => void} onStrokeStart
+ * @property {(x: number, y: number, p: number, t: number) => void} onStrokePoint
+ * @property {(x: number, y: number, p: number, t: number) => void} onStrokeEnd
  * @property {() => void} onStrokeCancel
  */
 
@@ -26,7 +28,9 @@ export class InputManager {
     this.camera = camera;
     this.hooks = hooks;
 
-    this.ring = new Float32Array(CAP * FIELDS);
+    // Float64: i timeStamp (ms dall'avvio pagina) in f32 perdono precisione
+    // sub-ms dopo ~4 ore di sessione, e la velocità ne ha bisogno.
+    this.ring = new Float64Array(CAP * FIELDS);
     this.head = 0;
     this.tail = 0;
 
@@ -55,7 +59,7 @@ export class InputManager {
     this.hover = { x: -100, y: -100, visible: false, touch: false };
 
     // Ultimo punto del tratto in corso (schermo), per chiusura da gesture
-    this._lastPoint = { x: 0, y: 0, p: 0 };
+    this._lastPoint = { x: 0, y: 0, p: 0, t: 0 };
 
     // Pointer in contatto (down ricevuto, up/cancel non ancora).
     // Su mobile NON ci si può fidare di e.buttons: Safari iOS riporta
@@ -69,14 +73,14 @@ export class InputManager {
 
   /**
    * @param {number} type @param {number} id @param {number} x @param {number} y
-   * @param {number} p @param {number} pt @param {number} buttons
+   * @param {number} p @param {number} pt @param {number} buttons @param {number} t
    */
-  _push(type, id, x, y, p, pt, buttons) {
+  _push(type, id, x, y, p, pt, buttons, t) {
     const next = (this.tail + 1) % CAP;
     if (next === this.head) return; // pieno: scarta il più vecchio implicito
     const o = this.tail * FIELDS, r = this.ring;
     r[o] = type; r[o + 1] = id; r[o + 2] = x; r[o + 3] = y;
-    r[o + 4] = p; r[o + 5] = pt; r[o + 6] = buttons;
+    r[o + 4] = p; r[o + 5] = pt; r[o + 6] = buttons; r[o + 7] = t;
     this.tail = next;
     this._evCount++;
   }
@@ -87,7 +91,7 @@ export class InputManager {
   /** @param {HTMLCanvasElement} canvas */
   rebind(canvas) {
     this.canvas = canvas;
-    if (this.drawingId !== -1) this._push(EV_CANCEL, this.drawingId, 0, 0, 0, 0, 0);
+    if (this.drawingId !== -1) this._push(EV_CANCEL, this.drawingId, 0, 0, 0, 0, 0, performance.now());
     this.panningId = -1;
     this.gesture = false;
     this._gestA = -1; this._gestB = -1;
@@ -117,14 +121,21 @@ export class InputManager {
     const c = this.canvas;
     /** @type {(e: PointerEvent) => number} */
     const ptType = (e) => e.pointerType === 'pen' ? PT_PEN : e.pointerType === 'touch' ? PT_TOUCH : PT_MOUSE;
+    // Solo la penna ha pressione vera (la rampa al pen-down/lift-off fa le
+    // punte da sola); il tocco riporta uno 0.5 fisso senza informazione e il
+    // mouse 0.5/1: per entrambi 1 = fattore pressione neutro, ci pensa la
+    // dinamica velocità.
     /** @type {(e: PointerEvent, pt: number) => number} */
-    const press = (e, pt) => pt === PT_MOUSE ? 1 : (e.pressure > 0 ? e.pressure : 0.5);
+    const press = (e, pt) => pt === PT_PEN ? (e.pressure > 0 ? e.pressure : 0.5) : 1;
+    // alcuni browser danno timeStamp 0 sui coalesced: fallback all'evento padre
+    /** @type {(e: PointerEvent, fb: number) => number} */
+    const time = (e, fb) => e.timeStamp > 0 ? e.timeStamp : fb;
 
     c.addEventListener('pointerdown', (e) => {
       try { c.setPointerCapture(e.pointerId); } catch { /* eventi sintetici o pointer già rilasciato */ }
       const pt = ptType(e);
       this._contact.add(e.pointerId);
-      this._push(EV_DOWN, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, e.buttons);
+      this._push(EV_DOWN, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, e.buttons, time(e, performance.now()));
       e.preventDefault();
     });
 
@@ -140,12 +151,13 @@ export class InputManager {
       // coalesced: nessun campione perso da una penna a 240 Hz
       const co = e.getCoalescedEvents ? e.getCoalescedEvents() : null;
       if (co && co.length > 0) {
+        const tFb = time(e, performance.now());
         for (let i = 0; i < co.length; i++) {
           const ce = co[i];
-          this._push(EV_MOVE, e.pointerId, ce.clientX, ce.clientY, press(ce, pt), pt, e.buttons);
+          this._push(EV_MOVE, e.pointerId, ce.clientX, ce.clientY, press(ce, pt), pt, e.buttons, time(ce, tFb));
         }
       } else {
-        this._push(EV_MOVE, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, e.buttons);
+        this._push(EV_MOVE, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, e.buttons, time(e, performance.now()));
       }
       e.preventDefault();
     });
@@ -154,19 +166,19 @@ export class InputManager {
     const up = (e) => {
       const pt = ptType(e);
       this._contact.delete(e.pointerId);
-      this._push(EV_UP, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, 0);
+      this._push(EV_UP, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, 0, time(e, performance.now()));
       e.preventDefault();
     };
     c.addEventListener('pointerup', up);
     c.addEventListener('pointercancel', (e) => {
       this._contact.delete(e.pointerId);
-      this._push(EV_CANCEL, e.pointerId, e.clientX, e.clientY, 0, ptType(e), 0);
+      this._push(EV_CANCEL, e.pointerId, e.clientX, e.clientY, 0, ptType(e), 0, time(e, performance.now()));
     });
     // capture persa senza up (rarissimo, browser mobile): tratta come cancel
     c.addEventListener('lostpointercapture', (e) => {
       if (this._contact.has(e.pointerId)) {
         this._contact.delete(e.pointerId);
-        this._push(EV_CANCEL, e.pointerId, e.clientX, e.clientY, 0, ptType(e), 0);
+        this._push(EV_CANCEL, e.pointerId, e.clientX, e.clientY, 0, ptType(e), 0, time(e, performance.now()));
       }
     });
     c.addEventListener('pointerleave', () => { this.hover.visible = false; });
@@ -202,11 +214,11 @@ export class InputManager {
       const o = this.head * FIELDS;
       this.head = (this.head + 1) % CAP;
       const type = r[o], id = r[o + 1], x = r[o + 2], y = r[o + 3];
-      const p = r[o + 4], pt = r[o + 5], buttons = r[o + 6];
+      const p = r[o + 4], pt = r[o + 5], buttons = r[o + 6], t = r[o + 7];
 
-      if (type === EV_DOWN) this._onDown(id, x, y, p, pt, buttons);
-      else if (type === EV_MOVE) this._onMove(id, x, y, p, pt);
-      else this._onUp(id, x, y, p, pt, type === EV_CANCEL);
+      if (type === EV_DOWN) this._onDown(id, x, y, p, pt, buttons, t);
+      else if (type === EV_MOVE) this._onMove(id, x, y, p, pt, t);
+      else this._onUp(id, x, y, p, pt, type === EV_CANCEL, t);
     }
 
     // contatore eventi/s per HUD
@@ -220,9 +232,9 @@ export class InputManager {
 
   /**
    * @param {number} id @param {number} x @param {number} y @param {number} p
-   * @param {number} pt @param {number} buttons
+   * @param {number} pt @param {number} buttons @param {number} t
    */
-  _onDown(id, x, y, p, pt, buttons) {
+  _onDown(id, x, y, p, pt, buttons, t) {
     const H = this.hooks, cam = this.camera;
 
     if (pt === PT_TOUCH) {
@@ -236,7 +248,7 @@ export class InputManager {
           else {
             const e = this._lastPoint;
             cam.screenToWorld(e.x, e.y, this._tmpW);
-            H.onStrokeEnd(this._tmpW.x, this._tmpW.y, e.p);
+            H.onStrokeEnd(this._tmpW.x, this._tmpW.y, e.p, e.t);
           }
           this.drawingId = -1;
         }
@@ -264,13 +276,13 @@ export class InputManager {
     this.drawingIsTouch = pt === PT_TOUCH;
     this.strokeStartT = performance.now();
     this.strokeDist = 0;
-    this._lastPoint = { x, y, p };
+    this._lastPoint = { x, y, p, t };
     cam.screenToWorld(x, y, this._tmpW);
-    H.onStrokeStart(this._tmpW.x, this._tmpW.y, p);
+    H.onStrokeStart(this._tmpW.x, this._tmpW.y, p, t);
   }
 
-  /** @param {number} id @param {number} x @param {number} y @param {number} p @param {number} pt */
-  _onMove(id, x, y, p, pt) {
+  /** @param {number} id @param {number} x @param {number} y @param {number} p @param {number} pt @param {number} t */
+  _onMove(id, x, y, p, pt, t) {
     const H = this.hooks, cam = this.camera;
 
     if (pt === PT_TOUCH && this.touches.has(id)) {
@@ -292,17 +304,17 @@ export class InputManager {
     if (id === this.drawingId) {
       const lp = this._lastPoint;
       this.strokeDist += Math.hypot(x - lp.x, y - lp.y);
-      lp.x = x; lp.y = y; lp.p = p;
+      lp.x = x; lp.y = y; lp.p = p; lp.t = t;
       cam.screenToWorld(x, y, this._tmpW);
-      H.onStrokePoint(this._tmpW.x, this._tmpW.y, p);
+      H.onStrokePoint(this._tmpW.x, this._tmpW.y, p, t);
     }
   }
 
   /**
    * @param {number} id @param {number} x @param {number} y @param {number} p
-   * @param {number} pt @param {boolean} cancelled
+   * @param {number} pt @param {boolean} cancelled @param {number} t
    */
-  _onUp(id, x, y, p, pt, cancelled) {
+  _onUp(id, x, y, p, pt, cancelled, t) {
     const H = this.hooks, cam = this.camera;
 
     if (pt === PT_TOUCH) {
@@ -328,7 +340,7 @@ export class InputManager {
       if (cancelled) H.onStrokeCancel();
       else {
         cam.screenToWorld(x, y, this._tmpW);
-        H.onStrokeEnd(this._tmpW.x, this._tmpW.y, p);
+        H.onStrokeEnd(this._tmpW.x, this._tmpW.y, p, t);
       }
     }
   }
