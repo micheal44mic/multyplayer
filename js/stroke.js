@@ -167,6 +167,7 @@ export class StrokeEngine {
     this._vlx = 0; this._vly = 0; this._vlt = 0;  // ultimo input grezzo
     this._accDist = 0;                            // distanza tra eventi con dt=0
     this._moved = 0;                              // distanza campionata totale (tap detection)
+    this._started = false;                        // il movimento grezzo è iniziato
     // registro delle emissioni per il pass finale: (x, y, m, burn) —
     // burn=1 se nel pass live è seguito un rng() di jitterSpacing
     this._rec = new Float32Array(1024 * 4);
@@ -281,7 +282,7 @@ export class StrokeEngine {
     this._lx = x; this._ly = y; this._lp = p; this._lt = t;
     this._dirX = 1; this._dirY = 0;
     this._t0 = t;
-    this._vel = 0; this._accDist = 0; this._moved = 0;
+    this._vel = 0; this._accDist = 0; this._moved = 0; this._started = false;
     this._vlx = x; this._vly = y; this._vlt = t;
     this._recN = 0;
     this.endPassNeeded = false;
@@ -300,6 +301,14 @@ export class StrokeEngine {
   move(x, y, p, t) {
     if (!this.active) return;
     const s = this.snap;
+    // Il taper d'inizio parte da quando ci si MUOVE, non dal pen-down: il
+    // dwell naturale (20-50ms a mano ferma, spesso senza eventi) non deve
+    // mangiarsi la finestra. Se invece il dot ha maturato (pressione
+    // deliberata ≥ DOT_HOLD_MS) il tratto continua pieno dal dot.
+    if (!this._started && Math.hypot(x - this._vlx, y - this._vly) > 0.25) {
+      this._started = true;
+      if (t - this._t0 < DOT_HOLD_MS) this._t0 = Math.max(this._vlt, t - 16);
+    }
     // velocità del gesto: dagli input grezzi, filtrata passa-basso. Con eventi
     // coalesced a dt=0 la distanza si accumula fino al prossimo dt>0.
     this._accDist += Math.hypot(x - this._vlx, y - this._vly);
