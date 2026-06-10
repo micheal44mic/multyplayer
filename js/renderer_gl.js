@@ -110,10 +110,16 @@ export class GLRenderer {
       desynchronized: opts && opts.desynchronized !== undefined ? opts.desynchronized : true,
       powerPreference: 'high-performance',
     };
+    // WebGL2 quando c'è: serve UNPACK_ROW_LENGTH per caricare solo il
+    // sotto-rettangolo sporco del chunk. Gli shader (GLSL ES 1.0) e il resto
+    // dell'API sono identici; su WebGL1 si torna all'upload del chunk intero.
     this.gl = /** @type {WebGLRenderingContext} */ (
+      canvas.getContext('webgl2', ctxOpts) ||
       canvas.getContext('webgl', ctxOpts) || canvas.getContext('experimental-webgl', ctxOpts));
     if (!this.gl) { this.ok = false; return; }
     this.ok = true;
+    this.isGL2 = typeof WebGL2RenderingContext !== 'undefined' && this.gl instanceof WebGL2RenderingContext;
+    this.kind = this.isGL2 ? 'WebGL2' : 'WebGL';
 
     canvas.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
@@ -202,20 +208,50 @@ export class GLRenderer {
     return chunk.tex;
   }
 
-  // Upload dei soli chunk sporchi. Ritorna i byte caricati.
+  // Upload dei soli chunk sporchi. Su WebGL2, se la texture è già valida,
+  // carica solo il rettangolo sporco accumulato (UNPACK_ROW_LENGTH = stride
+  // del chunk): un pennello piccolo passa da 256KB a pochi KB per chunk.
+  // Ritorna i byte caricati.
   /** @param {ChunkStore} store */
   uploadDirty(store) {
     if (this.contextLost) { store.dirty.clear(); return 0; }
     const gl = this.gl;
     let bytes = 0;
+    let rowLenSet = false;
     for (const chunk of store.dirty) {
       if (!store.map.has(chunk.key)) continue; // rilasciato nel frattempo
-      gl.bindTexture(gl.TEXTURE_2D, this._ensureTex(chunk));
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, CHUNK, CHUNK, gl.RGBA, gl.UNSIGNED_BYTE,
-        new Uint8Array(chunk.data.buffer, 0, chunk.data.length));
-      chunk.texDirty = false;
-      bytes += chunk.data.length;
-      this.uploadsThisFrame++;
+      if (this.isGL2 && chunk.tex && !chunk.texDirty && chunk.dirX1 >= chunk.dirX0) {
+        const x0 = chunk.dirX0, y0 = chunk.dirY0;
+        const w = chunk.dirX1 - x0 + 1, h = chunk.dirY1 - y0 + 1;
+        if (!rowLenSet) {
+          /** @type {WebGL2RenderingContext} */ (gl).pixelStorei(
+            WebGL2RenderingContext.UNPACK_ROW_LENGTH, CHUNK);
+          rowLenSet = true;
+        }
+        gl.bindTexture(gl.TEXTURE_2D, chunk.tex);
+        // vista che parte dal primo pixel del rect; le righe seguono lo
+        // stride del chunk via ROW_LENGTH (byteOffset: memoria wasm)
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE,
+          new Uint8Array(chunk.data.buffer,
+            chunk.data.byteOffset + (y0 * CHUNK + x0) * 4,
+            ((h - 1) * CHUNK + w) * 4));
+        bytes += w * h * 4;
+        this.uploadsThisFrame++;
+        chunk.dirX0 = CHUNK; chunk.dirY0 = CHUNK; chunk.dirX1 = -1; chunk.dirY1 = -1;
+      } else {
+        if (rowLenSet) {
+          // _uploadNow carica il chunk intero: stride di default
+          /** @type {WebGL2RenderingContext} */ (gl).pixelStorei(
+            WebGL2RenderingContext.UNPACK_ROW_LENGTH, 0);
+          rowLenSet = false;
+        }
+        this._uploadNow(chunk);
+        bytes += chunk.data.length;
+      }
+    }
+    if (rowLenSet) {
+      /** @type {WebGL2RenderingContext} */ (gl).pixelStorei(
+        WebGL2RenderingContext.UNPACK_ROW_LENGTH, 0);
     }
     store.dirty.clear();
     return bytes;
@@ -312,8 +348,10 @@ export class GLRenderer {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this._ensureTex(chunk));
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, CHUNK, CHUNK, gl.RGBA, gl.UNSIGNED_BYTE,
-      new Uint8Array(chunk.data.buffer, 0, chunk.data.length));
+      new Uint8Array(chunk.data.buffer, chunk.data.byteOffset, chunk.data.length));
     chunk.texDirty = false;
+    // il chunk intero è in texture: l'eventuale rect accumulato è coperto
+    chunk.dirX0 = CHUNK; chunk.dirY0 = CHUNK; chunk.dirX1 = -1; chunk.dirY1 = -1;
     this.uploadsThisFrame++;
   }
 

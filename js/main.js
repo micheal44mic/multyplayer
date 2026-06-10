@@ -13,20 +13,31 @@ import { InputManager } from './input.js';
 import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
+import { WasmHeap } from './wasm_core.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./stroke.js').Snap} Snap */
 
 export class App {
-  constructor() {
+  /** @param {WasmHeap|null} [heap] core SIMD; null = rasterizer JS */
+  constructor(heap = null) {
     this.canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('paint'));
     this.camera = new Camera();
-    this.docStore = new ChunkStore('doc');
-    this.strokeStore = new ChunkStore('stroke');
-    this.stampCache = new StampCache();
+    this.heap = heap;
+    this.docStore = new ChunkStore('doc', heap);
+    this.strokeStore = new ChunkStore('stroke', heap);
+    this.stampCache = new StampCache(160, heap);
+    if (heap) {
+      // memory.grow stacca il buffer: ogni vista va rigenerata subito
+      heap.onGrow = () => {
+        this.docStore.refreshViews();
+        this.strokeStore.refreshViews();
+        this.stampCache.refreshViews();
+      };
+    }
     this.queue = new DabQueue();
     this.engine = new StrokeEngine(this.queue);
-    this.raster = new Rasterizer(this.strokeStore, this.stampCache);
+    this.raster = new Rasterizer(this.strokeStore, this.stampCache, heap);
     this.hud = new Hud();
 
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
@@ -70,7 +81,7 @@ export class App {
       eventsPerSec: 0, docChunks: 0, strokeChunks: 0,
       cpuBytes: 0, gpuBytes: 0, undoCount: 0, undoBytes: 0,
       stampCache: 0, stampGen: 0, zoom: 1, dpr: 1,
-      renderer: renderer.kind, contextLost: false,
+      renderer: renderer.kind, engine: heap ? 'wasm simd' : 'js', contextLost: false,
     };
     this._frameMax = 0;
     this._frameMaxT = 0;
@@ -169,7 +180,8 @@ export class App {
     while (job.index < job.chunks.length && n < maxChunks) {
       const sc = job.chunks[job.index++];
       commitChunk(this.docStore, sc, job.snap,
-        (key, cx, cy, before) => this.undoMgr.captureChunk(key, cx, cy, before));
+        (key, cx, cy, before) => this.undoMgr.captureChunk(key, cx, cy, before),
+        this.heap);
       this.strokeStore.remove(sc.key, dispose);
       n++;
     }
@@ -314,4 +326,9 @@ export class App {
   }
 }
 
-/** @type {any} */ (window).__app = new App();
+// Il core wasm si carica PRIMA di costruire l'App: gli store nascono già
+// nella memoria lineare (mai chunk misti JS/wasm). ?engine=js forza il
+// fallback puro JS (utile per benchmark e debug).
+const forceJs = new URLSearchParams(location.search).get('engine') === 'js';
+const heap = forceJs ? null : await WasmHeap.load(new URL('./raster_core.wasm', import.meta.url));
+/** @type {any} */ (window).__app = new App(heap);

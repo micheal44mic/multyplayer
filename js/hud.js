@@ -25,6 +25,7 @@ const HISTORY = 120;
  * @property {number} zoom
  * @property {number} dpr
  * @property {string} renderer
+ * @property {string} engine
  * @property {boolean} contextLost
  */
 
@@ -95,7 +96,7 @@ export class Hud {
       `undo     ${String(stats.undoCount).padStart(6)} step  (${mb(stats.undoBytes)} MB)\n` +
       `stamp    ${String(stats.stampCache).padStart(6)} in cache (${stats.stampGen} generati)\n` +
       `vista    zoom ${(stats.zoom * 100).toFixed(0)}%  dpr ${stats.dpr}\n` +
-      `renderer <b>${stats.renderer}</b>${stats.contextLost ? '  ⚠ context lost' : ''}`;
+      `renderer <b>${stats.renderer}</b>  raster <b>${stats.engine}</b>${stats.contextLost ? '  ⚠ context lost' : ''}`;
   }
 
   _drawGraph() {

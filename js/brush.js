@@ -71,19 +71,23 @@ const RADIUS_LOG = Math.log(1.09); // bucket di raggio a passi del 9%
 const TWO_PI = Math.PI * 2;
 
 /**
+ * Con il core wasm attivo la mask è una vista sulla memoria lineare (offset
+ * ptr, così il modulo la legge direttamente); ptr = 0 = buffer JS.
  * @typedef {Object} Stamp
  * @property {number} size
  * @property {number} half
  * @property {Uint8Array} mask
+ * @property {number} ptr
  * @property {number} r
  */
 
 export class StampCache {
-  /** @param {number} [maxEntries] */
-  constructor(maxEntries = 160) {
+  /** @param {number} [maxEntries] @param {import('./wasm_core.js').WasmHeap|null} [heap] */
+  constructor(maxEntries = 160, heap = null) {
     /** @type {Map<number, Stamp>} */
     this.map = new Map();
     this.max = maxEntries;
+    this.heap = heap;
     this.generated = 0; // contatore per HUD
   }
 
@@ -109,29 +113,47 @@ export class StampCache {
     const h = clamp(hB / 12, 0, 1);
     const ro = clamp(roB / 8, 0.05, 1);
     const a = aB * (TWO_PI / 32);
-    s = generateStamp(r, h, ro, a);
+    s = generateStamp(r, h, ro, a, this.heap);
     this.generated++;
 
     this.map.set(key, s);
     if (this.map.size > this.max) {
-      // evict del meno recente (primo della Map)
+      // evict del meno recente (primo della Map); lo slot wasm torna libero
       const oldest = this.map.keys().next().value;
+      const old = this.map.get(oldest);
       this.map.delete(oldest);
+      if (this.heap && old.ptr) this.heap.free(old.ptr, old.size * old.size);
     }
     return s;
   }
 
-  clear() { this.map.clear(); }
+  clear() {
+    if (this.heap) {
+      for (const s of this.map.values()) {
+        if (s.ptr) this.heap.free(s.ptr, s.size * s.size);
+      }
+    }
+    this.map.clear();
+  }
+
+  // memory.grow ha staccato il buffer wasm: rigenera le viste delle maschere.
+  refreshViews() {
+    if (!this.heap) return;
+    for (const s of this.map.values()) s.mask = this.heap.u8(s.ptr, s.size * s.size);
+  }
 }
 
 /**
  * @param {number} r @param {number} hardness @param {number} roundness @param {number} angle
+ * @param {import('./wasm_core.js').WasmHeap|null} heap
  * @returns {Stamp}
  */
-function generateStamp(r, hardness, roundness, angle) {
+function generateStamp(r, hardness, roundness, angle, heap) {
   const half = Math.ceil(r) + 1;
   const size = half * 2;
-  const mask = new Uint8Array(size * size);
+  const ptr = heap ? heap.alloc(size * size) : 0;
+  const mask = heap ? heap.u8(ptr, size * size) : new Uint8Array(size * size);
+  if (ptr) mask.fill(0); // lo slot riusato può contenere una maschera vecchia
   const cos = Math.cos(-angle), sin = Math.sin(-angle);
   const invRo = 1 / roundness;
   let i = 0;
@@ -147,5 +169,5 @@ function generateStamp(r, hardness, roundness, angle) {
       if (a > 0) mask[i] = (a * 255 + 0.5) | 0;
     }
   }
-  return { size, half, mask, r };
+  return { size, half, mask, ptr, r };
 }

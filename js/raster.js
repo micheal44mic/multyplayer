@@ -16,10 +16,14 @@ import { T_DAB } from './stroke.js';
 /** @typedef {import('./brush.js').StampCache} StampCache */
 
 export class Rasterizer {
-  /** @param {ChunkStore} strokeStore @param {StampCache} stampCache */
-  constructor(strokeStore, stampCache) {
+  /**
+   * @param {ChunkStore} strokeStore @param {StampCache} stampCache
+   * @param {import('./wasm_core.js').WasmHeap|null} [heap]
+   */
+  constructor(strokeStore, stampCache, heap = null) {
     this.store = strokeStore;
     this.cache = stampCache;
+    this.heap = heap; // core SIMD: stessi identici output del path JS
     /** @type {Snap|null} */
     this.snap = null;
     // stats per HUD
@@ -127,6 +131,20 @@ export class Rasterizer {
     const buildup = snap.buildup;
     const store = this.store;
 
+    if (this.heap) {
+      const ex = this.heap.exports;
+      const maskPtr = stamp.ptr;
+      const bu = buildup ? 1 : 0;
+      forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
+        (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+          store.markDirty(chunk, lx0, ly0, lx1, ly1);
+          const wrote = ex.dab(chunk.ptr, lx0, ly0, lx1, ly1, maskPtr, sSize,
+            lx0 + ox - ix, ly0 + oy - iy, a255, cr, cg, cb, bu);
+          if (wrote) chunk.touched = true;
+        });
+      return;
+    }
+
     // Le LUT convengono se sono già valide (alpha/colore stabili nel tratto)
     // o se il dab è grande abbastanza da ammortizzare le ~1280 op di rebuild
     // (jitter colore/opacità le invalida a ogni dab; i pixel scritti sono ben
@@ -142,7 +160,7 @@ export class Rasterizer {
 
     forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
       (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
-        store.markDirty(chunk);
+        store.markDirty(chunk, lx0, ly0, lx1, ly1);
         const d = chunk.data;
         let wrote = false;
         for (let y2 = ly0; y2 <= ly1; y2++) {
@@ -203,8 +221,6 @@ export class Rasterizer {
     const h = snap.hardness;
     const cr = snap.colR, cg = snap.colG, cb = snap.colB;
     const store = this.store;
-    this._ensureColorLut(cr, cg, cb);
-    const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
 
     const maxR = Math.max(r0, r1) + 1;
     const bx0 = Math.floor(Math.min(x0, x1) - maxR);
@@ -212,20 +228,47 @@ export class Rasterizer {
     const bx1 = Math.ceil(Math.max(x0, x1) + maxR);
     const by1 = Math.ceil(Math.max(y0, y1) + maxR);
 
+    if (this.heap) {
+      const ex = this.heap.exports;
+      forEachChunkInRect(store, bx0, by0, bx1, by1, true,
+        (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+          store.markDirty(chunk, lx0, ly0, lx1, ly1);
+          const wrote = ex.capsule(chunk.ptr, lx0, ly0, lx1, ly1, ox, oy,
+            x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb);
+          if (wrote) chunk.touched = true;
+        });
+      return;
+    }
+
+    this._ensureColorLut(cr, cg, cb);
+    const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
+
     const dx = x1 - x0, dy = y1 - y0;
     const len2 = dx * dx + dy * dy;
     const invLen2 = len2 > 0 ? 1 / len2 : 0;
     const dr = r1 - r0, da = a1 - a0;
+    // Bound esatto per riga: dist >= distanza riga->segmento e falloff
+    // monotono danno ma <= maMaxRow. Nei tratti a spacing basso i segmenti si
+    // sovrappongono quasi del tutto: i pixel già saturi vengono saltati prima
+    // di proiezione e sqrt senza cambiare l'output; le righe con bound 0
+    // (il bbox è quadrato, la capsula no) si saltano intere.
+    const aMax = Math.max(a0, a1);
+    const rMax = Math.max(r0, r1);
+    const yLo = Math.min(y0, y1), yHi = Math.max(y0, y1);
 
     forEachChunkInRect(store, bx0, by0, bx1, by1, true,
       (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
-        store.markDirty(chunk);
+        store.markDirty(chunk, lx0, ly0, lx1, ly1);
         const d = chunk.data;
         let wrote = false;
         for (let y2 = ly0; y2 <= ly1; y2++) {
           const py = oy + y2 + 0.5;
+          const rowDist = py < yLo ? yLo - py : py > yHi ? py - yHi : 0;
+          const maMaxRow = (falloff(rowDist, rMax, h) * aMax * 255 + 0.5) | 0;
+          if (maMaxRow === 0) continue;
           let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
           for (let x2 = lx0; x2 <= lx1; x2++, di += 4) {
+            if (d[di + 3] >= maMaxRow) continue;
             const px = ox + x2 + 0.5;
             let t = ((px - x0) * dx + (py - y0) * dy) * invLen2;
             if (t < 0) t = 0; else if (t > 1) t = 1;
@@ -259,8 +302,9 @@ export class Rasterizer {
  * @param {Chunk} sc
  * @param {Snap|null} snap
  * @param {(key: number, cx: number, cy: number, before: Uint8ClampedArray<ArrayBuffer>|null) => void} [undoCapture]
+ * @param {import('./wasm_core.js').WasmHeap|null} [heap]
  */
-export function commitChunk(docStore, sc, snap, undoCapture) {
+export function commitChunk(docStore, sc, snap, undoCapture, heap = null) {
   const op255 = Math.round((snap ? snap.globalOpacity : 1) * 255);
   const eraser = snap ? snap.eraser : false;
 
@@ -268,6 +312,13 @@ export function commitChunk(docStore, sc, snap, undoCapture) {
   if (eraser && !existing) return; // niente da cancellare
   if (undoCapture) undoCapture(sc.key, sc.cx, sc.cy, existing ? existing.data : null);
   const doc = existing || docStore.getOrCreate(sc.cx, sc.cy);
+
+  if (heap) {
+    heap.exports.commit(doc.ptr, sc.ptr, op255, eraser ? 1 : 0);
+    docStore.markDirty(doc);
+    return;
+  }
+
   const s = sc.data, d = doc.data;
   // Viste u32 per saltare in fretta i pixel vuoti (premultiplied: parola 0 =
   // pixel non toccato) e copiare in blocco quelli opachi. byteOffset esplicito:

@@ -10,15 +10,22 @@ const KEY_OFF = 32768;                 // chunk coords in [-32768, 32767] → mo
 
 /**
  * Tile 256x256 RGBA premultiplied. tex/c2d appartengono al renderer attivo.
+ * Con il core wasm attivo, data è una vista sulla memoria lineare (offset
+ * ptr); ptr = 0 indica un normale buffer JS.
  * @typedef {Object} Chunk
  * @property {number} key
  * @property {number} cx
  * @property {number} cy
  * @property {Uint8ClampedArray<ArrayBuffer>} data
+ * @property {number} ptr
  * @property {WebGLTexture|null} tex
  * @property {boolean} texDirty
  * @property {boolean} touched
  * @property {HTMLCanvasElement|null} c2d
+ * @property {number} dirX0 rect locale sporco accumulato (vuoto: x0=CHUNK, x1=-1)
+ * @property {number} dirY0
+ * @property {number} dirX1
+ * @property {number} dirY1
  */
 
 /** @type {(cx: number, cy: number) => number} */
@@ -29,9 +36,10 @@ export const keyCx = (key) => (key >>> 16) - KEY_OFF;
 export const keyCy = (key) => (key & 0xffff) - KEY_OFF;
 
 export class ChunkStore {
-  /** @param {string} name */
-  constructor(name) {
+  /** @param {string} name @param {import('./wasm_core.js').WasmHeap|null} [heap] */
+  constructor(name, heap = null) {
     this.name = name;
+    this.heap = heap;        // se presente, i pixel vivono nella memoria wasm
     /** @type {Map<number, Chunk>} */
     this.map = new Map();    // key:int -> chunk
     /** @type {Set<Chunk>} */
@@ -57,24 +65,41 @@ export class ChunkStore {
     if (c === undefined) {
       c = this._pool.pop();
       if (c === undefined) {
+        // l'alloc può far crescere la memoria wasm (onGrow rigenera le viste
+        // esistenti); la vista qui sotto è creata dopo, quindi sempre valida
+        const ptr = this.heap ? this.heap.alloc(CHUNK_BYTES) : 0;
+        const data = this.heap ? this.heap.u8c(ptr, CHUNK_BYTES) : new Uint8ClampedArray(CHUNK_BYTES);
+        if (ptr) data.fill(0); // lo slot riusato può contenere pixel vecchi
         c = {
           key: 0, cx: 0, cy: 0,
-          data: new Uint8ClampedArray(CHUNK_BYTES),
+          data,
+          ptr,
           tex: null,        // gestita dal renderer
           texDirty: true,
           touched: false,   // true se il rasterizer ha scritto pixel reali
           c2d: null,        // canvas del fallback 2D
+          dirX0: CHUNK, dirY0: CHUNK, dirX1: -1, dirY1: -1,
         };
       }
       c.key = key; c.cx = cx; c.cy = cy; c.texDirty = true; c.touched = false;
+      c.dirX0 = CHUNK; c.dirY0 = CHUNK; c.dirX1 = -1; c.dirY1 = -1;
       this.map.set(key, c);
     }
     return c;
   }
 
-  /** @param {Chunk} chunk */
-  markDirty(chunk) {
+  // Accumula il rettangolo locale modificato: il renderer WebGL2 carica solo
+  // quello (UNPACK_ROW_LENGTH). Senza argomenti = chunk intero (conservativo).
+  /**
+   * @param {Chunk} chunk
+   * @param {number} [lx0] @param {number} [ly0] @param {number} [lx1] @param {number} [ly1]
+   */
+  markDirty(chunk, lx0 = 0, ly0 = 0, lx1 = CHUNK - 1, ly1 = CHUNK - 1) {
     this.dirty.add(chunk);
+    if (lx0 < chunk.dirX0) chunk.dirX0 = lx0;
+    if (ly0 < chunk.dirY0) chunk.dirY0 = ly0;
+    if (lx1 > chunk.dirX1) chunk.dirX1 = lx1;
+    if (ly1 > chunk.dirY1) chunk.dirY1 = ly1;
   }
 
   // Svuota lo store. I chunk che entrano nel pool tengono la texture viva
@@ -96,8 +121,10 @@ export class ChunkStore {
     if (this._pool.length < 64) {
       if (forceDispose && disposeTex) disposeTex(c);
       this._pool.push(c);
-    } else if (disposeTex) {
-      disposeTex(c);
+    } else {
+      // il chunk muore: oltre alla texture va liberato anche lo slot wasm
+      if (disposeTex) disposeTex(c);
+      if (this.heap && c.ptr) this.heap.free(c.ptr, CHUNK_BYTES);
     }
   }
 
@@ -117,6 +144,14 @@ export class ChunkStore {
   dropRendererResources() {
     for (const c of this.map.values()) { c.tex = null; c.c2d = null; c.texDirty = true; }
     for (const c of this._pool) { c.tex = null; c.c2d = null; c.texDirty = true; }
+  }
+
+  // memory.grow ha staccato il buffer wasm: tutte le viste (chunk vivi E
+  // pool) vanno rigenerate. Chiamata da WasmHeap.onGrow.
+  refreshViews() {
+    if (!this.heap) return;
+    for (const c of this.map.values()) c.data = this.heap.u8c(c.ptr, CHUNK_BYTES);
+    for (const c of this._pool) c.data = this.heap.u8c(c.ptr, CHUNK_BYTES);
   }
 
   get count() { return this.map.size; }
