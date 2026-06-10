@@ -13,6 +13,7 @@ import { InputManager } from './input.js';
 import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
+import { TextLayer } from './text_layer.js';
 import { WasmHeap } from './wasm_core.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
@@ -39,6 +40,7 @@ export class App {
     this.engine = new StrokeEngine(this.queue);
     this.raster = new Rasterizer(this.strokeStore, this.stampCache, heap);
     this.hud = new Hud();
+    this.textLayer = new TextLayer();
 
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
     // può far lampeggiare il tratto (frame presentati fuori sincrono).
@@ -224,6 +226,7 @@ export class App {
     this.commitJob = null;
     this.cancelStroke();
     this.docStore.releaseAll((c) => this.renderer.disposeChunkTex(c), true);
+    this.textLayer.clear();
     this.undoMgr.clear();
   }
 
@@ -297,7 +300,9 @@ export class App {
     this.renderer.uploadDirty(this.strokeStore);
     const t3 = performance.now();
 
-    // 5. present
+    // 5. present (il livello testo è un overlay SVG: qui si aggiorna solo il
+    // suo viewBox quando la camera cambia, il paint vettoriale lo fa il browser)
+    this.textLayer.update(this.camera);
     const snap = this.raster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;

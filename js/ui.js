@@ -7,6 +7,7 @@ import { CHUNK } from './store.js';
 import { ZOOM_MIN, ZOOM_MAX } from './camera.js';
 import { BrushPreview } from './brush_preview.js';
 import { textureFromFile, defaultGrainTexture } from './texture.js';
+import { TextUI } from './text_ui.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Tool} Tool */
@@ -166,6 +167,7 @@ export class UI {
     this._toggleSync = [];
     /** @type {(() => void)|null} */
     this._texRefresh = null;
+    this.textUI = new TextUI(app);
     this._buildStudio();
     this._bindToolbar();
     this._bindKeys();
@@ -543,6 +545,7 @@ export class UI {
     this.zoomOutBtn.addEventListener('click', () => this._zoomBy(0.8));
     this.zoomInBtn.addEventListener('click', () => this._zoomBy(1.25));
     document.getElementById('btn-hud').addEventListener('click', () => app.hud.toggle());
+    document.getElementById('btn-text').addEventListener('click', () => this.textUI.placeAtView());
     document.getElementById('btn-panel').addEventListener('click', () => this.toggleStudio());
   }
 
@@ -585,6 +588,7 @@ export class UI {
     const app = this.app;
     window.addEventListener('keydown', (e) => {
       if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
+      if (e.target instanceof HTMLSelectElement) return;
       const k = e.key.toLowerCase();
       if ((e.ctrlKey || e.metaKey) && k === 'z' && !e.shiftKey) { e.preventDefault(); app.undo(); }
       else if ((e.ctrlKey || e.metaKey) && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); app.redo(); }
@@ -592,7 +596,8 @@ export class UI {
       else if (k === 'e') this.setTool('eraser');
       else if (k === 'h') this.setTool('pan');
       else if (k === 'p') this.toggleStudio();
-      else if (k === 'escape') this.toggleStudio(false);
+      else if (k === 't') this.textUI.placeAtView();
+      else if (k === 'escape') { this.toggleStudio(false); this.textUI.open(false); }
       else if (k === '`' || k === '\\') app.hud.toggle();
       else if (k === '0') app.camera.reset();
       else if (k === '[') { brush.size = stepSize(brush.size, -1); this.syncSliders(); this._settingChanged(); }
