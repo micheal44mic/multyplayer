@@ -1,9 +1,11 @@
 // TESTO VETTORIALE — vettore puro fino allo schermo: ogni livello testo è un
 // piano SVG (pointer-events: none) il cui viewBox segue la camera; il browser
 // rasterizza i glifi alla risoluzione del device a ogni paint, quindi il
-// testo è nitido sempre, anche durante il gesto di zoom. Questo modulo tiene
-// font, stile e la sincronizzazione attributi; la creazione/ordinamento dei
-// piani è del gestore in planes.js.
+// testo è nitido sempre — anche durante lo zoom su desktop; sul touch lo
+// zoom congela il piano in texture (vedi il freeze in planes.js) e la
+// nitidezza torna al rilascio. Questo modulo tiene font, stile e la
+// sincronizzazione attributi; la creazione/ordinamento dei piani è del
+// gestore in planes.js.
 
 /** @typedef {import('./camera.js').Camera} Camera */
 /** @typedef {import('./layers.js').Layer} Layer */
@@ -127,12 +129,14 @@ export function textBaselineY(it, st) {
   return it.y + (asc - des) * 0.5;
 }
 
-// Estrusione 3D lungo la diagonale: copie del testo a passo sub-pixel,
-// rasterizzate UNA volta su canvas e mostrate come <image> ancorata in
-// coordinate mondo. Durante pan/zoom il compositor scala solo una texture
-// (un filtro SVG verrebbe rieseguito a ogni frame: ingestibile su mobile);
-// la bitmap si rigenera quando cambia lo stile o quando lo zoom si ferma
-// su una scala troppo diversa da quella renderizzata.
+// EFFETTI (estrusione 3D e ombra morbida) — rasterizzati su un canvas HTML
+// persistente, ancorato in coordinate mondo e posizionato con un transform
+// CSS: durante pan/zoom il compositor scala solo una texture. Un filtro
+// CSS/SVG (il vecchio drop-shadow dell'ombra morbida) verrebbe invece
+// rieseguito a ogni frame di zoom, a risoluzione device: ingestibile.
+// Mentre un gesto è in corso (slider, tastiera) si rigenerano ANTEPRIME a
+// metà risoluzione e passo largo; la qualità piena arriva a gesto fermo.
+// Niente toBlob/PNG: si disegna nel canvas mostrato, zero encode/decode.
 
 /** @param {number} x @param {number} y @param {string} fill @param {number} size @returns {TextItem} */
 export function makeTextItem(x, y, fill, size) {
@@ -141,10 +145,11 @@ export function makeTextItem(x, y, fill, size) {
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
-// Crea il piano SVG di un livello testo (lo possiede planes.js).
-// La geometria vive UNA volta in <defs><text>: il testo visibile e le copie
-// dell'estrusione 3D sono <use> che la riferiscono — fill/stroke arrivano
-// per eredità perché la sorgente non li dichiara.
+// Crea il piano SVG di un livello testo e il canvas del suo effetto (li
+// possiede planes.js, che li inserisce adiacenti: canvas sotto, svg sopra).
+// La geometria vive UNA volta in <defs><text>: il testo visibile è uno <use>
+// che la riferisce — fill/stroke arrivano per eredità perché la sorgente non
+// li dichiara.
 /** @param {Layer} layer */
 export function createTextSvg(layer) {
   const svg = document.createElementNS(SVG_NS, 'svg');
@@ -153,26 +158,34 @@ export function createTextSvg(layer) {
   // il viewBox ha lo stesso aspect del viewport: 'none' evita letterbox
   // da arrotondamenti e mappa mondo -> schermo esattamente come la camera
   svg.setAttribute('preserveAspectRatio', 'none');
+  // origine in alto a sinistra per il freeze dello zoom touch (planes.js
+  // scala il piano già dipinto col compositor invece di ridipingerlo)
+  svg.style.transformOrigin = '0 0';
   const defs = document.createElementNS(SVG_NS, 'defs');
   const t = document.createElementNS(SVG_NS, 'text');
   t.setAttribute('id', 'tsrc' + layer.id); // id unico nel documento
   t.setAttribute('text-anchor', 'middle');
   t.setAttribute('dominant-baseline', 'alphabetic');
   defs.appendChild(t);
-  // estrusione: bitmap cacheata, ancorata in px mondo sotto il testo
-  const block = document.createElementNS(SVG_NS, 'image');
-  block.setAttribute('preserveAspectRatio', 'none');
-  block.style.display = 'none';
   const main = document.createElementNS(SVG_NS, 'use');
   main.setAttribute('href', '#tsrc' + layer.id);
   // il bordo è sotto il fill (paint-order): stroke centrato largo il doppio,
   // la metà interna è coperta -> bordo "esterno" come nei programmi di grafica
   main.setAttribute('paint-order', 'stroke');
   main.setAttribute('stroke-linejoin', 'round');
-  svg.append(defs, block, main);
+  svg.append(defs, main);
+  // canvas dell'effetto: dimensionato/posizionato a ogni rigenerazione.
+  // Stili inline per vincere su `#planes > *` (inset/width/height 100%);
+  // will-change lo tiene su un layer compositor suo: pan/zoom non
+  // ridipingono mai questi pixel
+  const cnv = document.createElement('canvas');
+  cnv.className = 'fxplane';
+  cnv.setAttribute('aria-hidden', 'true');
+  cnv.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;' +
+    'transform-origin:0 0;will-change:transform;display:none;';
   layer.svg = svg;
   layer.textEl = t;
-  layer.blockEl = block;
+  layer.blockCanvas = cnv;
   layer.mainEl = main;
   layer.styleDirty = true;
   return svg;
@@ -181,9 +194,9 @@ export function createTextSvg(layer) {
 // Misuratore condiviso per l'ingombro del testo (mai nel path per-frame).
 const measurer = document.createElement('canvas').getContext('2d');
 
-// Ingombro mondo dell'estrusione: testo + corsa del blocco + margine blur.
-// La larghezza misurata può essere corta se il font non è ancora pronto:
-// il fallback per-carattere tiene il box abbondante.
+// Ingombro mondo dell'effetto: testo + corsa di estrusione/ombra + margine
+// blur. La larghezza misurata può essere corta se il font non è ancora
+// pronto: il fallback per-carattere tiene il box abbondante.
 /** @param {TextItem} it @param {TextStyle} st */
 function blockBox(it, st) {
   measurer.font = textFont(it, st);
@@ -191,7 +204,7 @@ function blockBox(it, st) {
   const hw = tw / 2 + st.stroke + it.size * 0.15;
   const hh = it.size * 0.9 + st.stroke;
   const pad = st.shadowBlur * 1.5 + 2;
-  // la corsa dell'estrusione estende il box solo dal lato verso cui punta
+  // la corsa dell'effetto estende il box solo dal lato verso cui punta
   const { ux, uy } = shadowDir(st);
   const ddx = ux * st.shadowDist, ddy = uy * st.shadowDist;
   return {
@@ -202,22 +215,30 @@ function blockBox(it, st) {
   };
 }
 
-// Disegna l'estrusione su canvas a `r` px bitmap per px mondo: copie a passo
-// ~0.6px DEVICE (lisce a quella scala), bordo incluso nella sagoma. Il blur
-// usa l'ombra di un drawImage (ctx.filter manca su alcuni Safari) sul blocco
-// già fuso: niente sovrapposizioni che scuriscono. Colore pieno: l'alpha
-// 0.65 la mette l'elemento <image> (o l'export), uniforme.
-// alignX/alignY: correzione baseline SVG/canvas (vedi _generateBlock).
+// Disegna l'effetto nel canvas dato a `r` px bitmap per px mondo.
+// Blocco 3D: copie a passo ~stepDev px DEVICE (lisce a quella scala), bordo
+// incluso nella sagoma; ombra morbida: una sola copia alla distanza piena.
+// Il blur usa l'ombra di un drawImage (ctx.filter manca su alcuni Safari)
+// via `scratch`, sulla sagoma già fusa: niente sovrapposizioni che
+// scuriscono. Colore pieno: l'alpha la mette l'elemento (o l'export),
+// uniforme. Ritorna il numero di copie (per la diagnostica).
 /**
+ * @param {HTMLCanvasElement} cnv @param {HTMLCanvasElement} scratch
  * @param {TextItem} it @param {TextStyle} st @param {number} r
- * @param {ReturnType<typeof blockBox>} [box] @param {number} [alignX] @param {number} [alignY]
+ * @param {ReturnType<typeof blockBox>} box @param {number} stepDev
  */
-export function renderBlockCanvas(it, st, r, box = blockBox(it, st), alignX = 0, alignY = 0) {
+function renderEffectInto(cnv, scratch, it, st, r, box, stepDev) {
   const cw = Math.max(1, Math.round(box.w * r));
   const ch = Math.max(1, Math.round(box.h * r));
-  const cnv = document.createElement('canvas');
-  cnv.width = cw; cnv.height = ch;
-  const ctx = cnv.getContext('2d');
+  const blur = st.shadowBlur > 0;
+  // i canvas sono riusati fra le rigenerazioni: si ridimensiona (= rialloca)
+  // solo se serve, altrimenti basta pulire
+  const base = blur ? scratch : cnv;
+  if (base.width !== cw || base.height !== ch) { base.width = cw; base.height = ch; }
+  const ctx = base.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.shadowColor = 'rgba(0,0,0,0)'; // stato residuo di un uso precedente
+  ctx.clearRect(0, 0, cw, ch);
   ctx.scale(r, r);
   ctx.translate(-box.x, -box.y);
   ctx.font = textFont(it, st);
@@ -227,34 +248,52 @@ export function renderBlockCanvas(it, st, r, box = blockBox(it, st), alignX = 0,
   ctx.fillStyle = st.shadowColor;
   ctx.strokeStyle = st.shadowColor;
   ctx.lineWidth = st.stroke * 2;
-  const n = Math.max(1, Math.min(400, Math.ceil(st.shadowDist * r / 0.6)));
+  const n = st.block
+    ? Math.max(1, Math.min(400, Math.ceil(st.shadowDist * r / stepDev)))
+    : 1;
   const { ux, uy } = shadowDir(st);
   const sx = ux * st.shadowDist / n, sy = uy * st.shadowDist / n;
-  const bx = it.x + alignX, by = textBaselineY(it, st) + alignY;
+  // SVG e Canvas usano entrambi la baseline alfabetica di textBaselineY();
+  // non correggerla con getBBox(): sugli SVG <text> descrive una scatola
+  // font/logica, non il contorno visivo dei pixel.
+  const bx = it.x, by = textBaselineY(it, st);
   // Si parte da 1: i=0 è la faccia frontale, già coperta dal testo SVG.
   // Disegnarla anche nella bitmap crea un alone/offset apparente sopra il fill.
   for (let i = 1; i <= n; i++) {
     if (st.stroke > 0) ctx.strokeText(it.text, bx + sx * i, by + sy * i);
     ctx.fillText(it.text, bx + sx * i, by + sy * i);
   }
-  if (st.shadowBlur > 0) {
-    const c2 = document.createElement('canvas');
-    c2.width = cw; c2.height = ch;
-    const x2 = c2.getContext('2d');
+  if (blur) {
+    if (cnv.width !== cw || cnv.height !== ch) { cnv.width = cw; cnv.height = ch; }
+    const x2 = cnv.getContext('2d');
+    x2.setTransform(1, 0, 0, 1, 0, 0);
+    x2.clearRect(0, 0, cw, ch);
     x2.shadowColor = st.shadowColor;
     x2.shadowBlur = st.shadowBlur * r;
     x2.shadowOffsetX = cw + ch; // la sorgente sta fuori, in vista solo l'ombra
-    x2.drawImage(cnv, -(cw + ch), 0);
-    return { canvas: c2, box };
+    x2.drawImage(base, -(cw + ch), 0);
+    x2.shadowColor = 'rgba(0,0,0,0)'; // il canvas può fare da `base` dopo
+    x2.shadowBlur = 0;
+    x2.shadowOffsetX = 0;
   }
+  return n;
+}
+
+// Variante one-shot per l'export: disegna l'effetto su un canvas NUOVO alla
+// risoluzione richiesta e lo restituisce col suo ingombro mondo.
+/** @param {TextItem} it @param {TextStyle} st @param {number} r @param {ReturnType<typeof blockBox>} [box] */
+export function renderBlockCanvas(it, st, r, box = blockBox(it, st)) {
+  const cnv = document.createElement('canvas');
+  renderEffectInto(cnv, document.createElement('canvas'), it, st, r, box, FULL_STEP);
   return { canvas: cnv, box };
 }
 
-// Applica item + stile + visibilità/opacità del livello agli attributi SVG.
+// Applica item + stile + visibilità/opacità del livello agli attributi SVG
+// e all'opacità del canvas dell'effetto (che cambia live, senza rigenerare).
 /** @param {Layer} layer */
 export function syncTextSvg(layer) {
   const it = layer.item, t = layer.textEl, st = layer.style;
-  const main = layer.mainEl, block = layer.blockEl;
+  const main = layer.mainEl;
   if (!t) return;
   layer.svg.style.display = layer.visible && layer.opacity > 0 ? 'block' : 'none';
   layer.svg.style.opacity = String(layer.opacity);
@@ -272,37 +311,166 @@ export function syncTextSvg(layer) {
     main.removeAttribute('stroke');
     main.removeAttribute('stroke-width');
   }
-  const block3d = st.block && st.shadowDist > 0;
-  if (block3d) {
-    // alpha sull'ELEMENTO: cambia live senza rigenerare la bitmap
-    block.setAttribute('opacity', String(st.shadowOpacity ?? 0.65));
-    block.style.display = '';
-    // la bitmap si aggiorna in refreshBlockBitmap (chiamata dai piani):
-    // qui basta che resti/diventi visibile
-  } else {
-    block.style.display = 'none';
-  }
-  // filter CSS su elemento SVG: lunghezze in unità utente = px mondo,
-  // quindi l'ombra scala con lo zoom da sola
-  if (!block3d && (st.shadowBlur > 0 || st.shadowDist > 0)) {
-    const { ux, uy } = shadowDir(st);
-    main.style.filter =
-      `drop-shadow(${(ux * st.shadowDist).toFixed(2)}px ` +
-      `${(uy * st.shadowDist).toFixed(2)}px ` +
-      `${st.shadowBlur}px ${shadowCss(st.shadowColor, st.shadowOpacity ?? 0.65)})`;
-  } else {
-    main.style.filter = '';
-  }
+  // alpha dell'effetto sull'ELEMENTO: cambia live senza rigenerare la
+  // bitmap; include l'opacità del livello (il canvas è fratello dell'svg,
+  // non figlio). Il display lo governa refreshBlockBitmap/freeBlockBitmap.
+  layer.blockCanvas.style.opacity =
+    String(layer.opacity * (st.shadowOpacity ?? 0.65));
 }
 
+// Profilo device, deciso una volta al load: sul touch (mobile/tablet) le
+// anteprime costano — dpr alto, CPU lenta — quindi cadenza più rada,
+// risoluzione più bassa e passo più largo; sul desktop una per frame.
+export const COARSE_POINTER =
+  typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+
+// Cadenza delle rigenerazioni: durante un gesto si disegnano anteprime a
+// risoluzione ridotta, mai più ravvicinate di PREVIEW_MS; a gesto fermo da
+// SETTLE_MS l'ultima anteprima viene promossa a qualità piena. Tutto
+// sincrono: niente blob in volo da arbitrare.
+const PREVIEW_MS = COARSE_POINTER ? 40 : 16;
+const SETTLE_MS = COARSE_POINTER ? 200 : 120;
+const PREVIEW_SCALE = COARSE_POINTER ? 0.4 : 0.5; // risoluzione anteprime (lato)
+const FULL_STEP = 0.6;       // passo estrusione in px device, qualità piena
+const PREVIEW_STEP = COARSE_POINTER ? 2.4 : 1.8;  // passo largo in anteprima
 // Quanti frame la camera deve stare ferma prima di rigenerare la bitmap
 // solo perché lo zoom è cambiato (le modifiche di stile non aspettano).
 const BLOCK_STABLE_FRAMES = 12;
 const BLOCK_MAX_SIDE = 2048;       // lato massimo della bitmap
 const BLOCK_MAX_AREA = 2_000_000;  // ~8 MB RGBA per livello, al massimo
-// Diagnostica temporanea: stampa in console le misure che allineano SVG e
-// bitmap del blocco 3D, così si vede se lo scarto nasce da baseline/box/pixel.
-const DEBUG_BLOCK_3D = true;
+
+// Chiamata dai piani a ogni frame per ogni livello testo: decide se la
+// bitmap dell'effetto va (ri)generata e a quale qualità. Tutte le uscite
+// veloci sono confronti su numeri/stringhe: a regime non alloca e non
+// disegna nulla.
+/** @param {Layer} layer @param {Camera} camera @param {boolean} camChanged */
+export function refreshBlockBitmap(layer, camera, camChanged) {
+  const st = layer.style, it = layer.item;
+  const on = (st.block ? st.shadowDist > 0 : st.shadowBlur > 0 || st.shadowDist > 0) &&
+    layer.visible && layer.opacity > 0 && it.text.length > 0;
+  if (!on) {
+    if (layer.blockKey) freeBlockBitmap(layer);
+    return;
+  }
+  layer.blockStable = camChanged ? 0 : (layer.blockStable || 0) + 1;
+  // contenuto della bitmap (posizione esclusa: sposta solo il transform).
+  // Lo stato del font fa parte della chiave: una bitmap generata col font
+  // di fallback si rigenera da sola quando il font vero atterra.
+  const fontReady = document.fonts.check(`${st.weight} 16px "${st.font}"`) ? 1 : 0;
+  const key = `${st.block ? 'B' : 'S'}|${it.text}|${it.size}|${st.font}|${st.weight}|` +
+    `${st.stroke}|${st.shadowColor}|${st.shadowBlur}|${st.shadowDist}|` +
+    `${st.shadowAngle ?? 45}|F${fontReady}`;
+  const now = performance.now();
+  if (layer.blockKey !== key) {
+    // stile/testo cambiati: anteprima subito ma con un tetto di frequenza,
+    // così il drag di uno slider non disegna una bitmap a ogni evento
+    if (!layer.blockKey || now - (layer.blockT || 0) > PREVIEW_MS) {
+      layer.blockKey = key;
+      layer.blockT = now;
+      _generateBlock(layer, camera, true);
+    }
+    return;
+  }
+  // gesto fermo: l'ultima anteprima viene promossa a qualità piena
+  if (layer.blockQuality !== 'full') {
+    if (now - (layer.blockT || 0) > SETTLE_MS && layer.blockStable >= 2) {
+      layer.blockT = now;
+      _generateBlock(layer, camera, false);
+    }
+    return;
+  }
+  // zoom assestato su una scala troppo diversa da quella renderizzata
+  const ideal = _blockScale(camera, layer.blockBoxW || 1, layer.blockBoxH || 1);
+  if (Math.abs(Math.log2(ideal / layer.blockScale)) > 0.4 &&
+    layer.blockStable >= BLOCK_STABLE_FRAMES) {
+    layer.blockT = now;
+    _generateBlock(layer, camera, false);
+  }
+}
+
+/** @param {Camera} camera @param {number} w @param {number} h */
+function _blockScale(camera, w, h) {
+  return Math.max(0.05, Math.min(
+    camera.zoom * camera.dpr,
+    BLOCK_MAX_SIDE / w, BLOCK_MAX_SIDE / h,
+    Math.sqrt(BLOCK_MAX_AREA / (w * h))));
+}
+
+// Scratch condiviso per la passata di blur (sagoma pre-sfocatura): riusato
+// fra tutte le rigenerazioni live, mai più grande di BLOCK_MAX_SIDE².
+/** @type {HTMLCanvasElement|null} */
+let _scratch = null;
+
+/** @param {Layer} layer @param {Camera} camera @param {boolean} preview */
+function _generateBlock(layer, camera, preview) {
+  const it = layer.item, st = layer.style;
+  const box = blockBox(it, st);
+  // ancora relativa al testo: se item.x/y si sposta, l'effetto lo segue
+  // dal transform senza rigenerare
+  layer.blockOffX = box.x - it.x;
+  layer.blockOffY = box.y - it.y;
+  layer.blockBoxW = box.w;
+  layer.blockBoxH = box.h;
+  const r = Math.max(0.05,
+    _blockScale(camera, box.w, box.h) * (preview ? PREVIEW_SCALE : 1));
+  layer.blockScale = r;
+  layer.blockQuality = preview ? 'preview' : 'full';
+  if (!_scratch) _scratch = document.createElement('canvas');
+  const cnv = layer.blockCanvas;
+  const n = renderEffectInto(cnv, _scratch, it, st, r, box,
+    preview ? PREVIEW_STEP : FULL_STEP);
+  // dimensione CSS = pixel della bitmap: la scala visiva la fa il transform
+  cnv.style.width = cnv.width + 'px';
+  cnv.style.height = cnv.height + 'px';
+  cnv.style.display = '';
+  syncBlockTransform(layer, camera);
+  if (debug3d) _debugDump(layer, box, r, n);
+}
+
+// Ancora il canvas dell'effetto allo schermo: stessa mappatura mondo→schermo
+// del viewBox, come transform CSS. Durante pan/zoom cambia SOLO questa
+// stringa: il compositor scala la texture, niente repaint, niente filtri.
+/** @param {Layer} layer @param {Camera} camera */
+export function syncBlockTransform(layer, camera) {
+  if (!layer.blockScale) return;
+  const wx = layer.item.x + (layer.blockOffX || 0);
+  const wy = layer.item.y + (layer.blockOffY || 0);
+  const sx = (wx - camera.x) * camera.zoom + camera.w * 0.5;
+  const sy = (wy - camera.y) * camera.zoom + camera.h * 0.5;
+  const k = camera.zoom / layer.blockScale;
+  layer.blockCanvas.style.transform =
+    `translate3d(${sx}px,${sy}px,0) scale(${k})`;
+}
+
+// Libera la bitmap dell'effetto (toggle off, livello morto, clearAll).
+/** @param {Layer} layer */
+export function freeBlockBitmap(layer) {
+  const cnv = layer.blockCanvas;
+  if (cnv) {
+    cnv.style.display = 'none';
+    cnv.width = 0;  // backing store libero subito
+    cnv.height = 0;
+  }
+  layer.blockKey = '';
+  layer.blockScale = 0;
+  layer.blockQuality = '';
+}
+
+// ---- diagnostica estrusione/ombra ----------------------------------------
+// OFF di default: il suo path legge l'intera bitmap con getImageData (più
+// getBBox e console.table), un costo enorme se resta acceso durante i gesti
+// — era la prima causa del lag degli slider. Si comanda dalla console:
+//   __textDebug3d()       toggle
+//   __textDebug3d(true)   accende     __textDebug3d(false)   spegne
+// Stampa la diagnosi a ogni rigenerazione successiva, anteprime incluse.
+let debug3d = false;
+
+/** @param {boolean} [v] undefined = toggle @returns {boolean} stato attuale */
+export function setBlockDebug3d(v) {
+  debug3d = v === undefined ? !debug3d : !!v;
+  console.info(`[Text 3D debug] ${debug3d ? 'ON' : 'OFF'}`);
+  return debug3d;
+}
 
 /** @param {number} n */
 function dbgN(n) { return Number.isFinite(n) ? Math.round(n * 1000) / 1000 : n; }
@@ -346,22 +514,21 @@ function debugAlphaBounds(canvas, r, box) {
 
 /**
  * @param {Layer} layer @param {ReturnType<typeof blockBox>} box @param {number} r
- * @param {number} ax @param {number} ay
+ * @param {number} n copie disegnate nella bitmap
  * @param {{x: number, y: number, width: number, height: number}|null} svgBox
- * @param {TextMetrics|null} metrics @param {HTMLCanvasElement} canvas
+ * @param {TextMetrics|null} metrics
  */
-function debugBlock3d(layer, box, r, ax, ay, svgBox, metrics, canvas) {
+function debugBlock3d(layer, box, r, n, svgBox, metrics) {
   const it = layer.item, st = layer.style;
-  const alpha = debugAlphaBounds(canvas, r, box);
+  const alpha = debugAlphaBounds(layer.blockCanvas, r, box);
   const { ux, uy } = shadowDir(st);
-  const n = Math.max(1, Math.min(400, Math.ceil(st.shadowDist * r / 0.6)));
   const mLeft = metrics?.actualBoundingBoxLeft ?? 0;
   const mRight = metrics?.actualBoundingBoxRight ?? 0;
   const mAsc = metrics?.actualBoundingBoxAscent ?? 0;
   const mDes = metrics?.actualBoundingBoxDescent ?? 0;
-  const baseY = textBaselineY(it, st) + ay;
+  const baseY = textBaselineY(it, st);
   const canvasBox = metrics ? {
-    x: it.x + ax - mLeft,
+    x: it.x - mLeft,
     y: baseY - mAsc,
     width: mLeft + mRight,
     height: mAsc + mDes,
@@ -392,7 +559,6 @@ function debugBlock3d(layer, box, r, ax, ay, svgBox, metrics, canvas) {
   console.warn('[Text 3D debug] diagnosi rapida', {
     text: it.text,
     baselineY: dbgN(baseY),
-    alignY: dbgN(ay),
     alphaMinusSvgY: alphaDelta?.alphaMinusSvgY ?? null,
     alphaMinusSvgX: alphaDelta?.alphaMinusSvgX ?? null,
     firstCopy: 'i=1, prima copia spostata dal testo frontale',
@@ -401,22 +567,22 @@ function debugBlock3d(layer, box, r, ax, ay, svgBox, metrics, canvas) {
   console.groupCollapsed(`[Text 3D debug] "${it.text}" layer ${layer.id}`);
   console.table({
     font: `${st.weight} ${it.size}px ${st.font}`,
+    mode: st.block ? 'blocco 3D' : 'ombra morbida',
+    quality: layer.blockQuality,
     shadowDist: st.shadowDist,
     shadowAngle: st.shadowAngle ?? 45,
     dirX: dbgN(ux),
     dirY: dbgN(uy),
     bitmapScale: dbgN(r),
-    extrusionCopies: n,
+    copies: n,
     firstCopy: 'i=1, prima copia spostata dal testo frontale',
     firstStepX: dbgN(ux * st.shadowDist / n),
     firstStepY: dbgN(uy * st.shadowDist / n),
-    alignX: dbgN(ax),
     baselineY: dbgN(baseY),
-    alignY: dbgN(ay),
   });
   console.log('svg text bbox', dbgRect(svgBox));
-  console.log('canvas text bbox dopo correzione', dbgRect(canvasBox));
-  console.log('block image box mondo', dbgRect(box));
+  console.log('canvas text bbox', dbgRect(canvasBox));
+  console.log('effect box mondo', dbgRect(box));
   console.log('bitmap alpha bbox', alpha);
   console.log('delta canvas-vs-svg', delta);
   console.log('delta alpha-vs-svg', alphaDelta);
@@ -424,70 +590,11 @@ function debugBlock3d(layer, box, r, ax, ay, svgBox, metrics, canvas) {
   console.groupEnd();
 }
 
-// Chiamata dai piani a ogni frame per ogni livello testo: decide se la
-// bitmap dell'estrusione va (ri)generata. Tutte le uscite veloci sono
-// confronti su numeri/stringhe: a regime non alloca e non disegna nulla.
-/** @param {Layer} layer @param {Camera} camera @param {boolean} camChanged */
-export function refreshBlockBitmap(layer, camera, camChanged) {
-  const st = layer.style, it = layer.item;
-  const on = st.block && st.shadowDist > 0 && layer.visible && layer.opacity > 0 &&
-    it.text.length > 0;
-  if (!on) {
-    if (layer.blockUrl) freeBlockBitmap(layer);
-    return;
-  }
-  layer.blockStable = camChanged ? 0 : (layer.blockStable || 0) + 1;
-  // un blob è già in volo: aspettarlo, MAI accavallare le generazioni
-  // (rigenerare prima che atterri lo scarterebbe, e da capo all'infinito)
-  if (layer.blockPending) return;
-  // contenuto della bitmap (posizione esclusa: sposta solo gli attributi).
-  // Lo stato del font fa parte della chiave: una bitmap generata col font
-  // di fallback si rigenera da sola quando il font vero atterra.
-  const fontReady = document.fonts.check(`${st.weight} 16px "${st.font}"`) ? 1 : 0;
-  const key = `${it.text}|${it.size}|${st.font}|${st.weight}|${st.stroke}|` +
-    `${st.shadowColor}|${st.shadowBlur}|${st.shadowDist}|${st.shadowAngle ?? 45}|F${fontReady}`;
-  const fresh = layer.blockKey === key && !!layer.blockUrl;
-  if (!fresh) {
-    // stile/testo cambiati: rigenera subito ma con un tetto di frequenza,
-    // così il drag di uno slider non disegna una bitmap a ogni evento
-    const now = performance.now();
-    if (!layer.blockUrl || now - (layer.blockT || 0) > 80) {
-      layer.blockKey = key;
-      layer.blockT = now;
-      _generateBlock(layer, camera);
-    }
-    return;
-  }
-  // zoom assestato su una scala troppo diversa da quella renderizzata
-  const w = layer.blockBoxW || 1, h = layer.blockBoxH || 1;
-  const ideal = _blockScale(camera, w, h);
-  if (Math.abs(Math.log2(ideal / layer.blockScale)) > 0.4 &&
-    layer.blockStable >= BLOCK_STABLE_FRAMES) {
-    layer.blockT = performance.now();
-    _generateBlock(layer, camera);
-  }
-}
-
-/** @param {Camera} camera @param {number} w @param {number} h */
-function _blockScale(camera, w, h) {
-  return Math.max(0.05, Math.min(
-    camera.zoom * camera.dpr,
-    BLOCK_MAX_SIDE / w, BLOCK_MAX_SIDE / h,
-    Math.sqrt(BLOCK_MAX_AREA / (w * h))));
-}
-
-/** @param {Layer} layer @param {Camera} camera */
-function _generateBlock(layer, camera) {
+// Raccoglie le misure di confronto e stampa la diagnosi. getBBox forza un
+// layout flush sincrono: vive SOLO qui, mai nel path di rigenerazione.
+/** @param {Layer} layer @param {ReturnType<typeof blockBox>} box @param {number} r @param {number} n */
+function _debugDump(layer, box, r, n) {
   const it = layer.item, st = layer.style;
-  const box = blockBox(it, st);
-  layer.blockBoxW = box.w;
-  layer.blockBoxH = box.h;
-  const r = _blockScale(camera, box.w, box.h);
-  layer.blockScale = r;
-  // SVG e Canvas usano entrambi la baseline alfabetica calcolata da
-  // textBaselineY(). Non usare getBBox() per correggerla: sugli SVG <text>
-  // descrive una scatola font/logica, non il contorno visivo dei pixel.
-  let ax = 0, ay = 0;
   /** @type {{x: number, y: number, width: number, height: number}|null} */
   let svgBox = null;
   /** @type {TextMetrics|null} */
@@ -502,39 +609,8 @@ function _generateBlock(layer, camera) {
       metrics = measurer.measureText(it.text);
     }
   } catch (err) {
-    if (DEBUG_BLOCK_3D) console.warn('[Text 3D debug] getBBox fallito:', err);
-    // SVG non renderizzato: si resta senza correzione
+    console.warn('[Text 3D debug] getBBox fallito:', err);
+    // SVG non renderizzato: si resta senza confronto
   }
-  const { canvas } = renderBlockCanvas(it, st, r, box, ax, ay);
-  if (DEBUG_BLOCK_3D) debugBlock3d(layer, box, r, ax, ay, svgBox, metrics, canvas);
-  // l'encoding è async: un token scarta i risultati superati (free/undo)
-  const gen = (layer.blockGen = (layer.blockGen || 0) + 1);
-  layer.blockPending = gen;
-  canvas.toBlob((blob) => {
-    if (layer.blockPending === gen) layer.blockPending = 0;
-    if (!blob || gen !== layer.blockGen || !layer.blockEl) return;
-    if (layer.blockUrl) URL.revokeObjectURL(layer.blockUrl);
-    layer.blockUrl = URL.createObjectURL(blob);
-    const b = layer.blockEl;
-    b.setAttribute('href', layer.blockUrl);
-    b.setAttribute('x', String(box.x));
-    b.setAttribute('y', String(box.y));
-    b.setAttribute('width', String(box.w));
-    b.setAttribute('height', String(box.h));
-  });
-}
-
-// Libera la bitmap dell'estrusione (toggle off, livello morto, clearAll).
-/** @param {Layer} layer */
-export function freeBlockBitmap(layer) {
-  if (layer.blockUrl) {
-    URL.revokeObjectURL(layer.blockUrl);
-    layer.blockUrl = '';
-  }
-  if (layer.blockEl) layer.blockEl.removeAttribute('href');
-  layer.blockScale = 0;
-  layer.blockKey = '';
-  layer.blockPending = 0;
-  // un blob ancora in volo per questo livello muore qui
-  layer.blockGen = (layer.blockGen || 0) + 1;
+  debugBlock3d(layer, box, r, n, svgBox, metrics);
 }

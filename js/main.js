@@ -16,7 +16,7 @@ import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
 import { LayerManager, makeRasterLayer } from './layers.js';
-import { freeBlockBitmap } from './text_layer.js';
+import { freeBlockBitmap, setBlockDebug3d } from './text_layer.js';
 import { Planes } from './planes.js';
 import { WasmHeap } from './wasm_core.js';
 
@@ -523,3 +523,6 @@ export class App {
 const forceJs = new URLSearchParams(location.search).get('engine') === 'js';
 const heap = forceJs ? null : await WasmHeap.load(new URL('./raster_core.wasm', import.meta.url));
 /** @type {any} */ (window).__app = new App(heap);
+// Diagnostica del testo 3D/ombra dalla console: __textDebug3d() fa toggle,
+// __textDebug3d(true|false) imposta. Costosa: accenderla solo per indagare.
+/** @type {any} */ (window).__textDebug3d = setBlockDebug3d;

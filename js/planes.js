@@ -6,7 +6,7 @@
 // l'ordine della pila. Caso comune (niente sandwich): un canvas + eventuali
 // SVG in cima — zero overhead rispetto a prima.
 
-import { syncTextSvg, createTextSvg, refreshBlockBitmap } from './text_layer.js';
+import { syncTextSvg, createTextSvg, refreshBlockBitmap, syncBlockTransform, COARSE_POINTER } from './text_layer.js';
 import { Canvas2DRenderer } from './renderer_2d.js';
 
 /** @typedef {import('./camera.js').Camera} Camera */
@@ -16,6 +16,10 @@ import { Canvas2DRenderer } from './renderer_2d.js';
 /** @typedef {import('./renderer_gl.js').GLRenderer} GLRenderer */
 
 /** @typedef {{type: 'raster', layers: Layer[]}|{type: 'text', layer: Layer}} Group */
+
+// Frame a camera ferma prima di scongelare i piani testo dopo uno zoom
+// touch (~100ms a 60Hz: il repaint nitido arriva subito dopo il rilascio).
+const FREEZE_SETTLE_FRAMES = 6;
 
 export class Planes {
   /** @param {HTMLElement} container @param {HTMLElement} gridEl */
@@ -35,6 +39,17 @@ export class Planes {
     this._camChanged = true;
     this._vb = '';
     this._w = 1; this._h = 1; this._dpr = 1;
+    // Freeze del testo durante lo zoom touch: finché lo zoom si muove i
+    // piani SVG restano dipinti al viewBox di partenza e il delta lo fa un
+    // transform CSS (compositor: leggera sfocatura, come le anteprime degli
+    // slider); a gesto fermo tornano vettoriali e nitidi. Solo pointer
+    // coarse: su desktop ridipingere i glifi a ogni frame regge ed è nitido.
+    this._freezeOk = COARSE_POINTER;
+    this._frozen = false;
+    this._fz = { x: 0, y: 0, z: 1, w: 0, h: 0 }; // camera del viewBox congelato
+    this._fzVb = '';
+    this._fzT = '';
+    this._fzStable = 0;
   }
 
   /** @param {number} w @param {number} h @param {number} dpr */
@@ -77,7 +92,8 @@ export class Planes {
     for (const g of groups) {
       if (g.type === 'text') {
         if (!g.layer.svg) createTextSvg(g.layer);
-        order.push(g.layer.svg);
+        // canvas dell'effetto subito sotto il suo testo vettoriale
+        order.push(g.layer.blockCanvas, g.layer.svg);
         where.set(g.layer.id, -2); // i testi non migrano: piano proprio
         continue;
       }
@@ -165,6 +181,9 @@ export class Planes {
 
     const camChanged = camera.x !== this._cx || camera.y !== this._cy ||
       camera.zoom !== this._cz || camera.w !== this._cw || camera.h !== this._ch;
+    // PRIMA dell'aggiornamento della cache: la base del freeze è la camera
+    // dell'ultimo frame dipinto
+    if (this._freezeOk) this._updateFreeze(camera, camChanged);
     if (camChanged) {
       this._cx = camera.x; this._cy = camera.y; this._cz = camera.zoom;
       this._cw = camera.w; this._ch = camera.h;
@@ -197,12 +216,27 @@ export class Planes {
     c2dIdx = 0;
     for (const g of this.groups) {
       if (g.type === 'text') {
-        if (g.layer.styleDirty) { g.layer.styleDirty = false; syncTextSvg(g.layer); }
-        if (camChanged || g.layer.svg.getAttribute('viewBox') !== this._vb) {
-          g.layer.svg.setAttribute('viewBox', this._vb);
+        const wasDirty = g.layer.styleDirty;
+        if (wasDirty) { g.layer.styleDirty = false; syncTextSvg(g.layer); }
+        if (this._frozen) {
+          // zoom in corso: viewBox fermo alla base, il delta lo fa il
+          // compositor (l'effetto bitmap resta allineato: stessa affine)
+          if (g.layer.svg.getAttribute('viewBox') !== this._fzVb) {
+            g.layer.svg.setAttribute('viewBox', this._fzVb);
+          }
+          if (g.layer.svg.style.transform !== this._fzT) {
+            g.layer.svg.style.transform = this._fzT;
+          }
+        } else {
+          if (g.layer.svg.style.transform) g.layer.svg.style.transform = '';
+          if (camChanged || g.layer.svg.getAttribute('viewBox') !== this._vb) {
+            g.layer.svg.setAttribute('viewBox', this._vb);
+          }
         }
-        // bitmap dell'estrusione 3D: a regime è un confronto e basta
+        // bitmap dell'effetto: a regime è un confronto e basta
         refreshBlockBitmap(g.layer, camera, camChanged);
+        // l'ancora del canvas segue camera e spostamenti del testo
+        if (camChanged || wasDirty) syncBlockTransform(g.layer, camera);
         continue;
       }
       const hasActive = g.layers.some((l) => l.id === activeId);
@@ -228,6 +262,39 @@ export class Planes {
 
   // Forza il ridisegno dei piani 2D al prossimo frame (undo, visibilità...).
   invalidate() { this._forceDraw = true; }
+
+  // Gestisce il freeze dei piani testo durante lo zoom touch. Parte quando
+  // CAMBIA lo zoom (il pan puro resta live: trasla soltanto), tiene fermo il
+  // viewBox della base e mappa base→camera con un transform CSS esatto:
+  // T(S0(w)) = S(w) per ogni punto mondo w, quindi il testo resta incollato
+  // ai raster sottostanti. Dopo FREEZE_SETTLE_FRAMES a camera ferma si
+  // scongela: i piani tolgono il transform e riprendono il viewBox vivo.
+  /** @param {Camera} camera @param {boolean} camChanged */
+  _updateFreeze(camera, camChanged) {
+    if (!this._frozen) {
+      if (!(camChanged && Number.isFinite(this._cz) && camera.zoom !== this._cz &&
+        camera.w === this._cw && camera.h === this._ch)) return;
+      this._frozen = true;
+      this._fz.x = this._cx; this._fz.y = this._cy; this._fz.z = this._cz;
+      this._fz.w = this._cw; this._fz.h = this._ch;
+      this._fzVb = this._vb;
+      this._fzStable = 0;
+    }
+    if (camera.w !== this._fz.w || camera.h !== this._fz.h) {
+      // resize a metà gesto: la base non vale più, si torna vettoriali
+      this._frozen = false;
+      return;
+    }
+    if (camChanged) {
+      this._fzStable = 0;
+      const k = camera.zoom / this._fz.z;
+      const tx = (this._fz.x - camera.x) * camera.zoom + camera.w * 0.5 * (1 - k);
+      const ty = (this._fz.y - camera.y) * camera.zoom + camera.h * 0.5 * (1 - k);
+      this._fzT = `translate3d(${tx}px,${ty}px,0) scale(${k})`;
+    } else if (++this._fzStable >= FREEZE_SETTLE_FRAMES) {
+      this._frozen = false;
+    }
+  }
 
   /** @param {Camera} camera */
   _syncGrid(camera) {

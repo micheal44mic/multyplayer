@@ -25,17 +25,17 @@ export const MAX_LAYERS = 16;
  * @property {boolean} [styleDirty] testo: attributi SVG da risincronizzare
  * @property {SVGSVGElement} [svg] testo: piano SVG (creato/posseduto da planes)
  * @property {SVGTextElement} [textEl] sorgente in <defs> (geometria + contenuto)
- * @property {SVGImageElement} [blockEl] bitmap dell'estrusione 3D (px mondo)
- * @property {SVGUseElement} [mainEl] testo visibile (fill/bordo/ombra morbida)
- * @property {string} [blockUrl] blob URL della bitmap estrusione
- * @property {string} [blockKey] contenuto renderizzato nella bitmap
+ * @property {HTMLCanvasElement} [blockCanvas] bitmap dell'effetto (estrusione 3D/ombra), fratello sotto l'svg
+ * @property {SVGUseElement} [mainEl] testo visibile (fill/bordo)
+ * @property {string} [blockKey] contenuto renderizzato nella bitmap ('' = nessuna)
  * @property {number} [blockScale] px bitmap per px mondo dell'ultimo render
+ * @property {''|'preview'|'full'} [blockQuality] qualità dell'ultimo render
+ * @property {number} [blockOffX] ancora della bitmap relativa a item.x/y (px mondo)
+ * @property {number} [blockOffY]
  * @property {number} [blockBoxW] ingombro mondo dell'ultimo render
  * @property {number} [blockBoxH]
  * @property {number} [blockStable] frame consecutivi a camera ferma
- * @property {number} [blockGen] token anti-risultati-stantii del toBlob
- * @property {number} [blockPending] generazione col blob ancora in volo (0 = nessuna)
- * @property {number} [blockT] timestamp ultima generazione (throttle slider)
+ * @property {number} [blockT] timestamp ultima generazione (cadenza anteprime)
  * @property {boolean} [thumbDirty] miniatura del pannello da rigenerare
  */
 
