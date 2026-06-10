@@ -6,6 +6,7 @@ import { hexToRgb, clamp } from './util.js';
 import { CHUNK } from './store.js';
 import { ZOOM_MIN, ZOOM_MAX } from './camera.js';
 import { BrushPreview } from './brush_preview.js';
+import { textureFromFile, defaultGrainTexture } from './texture.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Tool} Tool */
@@ -24,6 +25,7 @@ const BRUSH_DEFAULTS = (() => {
  * @typedef {Object} RowDef
  * @property {string} [sec]
  * @property {boolean} [renderer]
+ * @property {boolean} [texture] riga speciale: import/gestione texture
  * @property {{label: string, hint?: string, get: () => boolean, set: (v: boolean) => void}} [toggle]
  * @property {string} [id]
  * @property {string} [label]
@@ -43,6 +45,7 @@ const BRUSH_DEFAULTS = (() => {
 const ICONS = {
   base: '<path d="M20.7 3.3c-1-1-2.7-.9-3.6.1L9 11.5l3.5 3.5 8.1-8.1c1-1 1.1-2.6.1-3.6zM8 13c-2 0-3.5 1.6-3.5 3.5 0 1.5-1.2 2.2-2.5 2.5 1 1.3 2.7 2 4.5 2 2.8 0 5-2.2 5-5L8 13z"/>',
   shape: '<path d="M12 4C6.5 4 2 7.6 2 12s4.5 8 10 8 10-3.6 10-8-4.5-8-10-8zm0 2c4.4 0 8 2.7 8 6s-3.6 6-8 6-8-2.7-8-6 3.6-6 8-6z"/>',
+  texture: '<path fill-rule="evenodd" d="M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm0 2v14h14V5H5z"/><circle cx="8.5" cy="8.5" r="1.7"/><circle cx="14.5" cy="7.5" r="1.1"/><circle cx="17" cy="11" r="1.3"/><circle cx="7.5" cy="14.5" r="1.2"/><circle cx="12" cy="12" r="1"/><circle cx="14" cy="16.5" r="1.8"/>',
   scatter: '<path d="M7 3.5a2.2 2.2 0 1 1-.01 0zM16.5 5.5a2.8 2.8 0 1 1-.01 0zM5.5 12.5a2.8 2.8 0 1 1-.01 0zM14 13a3.6 3.6 0 1 1-.01 0z"/>',
   jitter: '<path d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/>',
   color: '<path d="M12 2.5s6.5 7 6.5 11.4a6.5 6.5 0 1 1-13 0C5.5 9.5 12 2.5 12 2.5z"/>',
@@ -63,6 +66,17 @@ const TABS = [
   { id: 'shape', label: 'Forma', icon: ICONS.shape, rows: [
     { id: 'roundness', label: 'Rotondità', min: 5, max: 100, step: 1, get: () => brush.roundness * 100, set: v => brush.roundness = v / 100, fmt: v => v + '%' },
     { id: 'angle', label: 'Angolo', min: 0, max: 360, step: 1, get: () => brush.angle, set: v => brush.angle = v, fmt: v => v + '°' },
+  ] },
+  { id: 'texture', label: 'Texture', icon: ICONS.texture, rows: [
+    { texture: true },
+    { toggle: { label: 'Texture attiva', hint: 'la grana modula l\'alpha di ogni stamp', get: () => brush.textureOn, set: v => brush.textureOn = v }, dep: () => !!brush.texture },
+    { id: 'txscale', label: 'Scala', min: 10, max: 400, step: 1, log: true, dep: () => !!brush.texture && brush.textureOn, get: () => brush.textureScale * 100, set: v => brush.textureScale = v / 100, fmt: v => Math.round(v) + '%' },
+    { id: 'txdepth', label: 'Profondità', min: 0, max: 100, step: 1, dep: () => !!brush.texture && brush.textureOn, get: () => brush.textureDepth * 100, set: v => brush.textureDepth = v / 100, fmt: v => v + '%' },
+    { id: 'txcontrast', label: 'Contrasto', min: 10, max: 300, step: 1, dep: () => !!brush.texture && brush.textureOn, get: () => brush.textureContrast * 100, set: v => brush.textureContrast = v / 100, fmt: v => v + '%' },
+    { id: 'txfloor', label: 'Tono minimo', min: 0, max: 100, step: 1, dep: () => !!brush.texture && brush.textureOn, get: () => brush.textureFloor * 100, set: v => brush.textureFloor = v / 100, fmt: v => v + '%' },
+    { toggle: { label: 'Inverti', hint: 'scuro = pieno invece di vuoto', get: () => brush.textureInvert, set: v => brush.textureInvert = v }, dep: () => !!brush.texture && brush.textureOn },
+    { toggle: { label: 'Segue il tratto', hint: 'OFF: grana fissa sul canvas (carta) · ON: la texture segue ogni stamp', get: () => brush.textureMoving, set: v => brush.textureMoving = v }, dep: () => !!brush.texture && brush.textureOn },
+    { toggle: { label: 'Colori della texture', hint: 'il tratto usa i colori dell\'immagine invece del colore pennello', get: () => brush.textureUseColor, set: v => brush.textureUseColor = v }, dep: () => !!brush.texture && brush.textureOn },
   ] },
   { id: 'scatter', label: 'Scatter', icon: ICONS.scatter, rows: [
     { toggle: { label: 'Scatter', hint: 'ogni stamp diventa una nuvola di particelle', get: () => brush.scatter, set: v => brush.scatter = v } },
@@ -111,6 +125,8 @@ export class UI {
     this._depRefresh = [];
     /** @type {(() => void)[]} */
     this._toggleSync = [];
+    /** @type {(() => void)|null} */
+    this._texRefresh = null;
     this._buildStudio();
     this._bindToolbar();
     this._bindKeys();
@@ -136,7 +152,8 @@ export class UI {
       for (const def of tab.rows) {
         if (def.sec) pane.appendChild(this._buildSection(def.sec));
         else if (def.renderer) pane.appendChild(this._buildRendererToggle());
-        else if (def.toggle) pane.appendChild(this._buildToggle(def.toggle));
+        else if (def.texture) pane.appendChild(this._buildTextureRow());
+        else if (def.toggle) pane.appendChild(this._buildToggle(def.toggle, def.dep));
         else pane.appendChild(this._buildSlider(def));
       }
       panes.appendChild(pane);
@@ -167,10 +184,18 @@ export class UI {
     return h;
   }
 
-  /** @param {{label: string, hint?: string, get: () => boolean, set: (v: boolean) => void}} t */
-  _buildToggle(t) {
+  /**
+   * @param {{label: string, hint?: string, get: () => boolean, set: (v: boolean) => void}} t
+   * @param {(() => boolean)} [dep]
+   */
+  _buildToggle(t, dep) {
     const lab = document.createElement('label');
     lab.className = 'p-toggle';
+    if (dep) {
+      const apply = () => lab.classList.toggle('p-off', !dep());
+      this._depRefresh.push(apply);
+      apply();
+    }
     const span = document.createElement('span');
     span.textContent = t.label;
     if (t.hint) {
@@ -213,6 +238,112 @@ export class UI {
     knob.className = 'knob';
     lab.append(span, input, knob);
     return lab;
+  }
+
+  // Riga texture: thumbnail + nome + import da file / grana di default /
+  // rimozione. La texture vive su brush.texture (vedi texture.js).
+  _buildTextureRow() {
+    const wrap = document.createElement('div');
+    wrap.className = 'p-texture';
+
+    const thumb = /** @type {HTMLCanvasElement} */ (document.createElement('canvas'));
+    thumb.className = 'p-tex-thumb';
+    thumb.width = 96; thumb.height = 96;
+
+    const info = document.createElement('div');
+    info.className = 'p-tex-info';
+    const name = document.createElement('div');
+    name.className = 'p-tex-name';
+    const meta = document.createElement('div');
+    meta.className = 'p-tex-meta';
+
+    const file = document.createElement('input');
+    file.type = 'file';
+    file.accept = 'image/*';
+    file.hidden = true;
+    file.addEventListener('change', async () => {
+      const f = file.files && file.files[0];
+      file.value = '';
+      if (!f) return;
+      try {
+        this._setTexture(await textureFromFile(f));
+      } catch {
+        alert('Immagine non valida o non leggibile.');
+      }
+    });
+
+    const btns = document.createElement('div');
+    btns.className = 'p-tex-btns';
+    /** @param {string} label @param {string} title @param {() => void} fn */
+    const mkBtn = (label, title, fn) => {
+      const b = document.createElement('button');
+      b.className = 'p-tex-btn';
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener('click', fn);
+      btns.appendChild(b);
+      return b;
+    };
+    mkBtn('Importa…', 'Importa un\'immagine come texture', () => file.click());
+    mkBtn('Grana carta', 'Grana procedurale di default', () => this._setTexture(defaultGrainTexture()));
+    const del = mkBtn('✕', 'Rimuovi texture', () => {
+      brush.texture = null;
+      brush.textureOn = false;
+      this.syncSliders();
+      this._refreshDeps();
+      this._settingChanged();
+    });
+    del.classList.add('danger');
+
+    this._texRefresh = () => {
+      const tex = brush.texture;
+      const ctx = thumb.getContext('2d');
+      ctx.clearRect(0, 0, thumb.width, thumb.height);
+      if (tex) {
+        // thumbnail dal livello mip più vicino alla taglia (niente ImageData
+        // giganti per texture native grandi), a colori
+        let level = 0;
+        while (level + 1 < tex.rgbMips.length &&
+          tex.mw[level] > thumb.width * 2 && tex.mh[level] > thumb.height * 2) level++;
+        const lw = tex.mw[level], lh = tex.mh[level], rgb = tex.rgbMips[level];
+        const tmp = document.createElement('canvas');
+        tmp.width = lw; tmp.height = lh;
+        const tctx = tmp.getContext('2d');
+        const img = tctx.createImageData(lw, lh);
+        const d = img.data;
+        for (let i = 0, o = 0; i < lw * lh; i++, o += 4) {
+          d[o] = rgb[i * 3];
+          d[o + 1] = rgb[i * 3 + 1];
+          d[o + 2] = rgb[i * 3 + 2];
+          d[o + 3] = 255;
+        }
+        tctx.putImageData(img, 0, 0);
+        ctx.drawImage(tmp, 0, 0, thumb.width, thumb.height);
+        name.textContent = tex.name;
+        meta.textContent = `${tex.w}×${tex.h}`;
+        del.disabled = false;
+      } else {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, thumb.width, thumb.height);
+        name.textContent = 'Nessuna texture';
+        meta.textContent = 'importa un\'immagine o usa la grana';
+        del.disabled = true;
+      }
+    };
+    this._texRefresh();
+
+    info.append(name, meta, btns);
+    wrap.append(thumb, info, file);
+    return wrap;
+  }
+
+  /** @param {import('./texture.js').BrushTexture} tex */
+  _setTexture(tex) {
+    brush.texture = tex;
+    brush.textureOn = true;
+    this.syncSliders();
+    this._refreshDeps();
+    this._settingChanged();
   }
 
   /** @param {RowDef} def */
@@ -332,6 +463,7 @@ export class UI {
       def._refresh();
     }
     for (const f of this._toggleSync) f();
+    if (this._texRefresh) this._texRefresh();
   }
 
   // ---- toolbar / scorciatoie ----

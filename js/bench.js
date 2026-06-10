@@ -5,6 +5,8 @@
 // misura raster + commit. Il checksum FNV dei pixel del documento (rep 0)
 // verifica che due motori producano lo stesso identico output.
 
+import { defaultGrainTexture } from './texture.js';
+
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Brush} Brush */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
@@ -16,8 +18,15 @@ const BASE = {
   particleDeviation: 0, jitterPos: 0, jitterSize: 0,
   jitterOpacity: 0, jitterSpacing: 0, jitterAngle: 0, jitterBright: 0,
   jitterSat: 0, buildup: false, pressureSize: true, pressureOpacity: false,
+  texture: null, textureOn: false, textureScale: 1, textureDepth: 0.5,
+  textureFloor: 0.25, textureContrast: 1, textureInvert: false, textureMoving: false,
+  textureUseColor: false,
   color: { r: 26, g: 26, b: 31 }, tool: 'brush',
 };
+
+// Texture deterministica (seed fisso): i checksum degli scenari texture sono
+// confrontabili tra ?engine=js e wasm come tutti gli altri.
+const GRAIN = defaultGrainTexture();
 
 /**
  * @typedef {Object} Scenario
@@ -35,6 +44,11 @@ const SCENARIOS = [
   { name: 'buildup-airbrush', brush: { size: 60, hardness: 0, spacing: 0.01, buildup: true, opacity: 0.35 }, points: 400 },
   { name: 'jitter-scatter', brush: { size: 48, hardness: 0.6, spacing: 0.08, roundness: 0.6, scatter: true, particleDensity: 100, particleSize: 40, particleDeviation: 0, jitterPos: 0.3, jitterSize: 0.3, jitterOpacity: 0.3, jitterAngle: 0.4, jitterBright: 0.2, jitterSat: 0.15 }, points: 400 },
   { name: 'gomma-grande', brush: { size: 120, hardness: 0.5, tool: 'eraser' }, points: 300, prep: { size: 160, hardness: 0.3 } },
+  { name: 'texture-carta', brush: { size: 64, hardness: 0.7, spacing: 0.08, texture: GRAIN, textureOn: true, textureDepth: 0.8 }, points: 400 },
+  { name: 'texture-capsula', brush: { size: 160, hardness: 0.7, spacing: 0.002, texture: GRAIN, textureOn: true, textureDepth: 0.8 }, points: 400 },
+  { name: 'texture-capsula-colore', brush: { size: 160, hardness: 0.7, spacing: 0.002, texture: GRAIN, textureOn: true, textureDepth: 0.5, textureUseColor: true }, points: 400 },
+  { name: 'texture-moving', brush: { size: 48, hardness: 0.6, spacing: 0.1, texture: GRAIN, textureOn: true, textureDepth: 1, textureContrast: 1.5, textureMoving: true }, points: 400 },
+  { name: 'texture-colore', brush: { size: 64, hardness: 0.7, spacing: 0.08, texture: GRAIN, textureOn: true, textureDepth: 0.6, textureUseColor: true }, points: 400 },
 ];
 
 // Traiettoria sinusoidale fissa: copre più chunk, pressione a campana.

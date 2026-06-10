@@ -300,7 +300,46 @@ html, body {
 
 .p-row { margin: 10px 0; }
 /* riga dipendente da un toggle spento: visibile ma non interagibile */
-.p-row.p-off { opacity: 0.35; pointer-events: none; }
+.p-row.p-off, .p-toggle.p-off { opacity: 0.35; pointer-events: none; }
+
+/* riga texture: thumbnail + nome + azioni */
+.p-texture {
+  display: flex;
+  gap: 12px;
+  margin: 12px 0 6px;
+  align-items: flex-start;
+}
+.p-tex-thumb {
+  width: 64px;
+  height: 64px;
+  flex: none;
+  border-radius: 10px;
+  border: 1px solid var(--ui-line);
+  background: #fff;
+}
+.p-tex-info { flex: 1; min-width: 0; }
+.p-tex-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.p-tex-meta { font-size: 11px; color: var(--ui-dim); margin: 1px 0 8px; }
+.p-tex-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.p-tex-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.p-tex-btn:hover { background: rgba(255, 255, 255, 0.16); }
+.p-tex-btn:disabled { opacity: 0.35; cursor: default; }
+.p-tex-btn.danger:hover { background: rgba(255, 93, 93, 0.3); }
 
 /* slider con stepper -/+ ai lati */
 .p-slider { display: flex; align-items: center; gap: 8px; }
@@ -426,8 +465,20 @@ html, body {
 }
 #hud-title { font-weight: 600; }
 #hud-fps { color: #6ee7a0; min-width: 58px; font-variant-numeric: tabular-nums; }
-#hud-toggle {
+#hud-copy {
   margin-left: auto;
+  background: rgba(255, 255, 255, 0.08);
+  border: none;
+  border-radius: 6px;
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+#hud-copy:hover { background: rgba(255, 255, 255, 0.16); }
+
+#hud-toggle {
   background: none;
   border: none;
   color: var(--ui-dim);

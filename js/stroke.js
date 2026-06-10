@@ -3,6 +3,7 @@
 // La coda è un ring buffer Float32 preallocato: il rasterizer la drena col suo budget.
 
 import { clamp, lerp, rgbToHsv, hsvToRgb, mulberry32 } from './util.js';
+import { buildTextureLut, buildTextureColorLut } from './texture.js';
 
 /** @typedef {import('./brush.js').Brush} Brush */
 
@@ -32,6 +33,12 @@ import { clamp, lerp, rgbToHsv, hsvToRgb, mulberry32 } from './util.js';
  * @property {number} alphaCompPow
  * @property {boolean} pressureSize
  * @property {boolean} pressureOpacity
+ * @property {import('./texture.js').BrushTexture|null} tex texture/grana (null = off)
+ * @property {number} texScale
+ * @property {boolean} texMoving
+ * @property {Uint8Array|null} texLut luminanza -> fattore alpha 0..255
+ * @property {boolean} texColor il tratto usa i colori della texture
+ * @property {Uint8Array|null} texColorLut canale -> canale con contrasto
  * @property {number} colR
  * @property {number} colG
  * @property {number} colB
@@ -156,11 +163,21 @@ export class StrokeEngine {
     const eraser = brush.tool === 'eraser';
     const hsv = rgbToHsv(brush.color.r, brush.color.g, brush.color.b, { h: 0, s: 0, v: 0 });
 
+    // Con profondità zero la texture serve comunque se presta i suoi colori
+    // al tratto.
+    const tex = brush.textureOn && brush.texture &&
+      (brush.textureDepth > 0.0001 || (brush.textureUseColor && !eraser))
+      ? brush.texture : null;
+
     const noJitter = !brush.scatter && brush.jitterPos === 0 && brush.jitterSize === 0 &&
       brush.jitterOpacity === 0 && brush.jitterSpacing === 0 &&
       brush.jitterBright === 0 && brush.jitterSat === 0;
+    // La grana ancorata al canvas modula ogni pixel allo stesso modo
+    // qualunque sia il dab che lo copre: l'unione wash dei dab resta una
+    // catena di capsule anche texturizzata (capsule_tex legge il fattore dai
+    // tile). Solo la grana moving (che segue lo stamp) forza la via discreta.
     const continuous = !brush.buildup && noJitter && brush.roundness >= 0.999 &&
-      brush.spacing < CONTINUOUS_THRESHOLD;
+      brush.spacing < CONTINUOUS_THRESHOLD && (!tex || !brush.textureMoving);
 
     // compensazione alpha per il clamp di spacing in buildup
     let rasterSpacing = brush.spacing;
@@ -194,6 +211,15 @@ export class StrokeEngine {
       alphaCompPow,
       pressureSize: brush.pressureSize,
       pressureOpacity: brush.pressureOpacity,
+      tex,
+      texScale: clamp(brush.textureScale || 1, 0.05, 16),
+      texMoving: !!brush.textureMoving,
+      texLut: tex ? buildTextureLut(brush.textureDepth, brush.textureContrast,
+        brush.textureFloor, brush.textureInvert) : null,
+      // la gomma non ha colore: la modalità colore si applica solo al pennello
+      texColor: !!(tex && brush.textureUseColor && !eraser),
+      texColorLut: tex && brush.textureUseColor && !eraser
+        ? buildTextureColorLut(brush.textureContrast) : null,
       colR: eraser ? 255 : brush.color.r,
       colG: eraser ? 255 : brush.color.g,
       colB: eraser ? 255 : brush.color.b,

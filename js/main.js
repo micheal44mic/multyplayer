@@ -76,7 +76,8 @@ export class App {
     // stats riusate (zero allocazioni nel loop)
     this.stats = {
       frameMs: 0, frameMaxMs: 0,
-      timings: { input: 0, sample: 0, raster: 0, upload: 0, draw: 0 },
+      timings: { input: 0, raster: 0, tex: 0, commit: 0, upload: 0, draw: 0 },
+      texDabs: 0,
       budgetPx: 0, rasterPx: 0, queueDepth: 0, dabsFrame: 0,
       eventsPerSec: 0, docChunks: 0, strokeChunks: 0,
       cpuBytes: 0, gpuBytes: 0, undoCount: 0, undoBytes: 0,
@@ -257,9 +258,11 @@ export class App {
 
     // 2. (il sampling avviene dentro drain via engine.move) — misurato insieme
     // 3. raster con budget
-    let rasterPx = 0;
+    let rasterPx = 0, texMs = 0, texDabs = 0;
     if (this.queue.count > 0) {
       rasterPx = this.raster.run(this.queue, this.budgetPx);
+      texMs = this.raster.lastTexMs;
+      texDabs = this.raster.lastTexDabs;
     }
     const t2 = performance.now();
 
@@ -269,6 +272,7 @@ export class App {
       this._beginCommit();
     }
     if (this.commitJob) this._runCommit(this.COMMIT_CHUNKS_PER_FRAME);
+    const t2b = performance.now();
 
     // 4. upload dei soli tile sporchi
     this.renderer.uploadDirty(this.docStore);
@@ -296,10 +300,12 @@ export class App {
     if (dtFrame > this._frameMax) this._frameMax = dtFrame;
     if (t - this._frameMaxT > 2000) { stats.frameMaxMs = this._frameMax; this._frameMax = 0; this._frameMaxT = t; }
     stats.timings.input = t1 - t0;
-    stats.timings.sample = 0;
     stats.timings.raster = rasterMs;
-    stats.timings.upload = t3 - t2;
+    stats.timings.tex = texMs;
+    stats.timings.commit = t2b - t2;
+    stats.timings.upload = t3 - t2b;
     stats.timings.draw = t4 - t3;
+    stats.texDabs = texDabs;
     stats.budgetPx = this.budgetPx;
     stats.rasterPx = rasterPx;
     stats.queueDepth = this.queue.count;

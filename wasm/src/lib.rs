@@ -131,6 +131,141 @@ pub unsafe extern "C" fn dab(
     wrote as u32
 }
 
+// Replica i 4 byte (un pixel ciascuno) di una parola su 16 lane: byte i -> px i.
+#[inline(always)]
+fn splat_bytes(word: u32) -> v128 {
+    let v = u32x4_splat(word);
+    i8x16_shuffle::<0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3>(v, v)
+}
+
+// Dab texturizzato via TILE di fattori in spazio chunk (1 byte/px, stesso
+// indirizzamento del chunk: il fattore del pixel (x,y) sta a tile_ptr+(y<<8)+x).
+// La matematica texture (bilineare+LUT) è già nel tile, calcolato una volta
+// per chunk in JS: qui solo m2 = div255(m*f) e lo stesso identico composito
+// di `dab`. Equivalenza bit-exact col fallback JS: stessa doppia quantizzazione
+// m2 = div255(m*f), poi ma = div255(m2*a255).
+// rgb_ptr != 0: tile RGBX (4 byte/px, X=255, stesso indirizzamento del chunk)
+// con i colori della texture al posto del colore del pennello; con X=255 la
+// lane X produce direttamente ma, come la lane alpha di c16.
+#[no_mangle]
+pub unsafe extern "C" fn dab_tex_tile(
+    chunk_ptr: u32, lx0: u32, ly0: u32, lx1: u32, ly1: u32,
+    mask_ptr: u32, mask_w: u32, mcol0: u32, mrow0: u32,
+    tile_ptr: u32, rgb_ptr: u32,
+    a255: u32, cr: u32, cg: u32, cb: u32, buildup: u32,
+) -> u32 {
+    let w = (lx1 - lx0 + 1) as usize;
+    let h = (ly1 - ly0 + 1) as usize;
+    let a16 = u16x8_splat(a255 as u16);
+    let a255_v = u8x16_splat(a255 as u8); // bound esatto del wash: ma <= a255
+    let c16 = u16x8(cr as u16, cg as u16, cb as u16, 255, cr as u16, cg as u16, cb as u16, 255);
+    let v255 = u16x8_splat(255);
+    let mut wrote = false;
+
+    for row in 0..h {
+        let trow = ((ly0 as usize + row) << CHUNK_SHIFT) + lx0 as usize;
+        let mut dp = chunk_ptr as usize + (trow << 2);
+        let mut tp = tile_ptr as usize + trow;
+        let mut rp = rgb_ptr as usize + (trow << 2); // letto solo se rgb_ptr != 0
+        let mut mp = mask_ptr as usize + (mrow0 as usize + row) * mask_w as usize + mcol0 as usize;
+        let mut x = 0usize;
+
+        while x + 4 <= w {
+            let mword = (mp as *const u32).read_unaligned();
+            if mword != 0 {
+                let fword = (tp as *const u32).read_unaligned();
+                // maschera e fattore replicati sui 4 canali di ogni pixel:
+                // m2 = div255(m*f) e ma = div255(m2*a255) escono già nel
+                // layout del composito di `dab` (m*f <= 65025: dentro u16)
+                let m8 = splat_bytes(mword);
+                let f8 = splat_bytes(fword);
+                let m2_lo = div255_v(i16x8_mul(u16x8_extend_low_u8x16(m8), u16x8_extend_low_u8x16(f8)));
+                let m2_hi = div255_v(i16x8_mul(u16x8_extend_high_u8x16(m8), u16x8_extend_high_u8x16(f8)));
+                let ma_lo = div255_v(i16x8_mul(m2_lo, a16));
+                let ma_hi = div255_v(i16x8_mul(m2_hi, a16));
+                if v128_any_true(v128_or(ma_lo, ma_hi)) {
+                    wrote = true; // semantica JS: ma != 0 conta come "scritto"
+                    let d = v128_load(dp as *const v128);
+                    // colore per coppia di pixel: fisso o dal tile RGBX
+                    let (cl, ch) = if rgb_ptr != 0 {
+                        let cv = v128_load(rp as *const v128);
+                        (u16x8_extend_low_u8x16(cv), u16x8_extend_high_u8x16(cv))
+                    } else {
+                        (c16, c16)
+                    };
+                    if buildup != 0 {
+                        let src_lo = div255_v(i16x8_mul(cl, ma_lo));
+                        let src_hi = div255_v(i16x8_mul(ch, ma_hi));
+                        let d_lo = u16x8_extend_low_u8x16(d);
+                        let d_hi = u16x8_extend_high_u8x16(d);
+                        let o_lo = u16x8_add(src_lo, div255_v(i16x8_mul(d_lo, u16x8_sub(v255, ma_lo))));
+                        let o_hi = u16x8_add(src_hi, div255_v(i16x8_mul(d_hi, u16x8_sub(v255, ma_hi))));
+                        v128_store(dp as *mut v128, u8x16_narrow_i16x8(o_lo, o_hi));
+                    } else {
+                        let da8 = splat_alpha(d);
+                        if !u8x16_all_true(u8x16_ge(da8, a255_v)) {
+                            let src_lo = div255_v(i16x8_mul(cl, ma_lo));
+                            let src_hi = div255_v(i16x8_mul(ch, ma_hi));
+                            let ma8 = u8x16_narrow_i16x8(ma_lo, ma_hi);
+                            let src8 = u8x16_narrow_i16x8(src_lo, src_hi); // [R,G,B,ma]
+                            let cond = u8x16_gt(ma8, da8);
+                            v128_store(dp as *mut v128, v128_bitselect(src8, d, cond));
+                        }
+                    }
+                }
+            }
+            dp += 16;
+            tp += 4;
+            rp += 16;
+            mp += 4;
+            x += 4;
+        }
+
+        // coda scalare (< 4 px), stessa aritmetica
+        while x < w {
+            let m = *(mp as *const u8) as u32;
+            if m != 0 {
+                let f = *(tp as *const u8) as u32;
+                let m2 = div255(m * f);
+                if m2 != 0 {
+                    let ma = div255(m2 * a255);
+                    if ma != 0 {
+                        wrote = true;
+                        let (r, g, b) = if rgb_ptr != 0 {
+                            (
+                                *(rp as *const u8) as u32,
+                                *((rp + 1) as *const u8) as u32,
+                                *((rp + 2) as *const u8) as u32,
+                            )
+                        } else {
+                            (cr, cg, cb)
+                        };
+                        let p = dp as *mut u8;
+                        if buildup != 0 {
+                            let inv = 255 - ma;
+                            *p = (div255(r * ma) + div255(*p as u32 * inv)) as u8;
+                            *p.add(1) = (div255(g * ma) + div255(*p.add(1) as u32 * inv)) as u8;
+                            *p.add(2) = (div255(b * ma) + div255(*p.add(2) as u32 * inv)) as u8;
+                            *p.add(3) = (ma + div255(*p.add(3) as u32 * inv)) as u8;
+                        } else if ma > *p.add(3) as u32 {
+                            *p = div255(r * ma) as u8;
+                            *p.add(1) = div255(g * ma) as u8;
+                            *p.add(2) = div255(b * ma) as u8;
+                            *p.add(3) = ma as u8;
+                        }
+                    }
+                }
+            }
+            dp += 4;
+            tp += 1;
+            rp += 4;
+            mp += 1;
+            x += 1;
+        }
+    }
+    wrote as u32
+}
+
 // sqrt scalare via lane SIMD: core (no_std) non ha f64::sqrt, ma il wasm sì.
 // f64x2_sqrt è correttamente arrotondato per lane, come Math.sqrt.
 #[inline(always)]
@@ -267,6 +402,135 @@ pub unsafe extern "C" fn capsule(
         }
         while x < w {
             wrote |= capsule_px(&c, (row + x * 4) as *mut u8, px0 + x as f64, py, py_dy);
+            x += 1;
+        }
+    }
+    wrote as u32
+}
+
+// Un pixel della capsula texturizzata: geometria identica a capsule_px, poi
+// ma = div255(ma_base * f) col fattore f letto dal tile. Il pre-check è
+// esatto: ma <= div255(ma_max * f) sempre (div255 è monotona), quindi un
+// pixel del documento già a quell'alpha non può superare `ma > alpha`.
+// rgb = 0 -> colore del pennello; altrimenti ptr al pixel RGBX del tile.
+#[inline(always)]
+unsafe fn capsule_tex_px(c: &Caps, p: *mut u8, f: u32, rgb: usize, px: f64, py: f64, py_dy: f64) -> bool {
+    if *p.add(3) as u32 >= div255(c.ma_max * f) {
+        return false;
+    }
+    let mut t = ((px - c.x0) * c.dx + py_dy) * c.inv_len2;
+    if t < 0.0 {
+        t = 0.0;
+    } else if t > 1.0 {
+        t = 1.0;
+    }
+    let qx = px - (c.x0 + c.dx * t);
+    let qy = py - (c.y0 + c.dy * t);
+    let r_t = c.r0 + c.dr * t;
+    let dist2 = qx * qx + qy * qy;
+    let lim = r_t + 1.0;
+    if dist2 >= lim * lim {
+        return false;
+    }
+    let a = falloff(sqrt64(dist2), r_t, c.h) * (c.a0 + c.da * t);
+    if a <= 0.0 {
+        return false;
+    }
+    let ma = div255((a * 255.0 + 0.5) as u32 * f);
+    if ma > *p.add(3) as u32 {
+        let (cr, cg, cb) = if rgb != 0 {
+            (
+                *(rgb as *const u8) as u32,
+                *((rgb + 1) as *const u8) as u32,
+                *((rgb + 2) as *const u8) as u32,
+            )
+        } else {
+            (c.cr, c.cg, c.cb)
+        };
+        *p = div255(cr * ma) as u8;
+        *p.add(1) = div255(cg * ma) as u8;
+        *p.add(2) = div255(cb * ma) as u8;
+        *p.add(3) = ma as u8;
+        return true;
+    }
+    false
+}
+
+// Capsula texturizzata: la via continua quando la grana è ancorata al canvas
+// (il fattore per pixel non dipende dal dab, quindi commuta con l'unione
+// wash). Stessa struttura di `capsule`; il bound per riga viene raffinato per
+// pixel col fattore del tile: dove la grana satura il documento a un'alpha
+// più bassa, il blocco di 4 pixel si salta con un confronto SIMD esatto.
+// tile_ptr: fattori 1 byte/px in spazio chunk; rgb_ptr: tile RGBX o 0.
+#[no_mangle]
+pub unsafe extern "C" fn capsule_tex(
+    chunk_ptr: u32, lx0: u32, ly0: u32, lx1: u32, ly1: u32,
+    ox: f64, oy: f64,
+    x0: f64, y0: f64, r0: f64, a0: f64,
+    x1: f64, y1: f64, r1: f64, a1: f64,
+    hardness: f64, cr: u32, cg: u32, cb: u32,
+    tile_ptr: u32, rgb_ptr: u32,
+) -> u32 {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let len2 = dx * dx + dy * dy;
+    let a_max = if a0 > a1 { a0 } else { a1 };
+    let r_max = if r0 > r1 { r0 } else { r1 };
+    let y_lo = if y0 < y1 { y0 } else { y1 };
+    let y_hi = if y0 > y1 { y0 } else { y1 };
+    let mut c = Caps {
+        x0, y0, dx, dy,
+        inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 },
+        r0, dr: r1 - r0, a0, da: a1 - a0, h: hardness,
+        cr, cg, cb,
+        ma_max: 0, // impostato per riga
+    };
+    let w = (lx1 - lx0 + 1) as usize;
+    let mut wrote = false;
+
+    for y2 in ly0..=ly1 {
+        let py = oy + y2 as f64 + 0.5;
+        let row_dist = if py < y_lo { y_lo - py } else if py > y_hi { py - y_hi } else { 0.0 };
+        let ma_max_row = (falloff(row_dist, r_max, hardness) * a_max * 255.0 + 0.5) as u32;
+        if ma_max_row == 0 {
+            continue; // nessun pixel della riga può scrivere
+        }
+        c.ma_max = ma_max_row;
+        let mam16 = u16x8_splat(ma_max_row as u16);
+
+        let py_dy = (py - y0) * dy; // termine costante per riga
+        let trow = ((y2 as usize) << CHUNK_SHIFT) + lx0 as usize;
+        let row = chunk_ptr as usize + (trow << 2);
+        let tr = tile_ptr as usize + trow;
+        let rr = rgb_ptr as usize + (trow << 2); // valido solo se rgb_ptr != 0
+        let px0 = ox + lx0 as f64 + 0.5;
+        let mut x = 0usize;
+
+        while x + 4 <= w {
+            let d4 = v128_load((row + x * 4) as *const v128);
+            // bound esatto per pixel, replicato sui 4 canali come l'alpha:
+            // ma <= div255(ma_max_row * f) (f*ma_max <= 65025: dentro u16)
+            let fword = ((tr + x) as *const u32).read_unaligned();
+            let f8 = splat_bytes(fword);
+            let b_lo = div255_v(i16x8_mul(u16x8_extend_low_u8x16(f8), mam16));
+            let b_hi = div255_v(i16x8_mul(u16x8_extend_high_u8x16(f8), mam16));
+            let bound = u8x16_narrow_i16x8(b_lo, b_hi);
+            if !u8x16_all_true(u8x16_ge(splat_alpha(d4), bound)) {
+                let p = (row + x * 4) as *mut u8;
+                let f = fword;
+                let rb = if rgb_ptr != 0 { rr + x * 4 } else { 0 };
+                let rs = if rgb_ptr != 0 { 4 } else { 0 };
+                wrote |= capsule_tex_px(&c, p, f & 0xff, rb, px0 + x as f64, py, py_dy);
+                wrote |= capsule_tex_px(&c, p.add(4), (f >> 8) & 0xff, rb + rs, px0 + (x + 1) as f64, py, py_dy);
+                wrote |= capsule_tex_px(&c, p.add(8), (f >> 16) & 0xff, rb + rs * 2, px0 + (x + 2) as f64, py, py_dy);
+                wrote |= capsule_tex_px(&c, p.add(12), f >> 24, rb + rs * 3, px0 + (x + 3) as f64, py, py_dy);
+            }
+            x += 4;
+        }
+        while x < w {
+            let f = *((tr + x) as *const u8) as u32;
+            let rb = if rgb_ptr != 0 { rr + x * 4 } else { 0 };
+            wrote |= capsule_tex_px(&c, (row + x * 4) as *mut u8, f, rb, px0 + x as f64, py, py_dy);
             x += 1;
         }
     }

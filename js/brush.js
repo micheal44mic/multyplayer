@@ -29,6 +29,15 @@ import { clamp } from './util.js';
  * @property {boolean} buildup
  * @property {boolean} pressureSize
  * @property {boolean} pressureOpacity
+ * @property {import('./texture.js').BrushTexture|null} texture
+ * @property {boolean} textureOn
+ * @property {number} textureScale
+ * @property {number} textureDepth
+ * @property {number} textureFloor
+ * @property {number} textureContrast
+ * @property {boolean} textureInvert
+ * @property {boolean} textureMoving
+ * @property {boolean} textureUseColor
  * @property {import('./util.js').Rgb} color
  * @property {Tool} tool
  */
@@ -57,6 +66,17 @@ export const brush = {
   buildup: false,      // true: l'opacità di ogni stamp si accumula nello stroke
   pressureSize: true,
   pressureOpacity: false,
+  // Texture/grana: modula l'alpha della maschera di ogni stamp (vedi
+  // texture.js per l'asset e raster.js per il campionamento antialiasato).
+  texture: null,       // BrushTexture importata o grana di default; null = off
+  textureOn: false,    // interruttore (attivo solo con una texture caricata)
+  textureScale: 1,     // 1 = px texture : px documento; <1 grana più fitta
+  textureDepth: 0.5,   // 0..1: quanto la grana scava l'alpha
+  textureFloor: 0.25,  // 0..1: alpha minima residua dove la texture è nera
+  textureContrast: 1,  // contrasto attorno al grigio medio (0..3)
+  textureInvert: false,
+  textureMoving: false, // false: grana fissa sul canvas (carta); true: segue lo stamp
+  textureUseColor: false, // true: il tratto usa i colori della texture, non il colore pennello
   color: { r: 26, g: 26, b: 31 },
   tool: 'brush',       // 'brush' | 'eraser' | 'pan'
 };
