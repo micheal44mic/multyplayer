@@ -5,7 +5,7 @@
 // e gomma scrivono sul livello attivo, i piani DOM compongono la pila.
 
 import { Camera } from './camera.js';
-import { ChunkStore } from './store.js';
+import { ChunkStore, chunkKey, CHUNK_SHIFT } from './store.js';
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
@@ -96,11 +96,12 @@ export class App {
     // canvas (toggle desync) e i piani figli sono pointer-events: none
     this.input = new InputManager(this.planesEl, this.camera, {
       isPanTool: () => brush.tool === 'pan',
-      onStrokeStart: (x, y, p) => this.startStroke(x, y, p),
-      onStrokePoint: (x, y, p) => { if (this.strokeLive) this.engine.move(x, y, p); },
-      onStrokeEnd: (x, y, p) => {
+      onStrokeStart: (x, y, p, t) => this.startStroke(x, y, p, t),
+      onStrokePoint: (x, y, p, t) => { if (this.strokeLive) this.engine.move(x, y, p, t); },
+      onStrokeEnd: (x, y, p, t) => {
         if (!this.strokeLive) return;
-        this.engine.end(x, y, p);
+        this.engine.end(x, y, p, t);
+        if (this.engine.endPassNeeded) this._endPass();
         this.pendingCommit = true;
       },
       onStrokeCancel: () => this.cancelStroke(),
@@ -225,8 +226,8 @@ export class App {
 
   // ---- stroke ----
 
-  /** @param {number} x @param {number} y @param {number} p */
-  startStroke(x, y, p) {
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  startStroke(x, y, p, t) {
     const target = this.layerMgr.paintTarget;
     if (!target) return; // attivo non dipingibile (testo/nascosto): ignora
     // chiudi del tutto l'eventuale tratto precedente: drena la sua coda
@@ -237,7 +238,8 @@ export class App {
     }
     if (this.commitJob) this._runCommit(Infinity);
     this._strokeLayerId = target.id;
-    this.engine.begin(x, y, p, brush);
+    // zoom camera = scala della velocità: la dinamica legge il gesto fisico
+    this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom);
     this.raster.beginStroke(this.engine.snap);
     this.strokeLive = true;
     this.pendingCommit = false;
@@ -254,6 +256,43 @@ export class App {
   _dropStrokeBuffer() {
     // i chunk tornano al pool (texture riusata) o liberano la texture
     this.strokeStore.releaseAll((c) => this.renderer.disposeChunkTex(c));
+  }
+
+  // Pass finale del taper al pen-up: live il tratto è pieno fino alla punta
+  // (zero ritardo); qui si svuotano i SOLI chunk coperti dalla punta
+  // (endPassRect) e il replay viene clippato lì dal rasterizer: il corpo del
+  // tratto non si ridisegna mai, il costo è ∝ all'area della punta — la
+  // punta appare nello stesso frame del rilascio, senza scatto. Sincrono e
+  // prima del present: nessun lampeggio.
+  _endPass() {
+    // il live ancora in coda va rasterizzato PRIMA di svuotare i chunk della
+    // punta: il replay fuori dal clip viene scartato, e un dab mai disegnato
+    // lascerebbe un buco nel corpo
+    if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+    const rect = this.engine.endPassRect();
+    /** @type {(c: import('./store.js').Chunk) => void} */
+    const dispose = (c) => this.renderer.disposeChunkTex(c);
+    /** @type {Set<number>|null} */
+    let clip = null;
+    if (rect) {
+      clip = new Set();
+      const cx0 = rect.x0 >> CHUNK_SHIFT, cy0 = rect.y0 >> CHUNK_SHIFT;
+      const cx1 = rect.x1 >> CHUNK_SHIFT, cy1 = rect.y1 >> CHUNK_SHIFT;
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const key = chunkKey(cx, cy);
+          clip.add(key);
+          this.strokeStore.remove(key, dispose);
+        }
+      }
+    } else {
+      this._dropStrokeBuffer();
+    }
+    this.raster.beginStroke(this.engine.snap);
+    this.raster.clip = clip;
+    this.engine.replay();
+    this.raster.run(this.queue, Infinity);
+    this.raster.clip = null;
   }
 
   // Avvia il commit incrementale: composito sul livello spalmato sui frame.
@@ -387,6 +426,8 @@ export class App {
 
     // 1. input (gesture + conversione in punti stroke)
     this.input.drain();
+    // a mano ferma il dot di pen-down matura (cresce fino a piena dimensione)
+    if (this.engine.active) this.engine.tick(performance.now());
     const t1 = performance.now();
 
     // 2. (il sampling avviene dentro drain via engine.move) — misurato insieme

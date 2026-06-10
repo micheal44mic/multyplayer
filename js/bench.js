@@ -17,7 +17,7 @@ const BASE = {
   roundness: 1, angle: 0, scatter: false, particleSize: 50, particleDensity: 100,
   particleDeviation: 0, jitterPos: 0, jitterSize: 0,
   jitterOpacity: 0, jitterSpacing: 0, jitterAngle: 0, jitterBright: 0,
-  jitterSat: 0, buildup: false,
+  jitterSat: 0, buildup: false, taperStart: 0, taperEnd: 0, speedThickness: 0.5,
   texture: null, textureOn: false, textureScale: 1, textureDepth: 0.5,
   textureFloor: 0.25, textureContrast: 1, textureInvert: false, textureMoving: false,
   textureUseColor: false,
@@ -51,9 +51,10 @@ const SCENARIOS = [
   { name: 'texture-colore', brush: { size: 64, hardness: 0.7, spacing: 0.08, texture: GRAIN, textureOn: true, textureDepth: 0.6, textureUseColor: true }, points: 400 },
 ];
 
-// Traiettoria sinusoidale fissa: copre più chunk. Deterministica: stessi
-// raggi a ogni run, quindi checksum confrontabili tra engine.
-/** @param {number} n @returns {{x: number, y: number, p: number}[]} */
+// Traiettoria sinusoidale fissa: copre più chunk. Tempi sintetici a 5 ms per
+// punto (deterministici: la dinamica taper/velocità produce sempre gli stessi
+// raggi, quindi checksum confrontabili tra engine).
+/** @param {number} n @returns {{x: number, y: number, p: number, t: number}[]} */
 function makePath(n) {
   const out = [];
   for (let k = 0; k < n; k++) {
@@ -62,6 +63,7 @@ function makePath(n) {
       x: -1300 + t * 2600,
       y: -400 + Math.sin(t * Math.PI * 5) * 200,
       p: 0.25 + 0.75 * Math.sin(t * Math.PI),
+      t: k * 5,
     });
   }
   return out;
@@ -84,16 +86,23 @@ export function checksum(store) {
 
 // Esegue una pennellata completa: sampling sincrono, raster a budget infinito,
 // commit immediato. Ritorna le misure (il sampling non è incluso nel raster).
-/** @param {App} app @param {Brush} cfg @param {{x: number, y: number, p: number}[]} path */
+/** @param {App} app @param {Brush} cfg @param {{x: number, y: number, p: number, t: number}[]} path */
 function runStroke(app, cfg, path) {
-  app.engine.begin(path[0].x, path[0].y, path[0].p, cfg);
+  app.engine.begin(path[0].x, path[0].y, path[0].p, path[0].t, cfg, undefined, 1);
   app.raster.beginStroke(app.engine.snap);
   app.strokeLive = true;
   // il bench scavalca startStroke: il commit va indirizzato al livello attivo
   app._strokeLayerId = app.layerMgr.activeId;
-  for (let i = 1; i < path.length - 1; i++) app.engine.move(path[i].x, path[i].y, path[i].p);
+  for (let i = 1; i < path.length - 1; i++) app.engine.move(path[i].x, path[i].y, path[i].p, path[i].t);
   const last = path[path.length - 1];
-  app.engine.end(last.x, last.y, last.p);
+  app.engine.end(last.x, last.y, last.p, last.t);
+  if (app.engine.endPassNeeded) {
+    // come nell'app: il live (mai rasterizzato qui) si scarta, vale il replay
+    app.queue.clear();
+    app._dropStrokeBuffer();
+    app.raster.beginStroke(app.engine.snap);
+    app.engine.replay();
+  }
 
   const t0 = performance.now();
   const px = app.raster.run(app.queue, Infinity);

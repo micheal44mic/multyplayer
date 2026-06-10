@@ -9,7 +9,8 @@ const CAP = 8192;
 /** @typedef {import('./camera.js').Camera} Camera */
 
 /**
- * t: timeStamp dell'evento (orologio di performance.now()).
+ * t: timeStamp dell'evento (orologio di performance.now()) — serve alla
+ * dinamica velocità/taper dello stroke engine.
  * @typedef {Object} InputHooks
  * @property {() => boolean} isPanTool
  * @property {(x: number, y: number, p: number, t: number) => void} onStrokeStart
