@@ -36,6 +36,7 @@ export const MAX_LAYERS = 16;
  * @property {number} [blockBoxH]
  * @property {number} [blockStable] frame consecutivi a camera ferma
  * @property {number} [blockT] timestamp ultima generazione (cadenza anteprime)
+ * @property {import('./text_gl.js').SdfEntry|null} [blockSdf] cache SDF del path GPU
  * @property {boolean} [thumbDirty] miniatura del pannello da rigenerare
  */
 

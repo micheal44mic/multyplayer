@@ -7,6 +7,8 @@
 // sincronizzazione attributi; la creazione/ordinamento dei piani è del
 // gestore in planes.js.
 
+import { TextFxGL } from './text_gl.js';
+
 /** @typedef {import('./camera.js').Camera} Camera */
 /** @typedef {import('./layers.js').Layer} Layer */
 
@@ -339,6 +341,86 @@ const BLOCK_STABLE_FRAMES = 12;
 const BLOCK_MAX_SIDE = 2048;       // lato massimo della bitmap
 const BLOCK_MAX_AREA = 2_000_000;  // ~8 MB RGBA per livello, al massimo
 
+// ---- path GPU (text_gl) ---------------------------------------------------
+// Quando il WebGL c'è, gli effetti si disegnano su GPU: la SDF della stringa
+// si rigenera solo su cambio testo/font/bucket, tutto il resto è uniform →
+// qualità piena a ogni evento di slider, niente anteprime né promozioni.
+// Il path CPU sotto resta come fallback (e per l'export, che è one-shot).
+/** @type {TextFxGL|null|undefined} undefined = non ancora provato */
+let _fx;
+let _gpuOn = true;
+
+function _fxInst() {
+  if (_fx === undefined) _fx = TextFxGL.create();
+  return _fx;
+}
+
+// Toggle runtime (console: __textGpu()) per confrontare GPU e CPU dal vivo.
+/** @param {boolean} [v] undefined = toggle @returns {boolean} stato attuale */
+export function setTextGpu(v) {
+  _gpuOn = v === undefined ? !_gpuOn : !!v;
+  console.info(`[Text GPU] ${_gpuOn ? 'ON' : 'OFF (path CPU)'}`);
+  return _gpuOn;
+}
+
+// Bucket della portata SDF in em: la distanza massima campionabile attorno
+// ai glifi è cotta nella texture; a bucket (e non al valore esatto) così gli
+// slider non la rigenerano mai, salvo attraversare una soglia.
+/** @param {TextItem} it @param {TextStyle} st */
+function _reachBucket(it, st) {
+  const em = (st.shadowDist + st.shadowBlur * 1.5 + st.stroke + 4) / it.size;
+  return em <= 0.5 ? 0.5 : em <= 1 ? 1 : em <= 2 ? 2 : 4;
+}
+
+/** @param {TextFxGL} fx @param {Layer} layer @param {Camera} camera */
+function _refreshGpu(fx, layer, camera) {
+  const st = layer.style, it = layer.item;
+  const fontReady = document.fonts.check(`${st.weight} 16px "${st.font}"`) ? 1 : 0;
+  const padEm = _reachBucket(it, st);
+  const sdfKey = `${it.text}|${st.font}|${st.weight}|P${padEm}|F${fontReady}`;
+  // tutto il resto è uniform: cambia la bitmap renderizzata, non la SDF
+  const key = `G|${sdfKey}|${it.size}|${st.stroke}|${st.shadowColor}|` +
+    `${st.shadowBlur}|${st.shadowDist}|${st.shadowAngle ?? 45}|${st.block ? 'B' : 'S'}`;
+  let scale = 0;
+  if (layer.blockKey !== key) {
+    scale = -1; // qualunque: forza il render
+  } else {
+    // zoom assestato su una scala troppo diversa da quella renderizzata
+    const ideal = _blockScale(camera, layer.blockBoxW || 1, layer.blockBoxH || 1);
+    if (Math.abs(Math.log2(ideal / layer.blockScale)) > 0.4 &&
+      layer.blockStable >= BLOCK_STABLE_FRAMES) scale = ideal;
+  }
+  if (!scale) return;
+  if (!fx.ensureSdf(layer, sdfKey, it, st, padEm)) return _fallbackCpu(layer, camera);
+  const box = blockBox(it, st);
+  const r = _blockScale(camera, box.w, box.h);
+  if (!fx.render(layer, it, st, box, r, textBaselineY(it, st))) {
+    return _fallbackCpu(layer, camera);
+  }
+  layer.blockKey = key;
+  layer.blockOffX = box.x - it.x;
+  layer.blockOffY = box.y - it.y;
+  layer.blockBoxW = box.w;
+  layer.blockBoxH = box.h;
+  layer.blockScale = r;
+  layer.blockQuality = 'full';
+  const cnv = layer.blockCanvas;
+  cnv.style.width = cnv.width + 'px';
+  cnv.style.height = cnv.height + 'px';
+  cnv.style.display = '';
+  syncBlockTransform(layer, camera);
+  if (debug3d) _debugDump(layer, box, r, st.block ? -1 : 1); // -1 = march GPU
+}
+
+// Il contesto GL è morto o la SDF non si è creata: da qui in poi path CPU.
+/** @param {Layer} layer @param {Camera} camera */
+function _fallbackCpu(layer, camera) {
+  console.warn('[Text GPU] non disponibile: passo al path CPU');
+  _gpuOn = false;
+  layer.blockKey = '';
+  _generateBlock(layer, camera, false);
+}
+
 // Chiamata dai piani a ogni frame per ogni livello testo: decide se la
 // bitmap dell'effetto va (ri)generata e a quale qualità. Tutte le uscite
 // veloci sono confronti su numeri/stringhe: a regime non alloca e non
@@ -353,6 +435,10 @@ export function refreshBlockBitmap(layer, camera, camChanged) {
     return;
   }
   layer.blockStable = camChanged ? 0 : (layer.blockStable || 0) + 1;
+  if (_gpuOn) {
+    const fx = _fxInst();
+    if (fx && fx.ok) return _refreshGpu(fx, layer, camera);
+  }
   // contenuto della bitmap (posizione esclusa: sposta solo il transform).
   // Lo stato del font fa parte della chiave: una bitmap generata col font
   // di fallback si rigenera da sola quando il font vero atterra.
@@ -442,7 +528,8 @@ export function syncBlockTransform(layer, camera) {
     `translate3d(${sx}px,${sy}px,0) scale(${k})`;
 }
 
-// Libera la bitmap dell'effetto (toggle off, livello morto, clearAll).
+// Libera la bitmap dell'effetto (toggle off, livello morto, clearAll),
+// compresa l'eventuale texture SDF del path GPU.
 /** @param {Layer} layer */
 export function freeBlockBitmap(layer) {
   const cnv = layer.blockCanvas;
@@ -451,6 +538,7 @@ export function freeBlockBitmap(layer) {
     cnv.width = 0;  // backing store libero subito
     cnv.height = 0;
   }
+  if (layer.blockSdf && _fx) _fx.free(layer);
   layer.blockKey = '';
   layer.blockScale = 0;
   layer.blockQuality = '';
