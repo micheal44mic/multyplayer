@@ -5,7 +5,7 @@
 // e gomma scrivono sul livello attivo, i piani DOM compongono la pila.
 
 import { Camera } from './camera.js';
-import { ChunkStore } from './store.js';
+import { ChunkStore, chunkKey, CHUNK_SHIFT } from './store.js';
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
@@ -259,14 +259,40 @@ export class App {
   }
 
   // Pass finale del taper al pen-up: live il tratto è pieno fino alla punta
-  // (zero ritardo); qui si svuota il buffer del tratto e lo si ridisegna
-  // intero con il cono finale. Sincrono e prima del present: nessun lampeggio.
+  // (zero ritardo); qui si svuotano i SOLI chunk coperti dalla punta
+  // (endPassRect) e il replay viene clippato lì dal rasterizer: il corpo del
+  // tratto non si ridisegna mai, il costo è ∝ all'area della punta — la
+  // punta appare nello stesso frame del rilascio, senza scatto. Sincrono e
+  // prima del present: nessun lampeggio.
   _endPass() {
-    this.queue.clear();
-    this._dropStrokeBuffer();
+    // il live ancora in coda va rasterizzato PRIMA di svuotare i chunk della
+    // punta: il replay fuori dal clip viene scartato, e un dab mai disegnato
+    // lascerebbe un buco nel corpo
+    if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+    const rect = this.engine.endPassRect();
+    /** @type {(c: import('./store.js').Chunk) => void} */
+    const dispose = (c) => this.renderer.disposeChunkTex(c);
+    /** @type {Set<number>|null} */
+    let clip = null;
+    if (rect) {
+      clip = new Set();
+      const cx0 = rect.x0 >> CHUNK_SHIFT, cy0 = rect.y0 >> CHUNK_SHIFT;
+      const cx1 = rect.x1 >> CHUNK_SHIFT, cy1 = rect.y1 >> CHUNK_SHIFT;
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const key = chunkKey(cx, cy);
+          clip.add(key);
+          this.strokeStore.remove(key, dispose);
+        }
+      }
+    } else {
+      this._dropStrokeBuffer();
+    }
     this.raster.beginStroke(this.engine.snap);
+    this.raster.clip = clip;
     this.engine.replay();
     this.raster.run(this.queue, Infinity);
+    this.raster.clip = null;
   }
 
   // Avvia il commit incrementale: composito sul livello spalmato sui frame.

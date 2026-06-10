@@ -65,13 +65,18 @@ const CONTINUOUS_THRESHOLD = 0.05;
 const MIN_BUILDUP_SPACING = 0.03;
 
 // Dinamica alla ibis Paint. Il taper d'inizio vive in una finestra di TEMPO
-// (lunghezza punta = velocità × finestra: lento = tondo, frustata = punta).
+// (frustata = punta lunga) con un pavimento SPAZIALE proporzionale alla
+// taglia: da sola la finestra è cieca al diametro — 60ms di gesto su un
+// pennello grosso sono una frazione del diametro e la punta esce mozza.
+// La punta dura quindi almeno TAPER_DIAMS diametri a qualunque taglia.
 // Il taper di FINE non può essere disegnato live (la fine non è nota): il
 // tratto viene disegnato a piena larghezza fino alla punta — zero ritardo —
-// e ogni emissione viene registrata; al pen-up il chiamante svuota il buffer
-// del tratto e replay() lo ridisegna con il cono finale, lungo
-// velocità-al-rilascio × TAPER_MS (rilascio da fermo = fine tonda).
+// e ogni emissione viene registrata; al pen-up il chiamante svuota i SOLI
+// chunk coperti dalla punta (endPassRect) e replay(), clippato lì dal
+// rasterizer, ridisegna il cono finale: costo ∝ area della punta, non del
+// tratto intero — niente scatto al rilascio.
 export const TAPER_MS = 60;
+export const TAPER_DIAMS = 1.5; // lunghezza minima della punta, in diametri
 const SPEED_TAU = 40;    // ms, passa-basso della velocità (niente tremolio)
 const SPEED_HALF = 1.0;  // px CSS/ms a cui l'effetto velocità è a metà
 const REC_MAX = 1 << 21; // tetto del registro (~32MB): oltre, niente pass finale
@@ -168,6 +173,7 @@ export class StrokeEngine {
     this._accDist = 0;                            // distanza tra eventi con dt=0
     this._moved = 0;                              // distanza campionata totale (tap detection)
     this._started = false;                        // il movimento grezzo è iniziato
+    this._taperSpatial = false;                   // pavimento spaziale del taper attivo
     // registro delle emissioni per il pass finale: (x, y, m, burn) —
     // burn=1 se nel pass live è seguito un rng() di jitterSpacing
     this._rec = new Float32Array(1024 * 4);
@@ -283,6 +289,7 @@ export class StrokeEngine {
     this._dirX = 1; this._dirY = 0;
     this._t0 = t;
     this._vel = 0; this._accDist = 0; this._moved = 0; this._started = false;
+    this._taperSpatial = false;
     this._vlx = x; this._vly = y; this._vlt = t;
     this._recN = 0;
     this.endPassNeeded = false;
@@ -291,7 +298,7 @@ export class StrokeEngine {
     this._pushPoint(x, y, p, t); // primo nodo della curva (nessuna emissione)
 
     // primo dab/dot, disegnato subito (il pass finale lo ridisegnerà)
-    const m = this._dynMult(t, p);
+    const m = this._dynMult(t, p, 0);
     this._dotM = m;
     this._emitLive(x, y, m, !continuous);
     if (!continuous) this._gapLeft = this._nextGap(Math.max(0.25, baseR * m));
@@ -307,7 +314,12 @@ export class StrokeEngine {
     // deliberata ≥ DOT_HOLD_MS) il tratto continua pieno dal dot.
     if (!this._started && Math.hypot(x - this._vlx, y - this._vly) > 0.25) {
       this._started = true;
-      if (t - this._t0 < DOT_HOLD_MS) this._t0 = Math.max(this._vlt, t - 16);
+      // dot non maturato: la finestra riparte dal movimento e vale anche il
+      // pavimento spaziale; dot deliberato: il tratto resta pieno dal dot
+      if (t - this._t0 < DOT_HOLD_MS) {
+        this._t0 = Math.max(this._vlt, t - 16);
+        this._taperSpatial = true;
+      }
     }
     // velocità del gesto: dagli input grezzi, filtrata passa-basso. Con eventi
     // coalesced a dt=0 la distanza si accumula fino al prossimo dt>0.
@@ -347,17 +359,20 @@ export class StrokeEngine {
     const s = this.snap;
     if (this._moved < 1) {
       // tap / pressione ferma: dot uniforme maturato col tempo tenuto giù
-      this._tapM = Math.max(0.05, this._dynMult(t, p));
+      // (1e9: il pavimento spaziale non ha senso su un punto fermo)
+      this._tapM = Math.max(0.05, this._dynMult(t, p, 1e9));
       this.endPassNeeded = this._recN > 0 && this._recN < REC_MAX;
     } else {
       // Fermo prima del rilascio: i pointermove smettono di arrivare e il
       // filtro resterebbe congelato all'ultima velocità — decade per il
-      // tempo di inattività (fermarsi e alzare = fine tonda, non a punta).
+      // tempo di inattività.
       const idle = t - this._vlt;
       if (idle > 0) this._vel *= Math.exp(-idle / SPEED_TAU);
-      // lunghezza della punta = velocità al rilascio × finestra (px documento)
-      this._endLen = this._vel / s.speedScale * TAPER_MS;
-      this.endPassNeeded = s.taperEnd < 1 && this._endLen > 0.5 &&
+      // lunghezza della punta: velocità al rilascio × finestra, ma mai meno
+      // di TAPER_DIAMS diametri — la punta scala col pennello e c'è anche a
+      // rilascio lento: stessa forma a ogni taglia, identica alla preview.
+      this._endLen = Math.max(this._vel / s.speedScale * TAPER_MS, TAPER_DIAMS * s.diam);
+      this.endPassNeeded = s.taperEnd < 1 &&
         this._recN > 1 && this._recN < REC_MAX;
     }
     this.active = false;
@@ -371,7 +386,8 @@ export class StrokeEngine {
   /** @param {number} now */
   tick(now) {
     if (!this.active || this._moved >= 1 || now - this._t0 < DOT_HOLD_MS) return;
-    const m = this._dynMult(now, this._lp);
+    // 1e9: la maturazione del dot è temporale, il pavimento spaziale no
+    const m = this._dynMult(now, this._lp, 1e9);
     if (m - this._dotM > 0.04) {
       this._dotM = m;
       this._emitLive(this._lx, this._ly, m, false);
@@ -382,9 +398,10 @@ export class StrokeEngine {
 
   // Secondo pass al pen-up (il chiamante ha appena svuotato il buffer del
   // tratto): ri-emette l'intero registro applicando il taper finale — un cono
-  // spaziale dalla punta, factor = taperEnd + (1-taperEnd)·sqrt(d/L) (sqrt:
-  // corpo pieno a lungo, punta corta). Stesso seed del pass live: jitter e
-  // scatter identici dove il taper non tocca.
+  // spaziale dalla punta con lo STESSO profilo smoothstep dell'attacco
+  // (sqrt aveva tangente verticale in d=0: sui pennelli grandi la fine usciva
+  // a parabola, tonda, mentre l'inizio era un ago). Stesso seed del pass
+  // live: jitter e scatter identici dove il taper non tocca.
   replay() {
     const s = this.snap, r = this._rec, n = this._recN;
     this.endPassNeeded = false;
@@ -410,10 +427,58 @@ export class StrokeEngine {
       if (i > 0) cum += Math.hypot(r[o] - r[o - 4], r[o + 1] - r[o - 3]);
       const d = D - cum;
       let m = r[o + 2];
-      if (d < L) m *= s.taperEnd + (1 - s.taperEnd) * Math.sqrt(d / L);
+      if (d < L) {
+        const u = d / L;
+        m *= s.taperEnd + (1 - s.taperEnd) * (u * u * (3 - 2 * u));
+      }
       this._emitNow(r[o], r[o + 1], m);
       if (burnGap && r[o + 3]) s.rng();
     }
+  }
+
+  // Bbox conservativo (px documento) dei pixel che il pass finale può
+  // cambiare: i dab della punta (per il tap: il dot) col loro VECCHIO
+  // ingombro — il nuovo è un sottoinsieme, il taper riduce soltanto. Il
+  // chiamante svuota i soli chunk intersecati e clippa il replay lì: il
+  // corpo del tratto non si ridisegna mai.
+  /** @returns {{x0: number, y0: number, x1: number, y1: number}|null} */
+  endPassRect() {
+    const s = this.snap, r = this._rec, n = this._recN;
+    if (!s || n === 0) return null;
+    // ingombro massimo di un'emissione oltre il centro: nuvola scatter
+    // (offset + raggio particella), jitter di posizione, bordo morbido dello
+    // stamp e arrotondamenti
+    const spreadK = 1 + 2 * s.jPos + (s.scatter ? s.partSize : 0);
+    const pad = s.jPos * s.diam + 3;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    /** @type {(x: number, y: number, m: number) => void} */
+    const add = (x, y, m) => {
+      const e = Math.max(0.25, s.baseR * m) * spreadK + pad;
+      if (x - e < x0) x0 = x - e;
+      if (y - e < y0) y0 = y - e;
+      if (x + e > x1) x1 = x + e;
+      if (y + e > y1) y1 = y + e;
+    };
+    if (this._moved < 1) {
+      // il dot del tap può anche CRESCERE (m -> _tapM): vale il max dei due
+      for (let i = 0; i < n; i++) {
+        const o = i * 4;
+        add(r[o], r[o + 1], Math.max(r[o + 2], this._tapM));
+      }
+    } else {
+      // punta: dall'ultima emissione a ritroso finché la distanza lungo la
+      // polilinea supera la punta; si include il primo nodo OLTRE il confine
+      // (in via continua cambia anche la capsula a cavallo del confine)
+      add(r[(n - 1) * 4], r[(n - 1) * 4 + 1], r[(n - 1) * 4 + 2]);
+      let cum = 0;
+      for (let i = n - 2; i >= 0; i--) {
+        const o = i * 4;
+        cum += Math.hypot(r[o + 4] - r[o], r[o + 5] - r[o + 1]);
+        add(r[o], r[o + 1], r[o + 2]);
+        if (cum >= this._endLen) break;
+      }
+    }
+    return { x0: Math.floor(x0), y0: Math.floor(y0), x1: Math.ceil(x1), y1: Math.ceil(y1) };
   }
 
   // ---- interni ----
@@ -493,7 +558,7 @@ export class StrokeEngine {
 
     if (this.snap.continuous) {
       if (dist >= 0.25) {
-        this._emitLive(x, y, this._dynMult(t, p), false);
+        this._emitLive(x, y, this._dynMult(t, p, this._moved), false);
         this._lx = x; this._ly = y; this._lp = p; this._lt = t;
       }
       return;
@@ -506,7 +571,7 @@ export class StrokeEngine {
       travelled += this._gapLeft;
       const f = travelled / dist;
       const px = this._lx + dx * f, py = this._ly + dy * f;
-      const m = this._dynMult(lerp(ta, t, f), lerp(pa, p, f));
+      const m = this._dynMult(lerp(ta, t, f), lerp(pa, p, f), this._moved - dist + travelled);
       this._emitLive(px, py, m, true);
       this._gapLeft = this._nextGap(Math.max(0.25, this.snap.baseR * m));
     }
@@ -519,12 +584,19 @@ export class StrokeEngine {
   // saturante) × pressione (reale solo dalla penna: mouse/tocco arrivano a 1
   // da input.js — con la penna le punte nascono già dalla rampa di pressione
   // al pen-down/lift-off). Il taper di fine vive nel pass di replay().
-  /** @param {number} ts @param {number} p */
-  _dynMult(ts, p) {
+  // dist: distanza campionata dal pen-down al punto emesso — il taper
+  // d'inizio avanza col più LENTO tra orologio e distanza percorsa, così la
+  // punta dura almeno TAPER_DIAMS diametri anche sui pennelli grossi.
+  /** @param {number} ts @param {number} p @param {number} dist */
+  _dynMult(ts, p, dist) {
     const s = this.snap;
     let f = 1;
     if (s.taperStart < 1) {
       let u = (ts - this._t0) / TAPER_MS;
+      if (this._taperSpatial) {
+        const ud = dist / (TAPER_DIAMS * s.diam);
+        if (ud < u) u = ud;
+      }
       if (u < 1) {
         if (u < 0) u = 0;
         u = u * u * (3 - 2 * u);

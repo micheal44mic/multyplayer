@@ -47,6 +47,11 @@ export class Rasterizer {
     this.heap = heap; // core SIMD: stessi identici output del path JS
     /** @type {Snap|null} */
     this.snap = null;
+    // Pass finale del taper: set di chiavi chunk (i soli svuotati della
+    // punta) a cui il replay può scrivere. Il resto del tratto è già giusto
+    // e in buildup riscriverlo lo accumulerebbe due volte. null = nessun clip.
+    /** @type {Set<number>|null} */
+    this.clip = null;
     // stats per HUD
     this.lastPx = 0;
     this.lastDabs = 0;
@@ -462,7 +467,7 @@ export class Rasterizer {
           }
         }
         if (wrote) chunk.touched = true;
-      });
+      }, this.clip);
   }
 
   // ---- via discreta: stamp dalla cache ----
@@ -511,7 +516,7 @@ export class Rasterizer {
           const wrote = ex.dab(chunk.ptr, lx0, ly0, lx1, ly1, maskPtr, sSize,
             lx0 + ox - ix, ly0 + oy - iy, a255, cr, cg, cb, bu);
           if (wrote) chunk.touched = true;
-        });
+        }, this.clip);
       return;
     }
 
@@ -578,7 +583,7 @@ export class Rasterizer {
           }
         }
         if (wrote) chunk.touched = true;
-      });
+      }, this.clip);
   }
 
   // Dab con grana ancorata al canvas: maschera dello stamp × fattore dal
@@ -608,7 +613,7 @@ export class Rasterizer {
             stamp.ptr, sSize, lx0 + ox - ix, ly0 + oy - iy,
             t.lumPtr, useColor ? t.rgbxPtr : 0, a255, cr, cg, cb, bu);
           if (wrote) chunk.touched = true;
-        });
+        }, this.clip);
       return;
     }
 
@@ -673,7 +678,7 @@ export class Rasterizer {
           }
         }
         if (wrote) chunk.touched = true;
-      });
+      }, this.clip);
   }
 
   // ---- via continua: capsula con raggio e alpha interpolati ----
@@ -705,7 +710,7 @@ export class Rasterizer {
           const wrote = ex.capsule(chunk.ptr, lx0, ly0, lx1, ly1, ox, oy,
             x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb);
           if (wrote) chunk.touched = true;
-        });
+        }, this.clip);
       return;
     }
 
@@ -760,7 +765,7 @@ export class Rasterizer {
           }
         }
         if (wrote) chunk.touched = true;
-      });
+      }, this.clip);
   }
 
   // Capsula texturizzata: la via continua quando la grana è ancorata al
@@ -797,7 +802,7 @@ export class Rasterizer {
             x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb,
             t.lumPtr, useColor ? t.rgbxPtr : 0);
           if (wrote) chunk.touched = true;
-        });
+        }, this.clip);
       return;
     }
 
@@ -859,7 +864,7 @@ export class Rasterizer {
           }
         }
         if (wrote) chunk.touched = true;
-      });
+      }, this.clip);
   }
 }
 
