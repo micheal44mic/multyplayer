@@ -15,7 +15,10 @@ import { clamp } from './util.js';
  * @property {number} spacing
  * @property {number} roundness
  * @property {number} angle
- * @property {number} scatter
+ * @property {boolean} scatter
+ * @property {number} particleSize
+ * @property {number} particleDensity
+ * @property {number} particleDeviation
  * @property {number} jitterPos
  * @property {number} jitterSize
  * @property {number} jitterOpacity
@@ -39,8 +42,12 @@ export const brush = {
   spacing: 0.04,       // frazione del diametro (0.001 .. 3.0)
   roundness: 1.0,      // 1 = tondo, <1 = ellisse
   angle: 0,            // gradi
-  scatter: 0,          // 0..1, offset perpendicolare in unità di diametro
-  jitterPos: 0,        // 0..1, offset casuale radiale in unità di diametro
+  scatter: false,        // ogni stamp diventa una nuvola di particelle
+  particleSize: 50,      // % del raggio del dab (con scatter ON)
+  particleDensity: 100,  // % -> particelle per stamp (100% = 4, range 1..12)
+  particleDeviation: 0,  // % -100..100: >0 addensa al centro, <0 verso il bordo
+  jitterPos: 0,        // 0..1, offset casuale radiale in unità di diametro (con
+                       // scatter ON estende il raggio della nuvola)
   jitterSize: 0,       // 0..1
   jitterOpacity: 0,    // 0..1
   jitterSpacing: 0,    // 0..1

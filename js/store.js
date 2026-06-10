@@ -26,6 +26,9 @@ const KEY_OFF = 32768;                 // chunk coords in [-32768, 32767] → mo
  * @property {number} dirY0
  * @property {number} dirX1
  * @property {number} dirY1
+ * @property {boolean} mips la catena mip in texture rispecchia il livello 0
+ * @property {boolean} mipOn MIN_FILTER attuale della texture è mipmap-linear
+ * @property {boolean} magNear MAG_FILTER attuale della texture è NEAREST
  */
 
 /** @type {(cx: number, cy: number) => number} */
@@ -79,10 +82,12 @@ export class ChunkStore {
           touched: false,   // true se il rasterizer ha scritto pixel reali
           c2d: null,        // canvas del fallback 2D
           dirX0: CHUNK, dirY0: CHUNK, dirX1: -1, dirY1: -1,
+          mips: false, mipOn: false, magNear: true,
         };
       }
       c.key = key; c.cx = cx; c.cy = cy; c.texDirty = true; c.touched = false;
       c.dirX0 = CHUNK; c.dirY0 = CHUNK; c.dirX1 = -1; c.dirY1 = -1;
+      c.mips = false;
       this.map.set(key, c);
     }
     return c;

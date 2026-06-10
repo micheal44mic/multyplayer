@@ -17,7 +17,10 @@ import { clamp, lerp, rgbToHsv, hsvToRgb, mulberry32 } from './util.js';
  * @property {number} baseAngle
  * @property {number} spacing
  * @property {number} smoothing
- * @property {number} scatter
+ * @property {boolean} scatter
+ * @property {number} partN particelle per stamp (1 se scatter off)
+ * @property {number} partSize raggio particella come frazione del raggio dab
+ * @property {number} partDev -1..1: >0 addensa al centro, <0 verso il bordo
  * @property {number} jPos
  * @property {number} jSize
  * @property {number} jOp
@@ -89,6 +92,37 @@ export class DabQueue {
 
 let strokeSeed = 1;
 
+// Catmull-Rom centripetale (Barry-Goldman) valutata al parametro t.
+// I nodi arrivano già con epsilon: i punti duplicati ai bordi del tratto
+// non degenerano. Scrive in out (zero allocazioni).
+/**
+ * @param {{x: number, y: number}} p0 @param {{x: number, y: number}} p1
+ * @param {{x: number, y: number}} p2 @param {{x: number, y: number}} p3
+ * @param {number} t0 @param {number} t1 @param {number} t2 @param {number} t3
+ * @param {number} t @param {{x: number, y: number}} out
+ */
+function crEval(p0, p1, p2, p3, t0, t1, t2, t3, t, out) {
+  const f01 = 1 / (t1 - t0), f12 = 1 / (t2 - t1), f23 = 1 / (t3 - t2);
+  const a1x = (p0.x * (t1 - t) + p1.x * (t - t0)) * f01;
+  const a1y = (p0.y * (t1 - t) + p1.y * (t - t0)) * f01;
+  const a2x = (p1.x * (t2 - t) + p2.x * (t - t1)) * f12;
+  const a2y = (p1.y * (t2 - t) + p2.y * (t - t1)) * f12;
+  const a3x = (p2.x * (t3 - t) + p3.x * (t - t2)) * f23;
+  const a3y = (p2.y * (t3 - t) + p3.y * (t - t2)) * f23;
+  const f02 = 1 / (t2 - t0), f13 = 1 / (t3 - t1);
+  const b1x = (a1x * (t2 - t) + a2x * (t - t0)) * f02;
+  const b1y = (a1y * (t2 - t) + a2y * (t - t0)) * f02;
+  const b2x = (a2x * (t3 - t) + a3x * (t - t1)) * f13;
+  const b2y = (a2y * (t3 - t) + a3y * (t - t1)) * f13;
+  out.x = (b1x * (t2 - t) + b2x * (t - t1)) * f12;
+  out.y = (b1y * (t2 - t) + b2y * (t - t1)) * f12;
+  return out;
+}
+
+// Sotto questa deviazione (px documento) la corda è indistinguibile dalla
+// curva: niente suddivisione, costo zero rispetto a prima.
+const CURVE_TOL = 0.25;
+
 export class StrokeEngine {
   /** @param {DabQueue} queue */
   constructor(queue) {
@@ -105,6 +139,12 @@ export class StrokeEngine {
     // ultimo punto emesso (via continua)
     this._ex = 0; this._ey = 0; this._er = 0; this._ea = 0;
     this._dirX = 1; this._dirY = 0;               // direzione corrente del tratto
+    // curva: ring degli ultimi 4 punti stabilizzati. Il segmento q1->q2 viene
+    // emesso come Catmull-Rom quando arriva il punto successivo (lag di un
+    // evento, ~5 ms): tra punti radi (mano veloce) niente più poligoni.
+    this._cq = [{ x: 0, y: 0, p: 0 }, { x: 0, y: 0, p: 0 }, { x: 0, y: 0, p: 0 }, { x: 0, y: 0, p: 0 }];
+    this._cqN = 0;
+    this._cm = { x: 0, y: 0 }; // out riusato per crEval
   }
 
   // Fotografa il pennello: lo stroke è deterministico e indipendente
@@ -115,7 +155,7 @@ export class StrokeEngine {
     const eraser = brush.tool === 'eraser';
     const hsv = rgbToHsv(brush.color.r, brush.color.g, brush.color.b, { h: 0, s: 0, v: 0 });
 
-    const noJitter = brush.scatter === 0 && brush.jitterPos === 0 && brush.jitterSize === 0 &&
+    const noJitter = !brush.scatter && brush.jitterPos === 0 && brush.jitterSize === 0 &&
       brush.jitterOpacity === 0 && brush.jitterSpacing === 0 &&
       brush.jitterBright === 0 && brush.jitterSat === 0;
     const continuous = !brush.buildup && noJitter && brush.roundness >= 0.999 &&
@@ -139,6 +179,9 @@ export class StrokeEngine {
       spacing: rasterSpacing,
       smoothing: brush.smoothing,
       scatter: brush.scatter,
+      partN: brush.scatter ? Math.max(1, Math.min(12, Math.round(4 * brush.particleDensity / 100))) : 1,
+      partSize: Math.max(0.02, brush.particleSize / 100),
+      partDev: clamp(brush.particleDeviation / 100, -1, 1),
       jPos: brush.jitterPos,
       jSize: brush.jitterSize,
       jOp: brush.jitterOpacity,
@@ -168,6 +211,8 @@ export class StrokeEngine {
     this._sx = x; this._sy = y; this._sp = p;
     this._lx = x; this._ly = y; this._lp = p;
     this._dirX = 1; this._dirY = 0;
+    this._cqN = 0;
+    this._pushPoint(x, y, p); // primo nodo della curva (nessuna emissione)
 
     if (continuous) {
       const r = this._radius(p);
@@ -190,7 +235,7 @@ export class StrokeEngine {
     this._sx += (x - this._sx) * k;
     this._sy += (y - this._sy) * k;
     this._sp += (p - this._sp) * k;
-    this._advance(this._sx, this._sy, this._sp);
+    this._pushPoint(this._sx, this._sy, this._sp);
   }
 
   // Catch-up: a fine tratto lo stabilizzatore raggiunge il punto grezzo
@@ -201,17 +246,83 @@ export class StrokeEngine {
       const steps = 6;
       for (let i = 1; i <= steps; i++) {
         const t = i / steps;
-        this._advance(lerp(this._sx, x, t), lerp(this._sy, y, t), lerp(this._sp, p, t));
+        this._pushPoint(lerp(this._sx, x, t), lerp(this._sy, y, t), lerp(this._sp, p, t));
       }
     } else {
-      this._advance(x, y, p);
+      this._pushPoint(x, y, p);
     }
+    this._flushCurve();
     this.active = false;
   }
 
-  cancel() { this.active = false; }
+  cancel() { this.active = false; this._cqN = 0; }
 
   // ---- interni ----
+
+  // Accoda un punto stabilizzato al ring della curva. Il segmento tra
+  // terzultimo e penultimo viene emesso (suddiviso) quando arriva il punto
+  // dopo: la spline ha bisogno del vicino successivo.
+  /** @param {number} x @param {number} y @param {number} p */
+  _pushPoint(x, y, p) {
+    const q = this._cq;
+    if (this._cqN > 0) {
+      const last = q[this._cqN - 1];
+      const dx = x - last.x, dy = y - last.y;
+      if (dx * dx + dy * dy < 0.0025) { last.p = p; return; } // < 0.05 px
+    }
+    if (this._cqN === 4) {
+      const head = q[0];
+      q[0] = q[1]; q[1] = q[2]; q[2] = q[3]; q[3] = head;
+      head.x = x; head.y = y; head.p = p;
+      this._emitCurve(q[0], q[1], q[2], q[3]);
+    } else {
+      const slot = q[this._cqN++];
+      slot.x = x; slot.y = y; slot.p = p;
+      if (this._cqN === 3) this._emitCurve(q[0], q[0], q[1], q[2]);
+      else if (this._cqN === 4) this._emitCurve(q[0], q[1], q[2], q[3]);
+    }
+  }
+
+  // Fine tratto: emette il segmento finale rimasto in sospeso nel ring.
+  _flushCurve() {
+    const q = this._cq;
+    if (this._cqN === 4) this._emitCurve(q[1], q[2], q[3], q[3]);
+    else if (this._cqN === 3) this._emitCurve(q[0], q[1], q[2], q[2]);
+    else if (this._cqN === 2) this._advance(q[1].x, q[1].y, q[1].p);
+    this._cqN = 0;
+  }
+
+  // Emette il segmento p1->p2 della Catmull-Rom centripetale. Suddivisione
+  // adattiva: si valuta la deviazione del punto medio della curva dalla
+  // corda; sotto CURVE_TOL si emette la corda com'era prima (costo zero),
+  // altrimenti n ~ sqrt(dev/tol) sotto-punti via _advance.
+  /**
+   * @param {{x: number, y: number, p: number}} p0 @param {{x: number, y: number, p: number}} p1
+   * @param {{x: number, y: number, p: number}} p2 @param {{x: number, y: number, p: number}} p3
+   */
+  _emitCurve(p0, p1, p2, p3) {
+    const cdx = p2.x - p1.x, cdy = p2.y - p1.y;
+    const chord = Math.sqrt(cdx * cdx + cdy * cdy);
+    if (chord < 0.05) return;
+    // nodi centripetali (dist^0.5) con epsilon contro i duplicati ai bordi
+    const t1 = Math.max(Math.sqrt(Math.hypot(p1.x - p0.x, p1.y - p0.y)), 1e-3);
+    const t2 = t1 + Math.max(Math.sqrt(chord), 1e-3);
+    const t3 = t2 + Math.max(Math.sqrt(Math.hypot(p3.x - p2.x, p3.y - p2.y)), 1e-3);
+    const cm = crEval(p0, p1, p2, p3, 0, t1, t2, t3, (t1 + t2) * 0.5, this._cm);
+    const sdx = cm.x - (p1.x + p2.x) * 0.5, sdy = cm.y - (p1.y + p2.y) * 0.5;
+    const sag2 = sdx * sdx + sdy * sdy;
+    if (sag2 <= CURVE_TOL * CURVE_TOL) {
+      this._advance(p2.x, p2.y, p2.p);
+      return;
+    }
+    const n = Math.min(32, Math.ceil(Math.sqrt(Math.sqrt(sag2) / CURVE_TOL)) + 1);
+    for (let k = 1; k < n; k++) {
+      const f = k / n;
+      crEval(p0, p1, p2, p3, 0, t1, t2, t3, t1 + (t2 - t1) * f, cm);
+      this._advance(cm.x, cm.y, p1.p + (p2.p - p1.p) * f);
+    }
+    this._advance(p2.x, p2.y, p2.p);
+  }
 
   /** @param {number} x @param {number} y @param {number} p */
   _advance(x, y, p) {
@@ -270,48 +381,69 @@ export class StrokeEngine {
     return gap;
   }
 
+  // Emette uno stamp; con scatter ON lo stamp diventa una nuvola di partN
+  // particelle (raggio = partSize del dab, offset su disco con distribuzione
+  // modellata da partDev, raggio nuvola esteso da jPos — semantica mvp4).
+  // Ogni particella tira i propri jitter. Ritorna il raggio base del dab
+  // (per il passo di spacing).
   /** @param {number} x @param {number} y @param {number} p */
   _emitDab(x, y, p) {
     const s = this.snap;
     const rng = s.rng;
+    const baseR = this._radius(p);
+    const aDyn = this._alphaDyn(p);
+    const n = s.partN;
 
-    let r = this._radius(p);
-    if (s.jSize > 0) r = Math.max(0.25, r * (1 - rng() * s.jSize));
+    for (let i = 0; i < n; i++) {
+      let px = x, py = y;
+      let r = baseR;
 
-    let a = this._alphaDyn(p);
-    if (s.jOp > 0) a *= 1 - rng() * s.jOp;
-    if (s.buildup) {
-      a *= s.opacity;
-      if (s.alphaCompPow !== 1) a = 1 - Math.pow(1 - a, s.alphaCompPow);
+      if (s.scatter) {
+        // disco: angolo uniforme; il raggio segue partDev (0 = uniforme via
+        // sqrt, >0 addensa al centro, <0 spinge verso il bordo)
+        const ang = rng() * Math.PI * 2;
+        const u = rng();
+        const dev = s.partDev;
+        const dT = dev > 0.0001
+          ? Math.pow(u, 0.5 + dev * 3)
+          : dev < -0.0001
+            ? 1 - Math.pow(1 - Math.sqrt(u), 1 - dev * 3)
+            : Math.sqrt(u);
+        const off = dT * baseR * (1 + s.jPos * 2);
+        px += Math.cos(ang) * off;
+        py += Math.sin(ang) * off;
+        r = Math.max(0.25, baseR * s.partSize);
+      } else if (s.jPos > 0) {
+        // jitter posizione: disco uniforme
+        const ang = rng() * Math.PI * 2;
+        const mag = rng() * s.jPos * s.diam;
+        px += Math.cos(ang) * mag;
+        py += Math.sin(ang) * mag;
+      }
+
+      if (s.jSize > 0) r = Math.max(0.25, r * (1 - rng() * s.jSize));
+
+      let a = aDyn;
+      if (s.jOp > 0) a *= 1 - rng() * s.jOp;
+      if (s.buildup) {
+        a *= s.opacity;
+        if (s.alphaCompPow !== 1) a = 1 - Math.pow(1 - a, s.alphaCompPow);
+      }
+
+      let angle = s.baseAngle;
+      if (s.jAngle > 0) angle += (rng() * 2 - 1) * Math.PI * s.jAngle;
+
+      let cr = s.colR, cg = s.colG, cb = s.colB;
+      if (!s.eraser && (s.jBright > 0 || s.jSat > 0)) {
+        const v = clamp(s.hsv.v + (rng() * 2 - 1) * s.jBright, 0, 1);
+        const sat = clamp(s.hsv.s + (rng() * 2 - 1) * s.jSat, 0, 1);
+        const c = hsvToRgb(s.hsv.h, sat, v, s.tmpRgb);
+        cr = c.r; cg = c.g; cb = c.b;
+      }
+
+      this.q.push(T_DAB, px, py, r, a, angle, cr, cg, cb, 0);
+      this.dabsEmitted++;
     }
-
-    // scatter: perpendicolare alla direzione del tratto
-    if (s.scatter > 0) {
-      const off = (rng() * 2 - 1) * s.scatter * s.diam;
-      x += -this._dirY * off;
-      y += this._dirX * off;
-    }
-    // jitter posizione: disco uniforme
-    if (s.jPos > 0) {
-      const ang = rng() * Math.PI * 2;
-      const mag = rng() * s.jPos * s.diam;
-      x += Math.cos(ang) * mag;
-      y += Math.sin(ang) * mag;
-    }
-
-    let angle = s.baseAngle;
-    if (s.jAngle > 0) angle += (rng() * 2 - 1) * Math.PI * s.jAngle;
-
-    let cr = s.colR, cg = s.colG, cb = s.colB;
-    if (!s.eraser && (s.jBright > 0 || s.jSat > 0)) {
-      const v = clamp(s.hsv.v + (rng() * 2 - 1) * s.jBright, 0, 1);
-      const sat = clamp(s.hsv.s + (rng() * 2 - 1) * s.jSat, 0, 1);
-      const c = hsvToRgb(s.hsv.h, sat, v, s.tmpRgb);
-      cr = c.r; cg = c.g; cb = c.b;
-    }
-
-    this.q.push(T_DAB, x, y, r, a, angle, cr, cg, cb, 0);
-    this.dabsEmitted++;
-    return r;
+    return baseR;
   }
 }

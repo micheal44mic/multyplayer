@@ -110,7 +110,9 @@ export class Canvas2DRenderer {
       (-camera.x * camera.zoom + camera.w * 0.5) * dpr,
       (-camera.y * camera.zoom + camera.h * 0.5) * dpr
     );
-    ctx.imageSmoothingEnabled = camera.zoom < 1;
+    // liscio in minificazione e fino a 380% di ingrandimento; oltre, pixel
+    // nitidi per il lavoro di dettaglio (stessa soglia del renderer WebGL)
+    ctx.imageSmoothingEnabled = camera.zoom <= 3.8;
 
     const r = camera.visibleRect(this._rect);
     const cx0 = Math.floor(r.x0 / CHUNK), cy0 = Math.floor(r.y0 / CHUNK);

@@ -8,6 +8,10 @@ import { CHUNK } from './store.js';
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
 /** @typedef {import('./camera.js').Camera} Camera */
 
+// Sopra questo zoom la magnificazione mostra i pixel nitidi (NEAREST, per il
+// lavoro di dettaglio); fino a qui l'ingrandimento è ammorbidito (LINEAR).
+const MAG_NEAREST_ZOOM = 3.8;
+
 const VS_CHUNK = `
 attribute vec2 aPos;
 uniform mat3 uMat;
@@ -100,6 +104,8 @@ export class GLRenderer {
     /** @type {ChunkStore[]} */
     this._stores = [];
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
+    this._wantMips = false;    // zoom < 1 nel frame corrente
+    this._wantNearest = true;  // zoom > MAG_NEAREST_ZOOM nel frame corrente
 
     // desynchronized: presentazione a bassa latenza (Chrome). Può lampeggiare
     // su alcuni sistemi: il frame va a schermo fuori sincrono col loop.
@@ -203,9 +209,42 @@ export class GLRenderer {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, CHUNK, CHUNK, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       chunk.texDirty = true;
+      chunk.mips = false;
+      chunk.mipOn = false;
+      chunk.magNear = true; // la texture nasce con MAG_FILTER = NEAREST
       this.texCount++;
     }
     return chunk.tex;
+  }
+
+  // Filtri di campionamento in funzione dello zoom, aggiornati pigramente
+  // per chunk (con la texture già bound sull'unità attiva):
+  //   - zoom < 1 (minificazione): LINEAR campiona solo 4 texel e i tratti
+  //     sottili si sgranano/spezzano -> mipmap, (ri)generate solo per i
+  //     chunk cambiati e solo quando servono;
+  //   - zoom 1..MAG_NEAREST_ZOOM: ingrandimento ammorbidito (MAG LINEAR);
+  //   - oltre: pixel nitidi (MAG NEAREST) per il lavoro di dettaglio.
+  /** @param {Chunk} chunk */
+  _applyMips(chunk) {
+    const gl = this.gl;
+    if (this._wantMips) {
+      if (!chunk.mips) {
+        gl.generateMipmap(gl.TEXTURE_2D); // CHUNK=256 è POT: ok anche su WebGL1
+        chunk.mips = true;
+      }
+      if (!chunk.mipOn) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+        chunk.mipOn = true;
+      }
+    } else if (chunk.mipOn) {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      chunk.mipOn = false;
+    }
+    if (this._wantNearest !== chunk.magNear) {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER,
+        this._wantNearest ? gl.NEAREST : gl.LINEAR);
+      chunk.magNear = this._wantNearest;
+    }
   }
 
   // Upload dei soli chunk sporchi. Su WebGL2, se la texture è già valida,
@@ -238,6 +277,7 @@ export class GLRenderer {
         bytes += w * h * 4;
         this.uploadsThisFrame++;
         chunk.dirX0 = CHUNK; chunk.dirY0 = CHUNK; chunk.dirX1 = -1; chunk.dirY1 = -1;
+        chunk.mips = false; // il livello 0 è cambiato: catena mip stantia
       } else {
         if (rowLenSet) {
           // _uploadNow carica il chunk intero: stride di default
@@ -274,6 +314,8 @@ export class GLRenderer {
     if (this.contextLost) return;
     const gl = this.gl;
     this.uploadsThisFrame = 0;
+    this._wantMips = camera.zoom < 1;
+    this._wantNearest = camera.zoom > MAG_NEAREST_ZOOM;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
     // sfondo + griglia procedurale (coordinate mondo nel fragment)
@@ -325,8 +367,10 @@ export class GLRenderer {
         if (sc && (!sc.tex || sc.texDirty)) this._uploadNow(sc);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, chunk.tex);
+        this._applyMips(chunk);
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D, sc && sc.tex ? sc.tex : this.dummyTex);
+        if (sc && sc.tex) this._applyMips(sc);
         gl.uniform2f(this.eOrigin, chunk.cx * CHUNK, chunk.cy * CHUNK);
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       }
@@ -352,6 +396,7 @@ export class GLRenderer {
     chunk.texDirty = false;
     // il chunk intero è in texture: l'eventuale rect accumulato è coperto
     chunk.dirX0 = CHUNK; chunk.dirY0 = CHUNK; chunk.dirX1 = -1; chunk.dirY1 = -1;
+    chunk.mips = false;
     this.uploadsThisFrame++;
   }
 
@@ -365,6 +410,7 @@ export class GLRenderer {
       if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
       if (!chunk.tex || chunk.texDirty) this._uploadNow(chunk);
       gl.bindTexture(gl.TEXTURE_2D, chunk.tex);
+      this._applyMips(chunk);
       gl.uniform2f(this.uOrigin, chunk.cx * CHUNK, chunk.cy * CHUNK);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }

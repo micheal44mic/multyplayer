@@ -10,9 +10,12 @@ import { ZOOM_MIN, ZOOM_MAX } from './camera.js';
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
 
 /**
- * Voce del pannello: o una sezione ({sec}) o uno slider completo.
+ * Voce del pannello: una sezione ({sec}), un toggle in linea ({toggle}) o
+ * uno slider completo. dep: la riga è attiva solo se ritorna true (il
+ * builder la rinfresca quando un toggle cambia).
  * @typedef {Object} SliderDef
  * @property {string} [sec]
+ * @property {{label: string, hint?: string, get: () => boolean, set: (v: boolean) => void}} [toggle]
  * @property {string} [id]
  * @property {string} [label]
  * @property {number} [min]
@@ -22,6 +25,7 @@ import { ZOOM_MIN, ZOOM_MAX } from './camera.js';
  * @property {(v: number) => void} [set]
  * @property {(v: number) => string} [fmt]
  * @property {boolean} [log]
+ * @property {() => boolean} [dep]
  * @property {HTMLInputElement} [_input]
  * @property {() => void} [_refresh]
  */
@@ -40,8 +44,13 @@ const SLIDERS = [
   { id: 'roundness', label: 'Rotondità', min: 5, max: 100, step: 1, get: () => brush.roundness * 100, set: v => brush.roundness = v / 100, fmt: v => v + '%' },
   { id: 'angle', label: 'Angolo', min: 0, max: 360, step: 1, get: () => brush.angle, set: v => brush.angle = v, fmt: v => v + '°' },
 
-  { sec: 'Scatter e jitter' },
-  { id: 'scatter', label: 'Scatter', min: 0, max: 100, step: 1, get: () => brush.scatter * 100, set: v => brush.scatter = v / 100, fmt: v => v + '%' },
+  { sec: 'Scatter' },
+  { toggle: { label: 'Scatter', hint: 'ogni stamp diventa una nuvola di particelle', get: () => brush.scatter, set: v => brush.scatter = v } },
+  { id: 'pdens', label: 'Densità', min: 25, max: 300, step: 1, dep: () => brush.scatter, get: () => brush.particleDensity, set: v => brush.particleDensity = v, fmt: v => `${v}% · ${Math.max(1, Math.min(12, Math.round(4 * v / 100)))} pt` },
+  { id: 'psize', label: 'Dimensione particelle', min: 5, max: 200, step: 1, dep: () => brush.scatter, get: () => brush.particleSize, set: v => brush.particleSize = v, fmt: v => v + '%' },
+  { id: 'pdev', label: 'Deviazione', min: -100, max: 100, step: 1, dep: () => brush.scatter, get: () => brush.particleDeviation, set: v => brush.particleDeviation = v, fmt: v => (v > 0 ? '+' : '') + v + '%' },
+
+  { sec: 'Jitter' },
   { id: 'jpos', label: 'Jitter posizione', min: 0, max: 100, step: 1, get: () => brush.jitterPos * 100, set: v => brush.jitterPos = v / 100, fmt: v => v + '%' },
   { id: 'jsize', label: 'Jitter spessore', min: 0, max: 100, step: 1, get: () => brush.jitterSize * 100, set: v => brush.jitterSize = v / 100, fmt: v => v + '%' },
   { id: 'jop', label: 'Jitter opacità', min: 0, max: 100, step: 1, get: () => brush.jitterOpacity * 100, set: v => brush.jitterOpacity = v / 100, fmt: v => v + '%' },
@@ -103,6 +112,11 @@ export class UI {
       frag.appendChild(lab);
     }
 
+    // righe con dipendenza da un toggle: rinfrescate a ogni cambio
+    /** @type {(() => void)[]} */
+    const depRefresh = [];
+    const refreshDeps = () => { for (const f of depRefresh) f(); };
+
     for (const def of SLIDERS) {
       if (def.sec) {
         const h = document.createElement('div');
@@ -111,8 +125,36 @@ export class UI {
         frag.appendChild(h);
         continue;
       }
+      if (def.toggle) {
+        const t = def.toggle;
+        const lab = document.createElement('label');
+        lab.className = 'p-toggle';
+        const span = document.createElement('span');
+        span.textContent = t.label;
+        if (t.hint) {
+          const hint = document.createElement('span');
+          hint.className = 'p-hint';
+          hint.textContent = t.hint;
+          span.appendChild(hint);
+        }
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = t.get();
+        input.addEventListener('change', () => { t.set(input.checked); refreshDeps(); });
+        const knob = document.createElement('span');
+        knob.className = 'knob';
+        lab.append(span, input, knob);
+        frag.appendChild(lab);
+        continue;
+      }
       const row = document.createElement('div');
       row.className = 'p-row';
+      if (def.dep) {
+        const dep = def.dep;
+        const apply = () => row.classList.toggle('p-off', !dep());
+        depRefresh.push(apply);
+        apply();
+      }
       const head = document.createElement('div');
       head.className = 'p-row-head';
       const name = document.createElement('span');

@@ -12,7 +12,8 @@
 /** @type {Brush} */
 const BASE = {
   size: 24, opacity: 1, hardness: 0.85, smoothing: 0.35, spacing: 0.04,
-  roundness: 1, angle: 0, scatter: 0, jitterPos: 0, jitterSize: 0,
+  roundness: 1, angle: 0, scatter: false, particleSize: 50, particleDensity: 100,
+  particleDeviation: 0, jitterPos: 0, jitterSize: 0,
   jitterOpacity: 0, jitterSpacing: 0, jitterAngle: 0, jitterBright: 0,
   jitterSat: 0, buildup: false, pressureSize: true, pressureOpacity: false,
   color: { r: 26, g: 26, b: 31 }, tool: 'brush',
@@ -32,7 +33,7 @@ const SCENARIOS = [
   { name: 'dab-grande-morbido', brush: { size: 160, hardness: 0.15 }, points: 300 },
   { name: 'capsule-continua', brush: { size: 80, hardness: 0.5, spacing: 0.001 }, points: 500 },
   { name: 'buildup-airbrush', brush: { size: 60, hardness: 0, spacing: 0.01, buildup: true, opacity: 0.35 }, points: 400 },
-  { name: 'jitter-scatter', brush: { size: 48, hardness: 0.6, spacing: 0.08, roundness: 0.6, scatter: 0.5, jitterPos: 0.3, jitterSize: 0.3, jitterOpacity: 0.3, jitterAngle: 0.4, jitterBright: 0.2, jitterSat: 0.15 }, points: 400 },
+  { name: 'jitter-scatter', brush: { size: 48, hardness: 0.6, spacing: 0.08, roundness: 0.6, scatter: true, particleDensity: 100, particleSize: 40, particleDeviation: 0, jitterPos: 0.3, jitterSize: 0.3, jitterOpacity: 0.3, jitterAngle: 0.4, jitterBright: 0.2, jitterSat: 0.15 }, points: 400 },
   { name: 'gomma-grande', brush: { size: 120, hardness: 0.5, tool: 'eraser' }, points: 300, prep: { size: 160, hardness: 0.3 } },
 ];
 

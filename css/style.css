@@ -194,6 +194,8 @@ html, body {
 .p-section:first-child { margin-top: 2px; }
 
 .p-row { margin: 10px 0; }
+/* riga dipendente da un toggle spento: visibile ma non interagibile */
+.p-row.p-off { opacity: 0.35; pointer-events: none; }
 .p-row-head {
   display: flex;
   justify-content: space-between;
