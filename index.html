@@ -70,13 +70,22 @@
     </div>
   </header>
 
-  <aside id="panel">
-    <div id="panel-head">
-      <span>Pennello</span>
-      <button id="panel-close" class="tb-btn" title="Chiudi">✕</button>
+  <div id="studio-backdrop" hidden></div>
+  <section id="studio" role="dialog" aria-modal="true" aria-label="Studio pennello">
+    <div id="studio-head">
+      <span id="studio-title">Pennello</span>
+      <button id="studio-close" class="tb-btn" title="Chiudi (P)">✕</button>
     </div>
-    <div id="panel-body"><!-- generato da ui.js --></div>
-  </aside>
+    <div id="bs-preview-wrap">
+      <canvas id="bs-preview"></canvas>
+      <span id="bs-badge"></span>
+    </div>
+    <nav id="bs-tabs"><!-- generato da ui.js --></nav>
+    <div id="bs-panes"><!-- generato da ui.js --></div>
+    <div id="bs-foot">
+      <button id="bs-reset">Reimposta pennello</button>
+    </div>
+  </section>
 
   <section id="hud" class="collapsed">
     <div id="hud-head">

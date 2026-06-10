@@ -148,9 +148,10 @@ export class StrokeEngine {
   }
 
   // Fotografa il pennello: lo stroke è deterministico e indipendente
-  // da cambi di impostazioni a metà tratto.
-  /** @param {number} x @param {number} y @param {number} p @param {Brush} brush */
-  begin(x, y, p, brush) {
+  // da cambi di impostazioni a metà tratto. seed: rng fisso (preview del
+  // pennello — scatter/jitter identici a ogni re-render, niente sfarfallio).
+  /** @param {number} x @param {number} y @param {number} p @param {Brush} brush @param {number} [seed] */
+  begin(x, y, p, brush, seed) {
     const baseR = Math.max(0.5, brush.size * 0.5);
     const eraser = brush.tool === 'eraser';
     const hsv = rgbToHsv(brush.color.r, brush.color.g, brush.color.b, { h: 0, s: 0, v: 0 });
@@ -202,7 +203,7 @@ export class StrokeEngine {
       // opacità globale applicata al composito (e allo shader live):
       // wash -> slider; buildup -> 1 (l'accumulo è già nei dab)
       globalOpacity: brush.buildup ? 1 : brush.opacity,
-      rng: mulberry32((strokeSeed = (strokeSeed * 1103515245 + 12345) >>> 0)),
+      rng: mulberry32(seed !== undefined ? seed >>> 0 : (strokeSeed = (strokeSeed * 1103515245 + 12345) >>> 0)),
       tmpRgb: { r: 0, g: 0, b: 0 },
     };
 
