@@ -9,7 +9,7 @@ import { BrushPreview } from './brush_preview.js';
 import { textureFromFile, defaultGrainTexture } from './texture.js';
 import { TextUI } from './text_ui.js';
 import { LayersUI } from './layers_ui.js';
-import { shadowCss } from './text_layer.js';
+import { shadowCss, renderBlockCanvas, textBaselineY } from './text_layer.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Tool} Tool */
@@ -134,13 +134,12 @@ const TABS = [
     { id: 'jsat', label: 'Jitter saturazione', min: 0, max: 100, step: 1, get: () => brush.jitterSat * 100, set: v => brush.jitterSat = v / 100, fmt: v => v + '%' },
   ] },
   { id: 'more', label: 'Altro', icon: ICONS.more, rows: [
-    // Dinamica ibis-style: % dello spessore base agli estremi del tratto.
-    // La lunghezza della punta dipende dalla velocità (tratto lento = estremi
-    // tondi, frustata = punte lunghe); vedi stroke.js.
+    // Punte del tratto: % dello spessore base ai vertici. La lunghezza delle
+    // punte non si imposta: la decide la velocità del gesto agli estremi
+    // (tratto posato = corte e smussate, frustata = lunghe); vedi stroke.js.
     { sec: 'Dinamica del tratto' },
     { id: 'tstart', label: 'Spessore iniziale', min: 0, max: 100, step: 1, get: () => brush.taperStart * 100, set: v => brush.taperStart = v / 100, fmt: v => v + '%' },
     { id: 'tend', label: 'Spessore finale', min: 0, max: 100, step: 1, get: () => brush.taperEnd * 100, set: v => brush.taperEnd = v / 100, fmt: v => v + '%' },
-    { id: 'vthick', label: 'Velocità → spessore', min: 0, max: 100, step: 1, get: () => brush.speedThickness * 100, set: v => brush.speedThickness = v / 100, fmt: v => v + '%' },
     { sec: 'Renderer' },
     { renderer: true },
   ] },
@@ -725,14 +724,24 @@ export function exportPng(mgr) {
       const it = layer.item, st = layer.style;
       ctx.font = `${st.weight} ${it.size}px "${st.font}", sans-serif`;
       ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
+      ctx.textBaseline = 'alphabetic';
       ctx.lineJoin = 'round';
-      const tx = it.x - x0, ty = it.y - y0;
-      if (st.shadowBlur > 0 || st.shadowDist > 0) {
-        ctx.shadowColor = shadowCss(st.shadowColor);
+      const tx = it.x - x0, ty = textBaselineY(it, st) - y0;
+      const block3d = st.block && st.shadowDist > 0;
+      if (block3d) {
+        // stesso renderer della bitmap live, alla risoluzione del documento;
+        // alpha dell'ombra in un colpo solo (l'overlap non scurisce)
+        const blk = renderBlockCanvas(it, st, 1);
+        ctx.save();
+        ctx.globalAlpha = layer.opacity * (st.shadowOpacity ?? 0.65);
+        ctx.drawImage(blk.canvas, blk.box.x - x0, blk.box.y - y0);
+        ctx.restore();
+      } else if (st.shadowBlur > 0 || st.shadowDist > 0) {
+        const rad = (st.shadowAngle ?? 45) * Math.PI / 180;
+        ctx.shadowColor = shadowCss(st.shadowColor, st.shadowOpacity ?? 0.65);
         ctx.shadowBlur = st.shadowBlur;
-        ctx.shadowOffsetX = st.shadowDist * 0.7071;
-        ctx.shadowOffsetY = st.shadowDist * 0.7071;
+        ctx.shadowOffsetX = Math.cos(rad) * st.shadowDist;
+        ctx.shadowOffsetY = Math.sin(rad) * st.shadowDist;
       }
       if (st.stroke > 0) {
         ctx.strokeStyle = st.strokeColor;

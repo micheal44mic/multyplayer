@@ -1,9 +1,9 @@
-// Preview del pennello (Brush Studio): un tratto a S con tempi sintetici
-// (veloce agli estremi, lento al centro) così la dinamica ibis-style mostra
-// punte agli estremi e corpo pieno al centro. Renderizzato con la STESSA
-// pipeline del canvas (StrokeEngine -> Rasterizer JS) su un mini ChunkStore
-// dedicato. Seed fisso: trascinare uno slider non fa "ballare" scatter e
-// jitter tra un re-render e l'altro.
+// Preview del pennello (Brush Studio): un tratto a S con tempi sintetici da
+// pennellata decisa (velocità costante e alta) così la dinamica delle punte
+// mostra i coni ai due estremi. Renderizzato con la STESSA pipeline del
+// canvas (StrokeEngine -> Rasterizer JS) su un mini ChunkStore dedicato.
+// Seed fisso: trascinare uno slider non fa "ballare" scatter e jitter tra un
+// re-render e l'altro.
 //
 // La dimensione del tratto è quella vera finché entra in altezza; oltre,
 // scala: tutti i parametri del pennello sono relativi al diametro, quindi
@@ -11,7 +11,7 @@
 
 import { brush, StampCache } from './brush.js';
 import { ChunkStore, CHUNK, CHUNK_SHIFT } from './store.js';
-import { DabQueue, StrokeEngine, TAPER_MS } from './stroke.js';
+import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer } from './raster.js';
 
 const SEED = 0x51ed270b;
@@ -63,22 +63,18 @@ export class BrushPreview {
     /** @type {(t: number) => number} */
     const py = (t) => cy - amp * Math.sin(t * Math.PI * 2) * Math.sin(t * Math.PI) * 1.15;
 
-    // Tempi sintetici deterministici: veloce agli estremi, lento al centro —
-    // la dinamica (taper temporale × velocità) disegna punte agli estremi e
-    // corpo pieno al centro, come una pennellata vera.
+    // Tempi sintetici deterministici a velocità costante e ALTA (sopra la
+    // soglia di punta piena): la dinamica disegna i coni ai due estremi,
+    // lunghi fino ai tetti — la forma del tratto di una pennellata decisa.
+    // I rapporti impostati (spessore iniziale/finale) restano visibili tali
+    // e quali: a questa velocità il pavimento del moncone è zero.
     const times = new Float64Array(POINTS + 1);
     {
+      const V = 2.2; // px/ms
       let len = 0;
       for (let i = 1; i <= POINTS; i++) {
         len += Math.hypot(px(i / POINTS) - px((i - 1) / POINTS), py(i / POINTS) - py((i - 1) / POINTS));
-      }
-      const vEnd = Math.max(0.2, 0.11 * len / TAPER_MS); // punta ~11% del tratto
-      const vMid = vEnd * 0.35;
-      for (let i = 1; i <= POINTS; i++) {
-        const u = (i - 0.5) / POINTS;
-        const v = vEnd + (vMid - vEnd) * Math.sin(u * Math.PI);
-        const ds = Math.hypot(px(i / POINTS) - px((i - 1) / POINTS), py(i / POINTS) - py((i - 1) / POINTS));
-        times[i] = times[i - 1] + ds / v;
+        times[i] = len / V;
       }
     }
 

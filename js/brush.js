@@ -29,7 +29,6 @@ import { clamp } from './util.js';
  * @property {boolean} buildup
  * @property {number} taperStart
  * @property {number} taperEnd
- * @property {number} speedThickness
  * @property {import('./texture.js').BrushTexture|null} texture
  * @property {boolean} textureOn
  * @property {number} textureScale
@@ -65,13 +64,12 @@ export const brush = {
   jitterBright: 0,     // 0..1 (luminosità HSV)
   jitterSat: 0,        // 0..1 (saturazione HSV)
   buildup: false,      // true: l'opacità di ogni stamp si accumula nello stroke
-  // Dinamica alla ibis Paint: lo spessore di inizio/fine tratto è un rapporto
-  // dello spessore base, applicato su una finestra di TEMPO (stroke.js) — un
-  // tratto lento parte/finisce tondo, una frustata a punta. speedThickness è
-  // lo spessore residuo ad alta velocità (1 = la velocità non influisce).
-  taperStart: 0,       // 0..1, rapporto a inizio tratto
-  taperEnd: 0,         // 0..1, rapporto a fine tratto
-  speedThickness: 0.5, // 0..1, rapporto a velocità massima
+  // Punte del tratto: rapporto di spessore al vertice d'inizio/fine (0 =
+  // punta vera, 1 = nessuna punta). La LUNGHEZZA delle punte non si imposta:
+  // la decide la velocità del gesto agli estremi (stroke.js) — frustata =
+  // punte lunghe, gesto posato = corte e smussate.
+  taperStart: 0,       // 0..1, rapporto al vertice d'inizio
+  taperEnd: 0,         // 0..1, rapporto al vertice di fine
   // Texture/grana: modula l'alpha della maschera di ogni stamp (vedi
   // texture.js per l'asset e raster.js per il campionamento antialiasato).
   texture: null,       // BrushTexture importata o grana di default; null = off

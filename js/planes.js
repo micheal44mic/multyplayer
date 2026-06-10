@@ -6,7 +6,7 @@
 // l'ordine della pila. Caso comune (niente sandwich): un canvas + eventuali
 // SVG in cima — zero overhead rispetto a prima.
 
-import { syncTextSvg, createTextSvg } from './text_layer.js';
+import { syncTextSvg, createTextSvg, refreshBlockBitmap } from './text_layer.js';
 import { Canvas2DRenderer } from './renderer_2d.js';
 
 /** @typedef {import('./camera.js').Camera} Camera */
@@ -201,6 +201,8 @@ export class Planes {
         if (camChanged || g.layer.svg.getAttribute('viewBox') !== this._vb) {
           g.layer.svg.setAttribute('viewBox', this._vb);
         }
+        // bitmap dell'estrusione 3D: a regime è un confronto e basta
+        refreshBlockBitmap(g.layer, camera, camChanged);
         continue;
       }
       const hasActive = g.layers.some((l) => l.id === activeId);

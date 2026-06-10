@@ -17,7 +17,7 @@ const BASE = {
   roundness: 1, angle: 0, scatter: false, particleSize: 50, particleDensity: 100,
   particleDeviation: 0, jitterPos: 0, jitterSize: 0,
   jitterOpacity: 0, jitterSpacing: 0, jitterAngle: 0, jitterBright: 0,
-  jitterSat: 0, buildup: false, taperStart: 0, taperEnd: 0, speedThickness: 0.5,
+  jitterSat: 0, buildup: false, taperStart: 0, taperEnd: 0,
   texture: null, textureOn: false, textureScale: 1, textureDepth: 0.5,
   textureFloor: 0.25, textureContrast: 1, textureInvert: false, textureMoving: false,
   textureUseColor: false,
@@ -52,7 +52,7 @@ const SCENARIOS = [
 ];
 
 // Traiettoria sinusoidale fissa: copre più chunk. Tempi sintetici a 5 ms per
-// punto (deterministici: la dinamica taper/velocità produce sempre gli stessi
+// punto (deterministici: la dinamica delle punte produce sempre gli stessi
 // raggi, quindi checksum confrontabili tra engine).
 /** @param {number} n @returns {{x: number, y: number, p: number, t: number}[]} */
 function makePath(n) {

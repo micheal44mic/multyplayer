@@ -1,6 +1,7 @@
 // STROKE PIPELINE — pura matematica, nessun pixel.
-// Smoother -> Sampler (accumulatore di spacing) -> BrushDynamics -> descrittori in coda.
-// La coda è un ring buffer Float32 preallocato: il rasterizer la drena col suo budget.
+// Smoother -> Sampler (accumulatore di spacing) -> dinamica delle punte ->
+// descrittori in coda. La coda è un ring buffer Float32 preallocato: il
+// rasterizer la drena col suo budget.
 
 import { clamp, lerp, rgbToHsv, hsvToRgb, mulberry32 } from './util.js';
 import { buildTextureLut, buildTextureColorLut } from './texture.js';
@@ -31,6 +32,9 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
  * @property {number} jSat
  * @property {boolean} buildup
  * @property {number} alphaCompPow
+ * @property {number} taperStart rapporto di spessore al vertice d'inizio (0..1)
+ * @property {number} taperEnd rapporto di spessore al vertice di fine (0..1)
+ * @property {number} speedScale px documento -> px CSS (zoom camera al pen-down)
  * @property {import('./texture.js').BrushTexture|null} tex texture/grana (null = off)
  * @property {number} texScale
  * @property {boolean} texMoving
@@ -60,16 +64,76 @@ const CONTINUOUS_THRESHOLD = 0.05;
 // analiticamente: stessa copertura accumulata, 30x meno lavoro nel caso 0.1%.
 const MIN_BUILDUP_SPACING = 0.03;
 
+// Dinamica delle punte (modello "pennellata a cerchi"). La lunghezza di ogni
+// punta è velocità × SENS_MS: una frustata lascia punte lunghe, un gesto
+// posato corte. La velocità è misurata agli ESTREMI del gesto su una finestra
+// di SW_MS (o SW_PTS punti filtrati a SW_FILTER px CSS).
+// Punta d'INIZIO: le emissioni vengono trattenute finché la finestra non si
+// chiude (~70 ms), poi lunghezza e rapporto della punta sono congelati e il
+// tratto parte già col profilo esatto — niente secondo pass sull'attacco.
+// Punta di FINE: non può essere disegnata live (la fine non è nota): il
+// tratto arriva pieno fino alla punta — zero ritardo — e ogni emissione viene
+// registrata; al pen-up il chiamante svuota i SOLI chunk coperti dalla punta
+// (endPassRect) e replay(), clippato lì dal rasterizer, ridisegna il cono
+// finale: costo ∝ area della punta, non del tratto intero.
+// Tetti: ogni punta al massimo TIP_MAX_FRAC del tratto, le due insieme
+// TIP_SUM_FRAC. Se i tetti accorciano la punta d'inizio rispetto a quella
+// disegnata live (tratto corto), il replay rifà il tratto intero: costo
+// comunque piccolo, il tratto è corto.
+const SENS_MS = 250;   // ms: lunghezza punta = velocità × SENS_MS
+const VFULL = 1.5;     // px CSS/ms: a questa velocità il vertice raggiunge il rapporto impostato
+const EXTRA = 0.35;    // pavimento extra a velocità zero: lento = moncone
+const SW_MS = 70;      // ms: finestra di misura della velocità agli estremi
+const SW_PTS = 10;     // ...o al massimo 10 punti filtrati
+const SW_FILTER = 1.5; // px CSS: distanza minima tra punti per la misura
+const TIP_MAX_FRAC = 0.65; // ogni punta: al massimo 65% della lunghezza del tratto
+const TIP_SUM_FRAC = 0.95; // le due insieme: al massimo 95%
+const MIN_R_PX = 0.06; // raggio sotto cui il dab non si stampa: la punta finisce a zero
+const REPLAY_MIN_GAP_PX = 0.5; // passo minimo del ricampionamento delle punte
+const REC_STRIDE = 5;    // registro: x, y, m, mP, burn
+const REC_MAX = 1 << 21; // tetto del registro (~40MB): oltre, niente pass finale
+
 // Salto massimo di raggio tra due emissioni consecutive: oltre, si inseriscono
 // dab intermedi interpolati — i gradini del bordo restano sub-pixel dovunque
-// il raggio cambia (pressione). Lo spacing dell'utente resta il ritmo base:
-// a raggio costante non si aggiunge nulla.
+// il raggio cambia (punte, pressione). Lo spacing dell'utente resta il ritmo
+// base: a raggio costante non si aggiunge nulla.
 const MAX_R_STEP_PX = 0.5;
 // ...ma SOLO dove gli stamp consecutivi si sovrappongono (il tratto è un
 // nastro continuo, la smerlatura si vede). Se il passo supera questa frazione
 // della somma dei raggi, i tondi sono separati di proposito (spacing alto):
-// la pressione deve scalarli, non fonderli con un ponte di dab intermedi.
+// le punte devono scalarli, non fonderli con un ponte di dab intermedi.
 const SUBDIV_OVERLAP = 0.75;
+
+// Profilo della punta: ease-out quartico 1-(1-x)^4 ("curvatura punta" 4).
+// Pendenza piena in x=0 — lo spessore cresce subito appena lasciato il
+// vertice — e tangente nulla in x=1: il raccordo col corpo pieno è senza
+// stacco.
+/** @param {number} x 0 al vertice, 1 al corpo */
+function easeTip(x) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const t = 1 - x;
+  return 1 - t * t * t * t;
+}
+
+// Fattore di spessore a distanza d dal vertice di una punta lunga len:
+// th al vertice, 1 da len in poi.
+/** @param {number} d @param {number} len @param {number} th */
+function tipFactor(d, len, th) {
+  if (d >= len) return 1;
+  return th + (1 - th) * easeTip(d / len);
+}
+
+// Rapporto al vertice: il valore impostato più un pavimento EXTRA che
+// svanisce con la velocità (S-curve fino a VFULL) — un'estremità posata
+// lascia un moncone, solo la frustata arriva al valore scelto (0 = punta
+// vera), come un pennello fisico.
+/** @param {number} setting rapporto impostato (0..1) @param {number} velCss px CSS/ms */
+function tipRatio(setting, velCss) {
+  let k = velCss / VFULL;
+  k = k <= 0 ? 0 : k >= 1 ? 1 : k * k * (3 - 2 * k);
+  return setting + (1 - k) * EXTRA * (1 - setting);
+}
 
 export class DabQueue {
   /** @param {number} [cap] */
@@ -155,8 +219,35 @@ export class StrokeEngine {
     this._gapLeft = 0;
     this._dirX = 1; this._dirY = 0;               // direzione corrente del tratto
     this._moved = 0;                              // distanza campionata totale
+    // dinamica delle punte
+    this._t0 = 0;                                 // tempo pen-down
+    this._held = false;                           // emissioni trattenute (finestra d'inizio aperta)
+    /** @type {number[]} */
+    this._hw = [];                                // input trattenuti: x, y, p, t per punto
+    this._swMinD = 0;                             // filtro distanza (px documento) per la misura
+    this._swDist = 0;                             // finestra d'inizio: distanza filtrata accumulata
+    this._swN = 0;                                // ... e punti accettati
+    this._swX = 0; this._swY = 0; this._swT = 0;  // ultimo punto accettato dal filtro
+    this._la = 1; this._th0 = 1;                  // punta d'inizio congelata alla chiusura della finestra
+    this._tipMin = 2;                             // lunghezza minima punta (px documento)
+    this._trX = new Float64Array(SW_PTS + 2);     // ring degli ultimi punti accettati (velocità di fine)
+    this._trY = new Float64Array(SW_PTS + 2);
+    this._trT = new Float64Array(SW_PTS + 2);
+    this._trN = 0;                                // contatore logico del ring
+    // registro delle emissioni per il pass finale: (x, y, m, mP, burn) —
+    // m = moltiplicatore emesso, mP = sola pressione (per ricampionare con
+    // altri coni), burn = 1 se nel live è seguito un rng() di jitterSpacing
+    this._rec = new Float32Array(1024 * REC_STRIDE);
+    this._recCap = 1024;
+    this._recN = 0;
     this._lemX = 0; this._lemY = 0; this._lemM = -1; // ultima emissione live (per la suddivisione; -1 = nessuna)
+    this._lemP = 1;                               // ... e il suo moltiplicatore di sola pressione
     this._enX = 0; this._enY = 0; this._enValid = false; // ultima emissione discreta (per l'alpha buildup)
+    this._D = 0;                                  // lunghezza della polilinea registrata (px documento)
+    this._laX = 0; this._lbX = 0;                 // lunghezze esatte delle punte dopo i tetti
+    this._th1 = 0;                                // rapporto al vertice di fine
+    this._full = false;                           // il replay rifà il tratto intero (tetti sull'attacco)
+    this.endPassNeeded = false;                   // il chiamante deve fare drop+replay
     this._segStarted = false;                     // via continua: primo nodo emesso
     this._fx = 0; this._fy = 0; this._fr = 0;     // ultimo nodo emesso
     // curva: ring degli ultimi 4 punti stabilizzati. Il segmento q1->q2 viene
@@ -170,11 +261,14 @@ export class StrokeEngine {
   // Fotografa il pennello: lo stroke è deterministico e indipendente
   // da cambi di impostazioni a metà tratto. seed: rng fisso (preview del
   // pennello — scatter/jitter identici a ogni re-render, niente sfarfallio).
+  // t: timeStamp dell'evento (stesso orologio di performance.now()).
+  // speedScale: zoom camera, così la velocità è quella fisica del gesto
+  // (px CSS/ms) e non dipende da quanto si è zoomati.
   /**
-   * @param {number} x @param {number} y @param {number} p
-   * @param {Brush} brush @param {number} [seed]
+   * @param {number} x @param {number} y @param {number} p @param {number} t
+   * @param {Brush} brush @param {number} [seed] @param {number} [speedScale]
    */
-  begin(x, y, p, brush, seed) {
+  begin(x, y, p, t, brush, seed, speedScale = 1) {
     const rngSeed = seed !== undefined ? seed >>> 0 : (strokeSeed = (strokeSeed * 1103515245 + 12345) >>> 0);
     const baseR = Math.max(0.5, brush.size * 0.5);
     const eraser = brush.tool === 'eraser';
@@ -226,6 +320,9 @@ export class StrokeEngine {
       jSat: brush.jitterSat,
       buildup: brush.buildup,
       alphaCompPow,
+      taperStart: clamp(brush.taperStart, 0, 1),
+      taperEnd: clamp(brush.taperEnd, 0, 1),
+      speedScale,
       tex,
       texScale: clamp(brush.textureScale || 1, 0.05, 16),
       texMoving: !!brush.textureMoving,
@@ -255,22 +352,55 @@ export class StrokeEngine {
     this._lx = x; this._ly = y; this._lp = p;
     this._dirX = 1; this._dirY = 0;
     this._moved = 0;
+    this._recN = 0;
     this._lemM = -1;
     this._enValid = false;
+    this.endPassNeeded = false;
+    this._full = false;
     this._segStarted = false;
     this._cqN = 0;
-    this._pushPoint(x, y, p); // primo nodo della curva (nessuna emissione)
-
-    // primo dab/dot, disegnato subito
-    const m = this._pressMult(p);
-    this._emitLive(x, y, m);
-    if (!continuous) this._gapLeft = this._nextGap(Math.max(0.25, baseR * m));
+    // misura della velocità: finestra d'inizio + ring di fine
+    this._t0 = t;
+    this._tipMin = Math.max(2, brush.size * 0.06);
+    this._swMinD = SW_FILTER / speedScale;
+    this._swDist = 0; this._swN = 1;
+    this._swX = x; this._swY = y; this._swT = t;
+    this._trN = 0;
+    this._trPush(x, y, t);
+    this._la = 1; this._th0 = 1;
+    this._hw.length = 0;
+    if (this.snap.taperStart >= 1) {
+      // punta d'inizio spenta: nessuna attesa, si emette subito
+      this._held = false;
+      this._emitFirst(x, y, p);
+    } else {
+      this._held = true;
+      this._hw.push(x, y, p, t);
+    }
   }
 
-  /** @param {number} x @param {number} y @param {number} p */
-  move(x, y, p) {
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  move(x, y, p, t) {
     if (!this.active) return;
-    // Smoother: il punto stabilizzato insegue il punto grezzo
+    // misura della velocità sui punti grezzi, filtrati a SW_FILTER px CSS
+    // (il jitter sub-pixel della mano non deve sporcare i timestamp)
+    const d = Math.hypot(x - this._swX, y - this._swY);
+    if (d >= this._swMinD) {
+      if (this._held) { this._swDist += d; this._swN++; }
+      this._swX = x; this._swY = y; this._swT = t;
+      this._trPush(x, y, t);
+    }
+    if (this._held) {
+      this._hw.push(x, y, p, t);
+      if (t - this._t0 >= SW_MS || this._swN > SW_PTS) this._closeWindow();
+      return;
+    }
+    this._moveBody(x, y, p);
+  }
+
+  // Smoother: il punto stabilizzato insegue il punto grezzo
+  /** @param {number} x @param {number} y @param {number} p */
+  _moveBody(x, y, p) {
     const k = lerp(1, 0.06, Math.sqrt(this.snap.smoothing));
     this._sx += (x - this._sx) * k;
     this._sy += (y - this._sy) * k;
@@ -278,10 +408,49 @@ export class StrokeEngine {
     this._pushPoint(this._sx, this._sy, this._sp);
   }
 
-  // Catch-up: a fine tratto lo stabilizzatore raggiunge il punto grezzo
+  // Chiude la finestra di velocità d'inizio: congela lunghezza e rapporto
+  // della punta, poi emette gli input trattenuti attraverso la pipeline
+  // normale — il profilo disegnato live è già quello esatto, l'attacco non
+  // ha bisogno di un secondo pass (salvo i tetti sui tratti corti).
+  _closeWindow() {
+    const s = this.snap;
+    const dt = this._swT - this._t0;
+    const v = dt > 0 ? this._swDist / dt : 0; // px documento/ms
+    this._la = Math.max(this._tipMin, v * SENS_MS);
+    this._th0 = tipRatio(s.taperStart, v * s.speedScale);
+    this._held = false;
+    const hw = this._hw;
+    this._emitFirst(hw[0], hw[1], hw[2]);
+    for (let i = 4; i < hw.length; i += 4) this._moveBody(hw[i], hw[i + 1], hw[i + 2]);
+    hw.length = 0;
+  }
+
+  // Primo nodo della curva + primo dab/dot (al pen-down se la punta d'inizio
+  // è spenta, altrimenti al flush della finestra).
   /** @param {number} x @param {number} y @param {number} p */
-  end(x, y, p) {
+  _emitFirst(x, y, p) {
+    const s = this.snap;
+    this._pushPoint(x, y, p);
+    const mP = this._pressMult(p);
+    const m = mP * this._th0; // fattore della punta in s=0
+    this._emitLive(x, y, m, mP, !s.continuous);
+    if (!s.continuous) this._gapLeft = this._nextGap(Math.max(0.25, s.baseR * m));
+  }
+
+  // Chiamato dal frame loop: a penna ferma i pointermove non arrivano e la
+  // finestra d'inizio resterebbe aperta — la si chiude a tempo, così il dot
+  // di pen-down appare dopo SW_MS (al pavimento di velocità zero).
+  /** @param {number} now */
+  tick(now) {
+    if (this.active && this._held && now - this._t0 >= SW_MS) this._closeWindow();
+  }
+
+  // Catch-up: a fine tratto lo stabilizzatore raggiunge il punto grezzo;
+  // poi si calcolano le punte esatte per il pass finale.
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  end(x, y, p, t) {
     if (!this.active) return;
+    if (this._held) this._closeWindow();
     if (this.snap.smoothing > 0) {
       const steps = 6;
       for (let i = 1; i <= steps; i++) {
@@ -293,9 +462,225 @@ export class StrokeEngine {
     }
     this._flushCurve();
     this.active = false;
+
+    // serve il pass finale? (il chiamante fa drop dei chunk della punta —
+    // o di tutto il buffer se _full — e poi replay())
+    const s = this.snap;
+    this.endPassNeeded = false;
+    if (this._moved < 1 || this._recN < 2 || this._recN >= REC_MAX) return;
+    this._trPush(x, y, t);
+    const ve = this._endSpeed(t);
+    const r = this._rec;
+    let D = 0;
+    for (let i = REC_STRIDE; i < this._recN * REC_STRIDE; i += REC_STRIDE) {
+      D += Math.hypot(r[i] - r[i - REC_STRIDE], r[i + 1] - r[i - REC_STRIDE + 1]);
+    }
+    this._D = D;
+    let la = Math.min(this._la, TIP_MAX_FRAC * D);
+    let lb = Math.min(Math.max(this._tipMin, ve * SENS_MS), TIP_MAX_FRAC * D);
+    if (la + lb > TIP_SUM_FRAC * D) {
+      const k = TIP_SUM_FRAC * D / (la + lb);
+      la *= k; lb *= k;
+    }
+    this._laX = la; this._lbX = lb;
+    this._th1 = tipRatio(s.taperEnd, ve * s.speedScale);
+    // i tetti hanno accorciato la punta d'inizio già disegnata live? allora
+    // l'attacco è sbagliato e si rifà il tratto intero (succede solo sui
+    // tratti corti: costo piccolo)
+    this._full = s.taperStart < 1 && la < this._la - 0.01;
+    this.endPassNeeded = this._th1 < 1 || this._full;
   }
 
-  cancel() { this.active = false; this._cqN = 0; }
+  cancel() {
+    this.active = false; this._held = false; this._hw.length = 0;
+    this._cqN = 0; this._recN = 0; this.endPassNeeded = false;
+  }
+
+  // ---- misura della velocità agli estremi ----
+
+  /** @param {number} x @param {number} y @param {number} t */
+  _trPush(x, y, t) {
+    const i = this._trN % this._trX.length;
+    this._trX[i] = x; this._trY[i] = y; this._trT[i] = t;
+    this._trN++;
+  }
+
+  // Velocità di fine: media sugli ultimi punti del ring entro SW_MS/SW_PTS.
+  // Il primo punto FUORI dalla finestra (appena oltre) entra come confine.
+  /** @param {number} tEnd @returns {number} px documento/ms */
+  _endSpeed(tEnd) {
+    const cap = this._trX.length, total = this._trN;
+    const n = Math.min(total, cap);
+    if (n < 2) return 0;
+    /** @type {(k: number) => number} */
+    const at = (k) => ((k % cap) + cap) % cap;
+    const last = total - 1;
+    let i = last - 1;
+    while (i > total - n && tEnd - this._trT[at(i)] < SW_MS && last - i < SW_PTS) i--;
+    let dist = 0;
+    for (let k = i; k < last; k++) {
+      dist += Math.hypot(this._trX[at(k + 1)] - this._trX[at(k)],
+        this._trY[at(k + 1)] - this._trY[at(k)]);
+    }
+    const dt = this._trT[at(last)] - this._trT[at(i)];
+    return dt > 0 ? dist / dt : 0;
+  }
+
+  // ---- pass finale ----
+
+  // Secondo pass al pen-up (il chiamante ha appena svuotato i chunk della
+  // punta, o tutto il buffer se _full): ri-emette il registro applicando i
+  // coni esatti. Stesso seed del pass live: jitter e scatter identici dove
+  // le punte non toccano. In via discreta la punta viene RICAMPIONATA: i dab
+  // registrati hanno lo spacing del raggio pieno, e riusarli rimpicciolendo
+  // il solo raggio li separa in una collana di cerchi — si cammina invece
+  // lungo la polilinea con passo proporzionale al diametro già rastremato.
+  replay() {
+    const s = this.snap, r = this._rec, n = this._recN;
+    this.endPassNeeded = false;
+    s.rng = mulberry32(s.seed);
+    this._segStarted = false;
+    this._enValid = false; // l'alpha buildup riparte come al pen-down
+    const burnGap = s.jSpacing > 0 && !s.continuous;
+    const D = this._D, la = this._laX, lb = this._lbX;
+    const th0 = this._th0, th1 = this._th1;
+
+    if (s.continuous) {
+      // catena di capsule: i nodi restano densi a qualunque raggio, bastano
+      // i fattori per nodo (fuori dal clip il rasterizer scarta a costo ~0)
+      let cum = 0;
+      for (let i = 0; i < n; i++) {
+        const o = i * REC_STRIDE;
+        if (i > 0) cum += Math.hypot(r[o] - r[o - REC_STRIDE], r[o + 1] - r[o - REC_STRIDE + 1]);
+        const m = this._full
+          ? r[o + 3] * tipFactor(cum, la, th0) * tipFactor(D - cum, lb, th1)
+          : r[o + 2] * tipFactor(D - cum, lb, th1);
+        this._emitNow(r[o], r[o + 1], m);
+      }
+      return;
+    }
+
+    if (this._full) {
+      // tratto intero ricampionato coi due coni (il registro viene
+      // ridisegnato per intero: lo stream del seed può divergere)
+      this._resample(1, 0, true);
+      return;
+    }
+
+    // corpo: dab registrati fino al confine della punta, identici al live
+    // (i burn tengono allineato lo stream del seed; la coda ricampionata
+    // può divergere senza conseguenze)
+    const bodyEnd = D - lb;
+    let cum = 0;
+    this._emitNow(r[0], r[1], r[2]);
+    if (burnGap && r[4]) s.rng();
+    let i = 1;
+    for (; i < n; i++) {
+      const o = i * REC_STRIDE;
+      const seg = Math.hypot(r[o] - r[o - REC_STRIDE], r[o + 1] - r[o - REC_STRIDE + 1]);
+      if (cum + seg > bodyEnd) break;
+      cum += seg;
+      this._emitNow(r[o], r[o + 1], r[o + 2]);
+      if (burnGap && r[o + 4]) s.rng();
+    }
+    if (i >= n) return;
+    this._resample(i, cum, false);
+  }
+
+  // Ricampiona il registro dal nodo i0 in poi applicando i coni esatti:
+  // m base interpolato dai soli moltiplicatori di pressione (mP), passo
+  // adattivo ∝ diametro corrente, stessa suddivisione a salto di raggio del
+  // live. cum: distanza all'inizio del nodo i0-1. emitFirst: emette anche il
+  // nodo i0-1 (replay dell'intero tratto; nel pass della sola punta è già
+  // stato emesso dal corpo).
+  /** @param {number} i0 @param {number} cum @param {boolean} emitFirst */
+  _resample(i0, cum, emitFirst) {
+    const s = this.snap, r = this._rec, n = this._recN;
+    const D = this._D, la = this._laX, lb = this._lbX;
+    const th0 = this._th0, th1 = this._th1;
+    /** @type {(d: number) => number} */
+    const cone = (d) => tipFactor(d, la, th0) * tipFactor(D - d, lb, th1);
+    const o0 = (i0 - 1) * REC_STRIDE;
+    let wx = r[o0], wy = r[o0 + 1], wm = r[o0 + 3];
+    let ex = wx, ey = wy, em = wm * cone(cum); // ultima emissione
+    /** @type {(x: number, y: number, m: number) => void} */
+    const emit = (x, y, m) => {
+      const dr = Math.abs(s.baseR * (m - em));
+      if (dr > MAX_R_STEP_PX) {
+        const dist = Math.hypot(x - ex, y - ey);
+        const rSum = Math.max(0.25, s.baseR * em) + Math.max(0.25, s.baseR * m);
+        if (dist < rSum * SUBDIV_OVERLAP) {
+          const k = Math.min(64, Math.ceil(dr / MAX_R_STEP_PX));
+          for (let j = 1; j < k; j++) {
+            const f = j / k;
+            this._emitNow(ex + (x - ex) * f, ey + (y - ey) * f, em + (m - em) * f);
+          }
+        }
+      }
+      this._emitNow(x, y, m);
+      ex = x; ey = y; em = m;
+    };
+    if (emitFirst) this._emitNow(ex, ey, em);
+    let gapLeft = Math.max(REPLAY_MIN_GAP_PX,
+      s.spacing * 2 * Math.max(0.25, s.baseR * em));
+    for (let i = i0; i < n; i++) {
+      const o = i * REC_STRIDE;
+      const nx = r[o], ny = r[o + 1], nm = r[o + 3];
+      const seg = Math.hypot(nx - wx, ny - wy);
+      let travelled = 0;
+      while (gapLeft <= seg - travelled) {
+        travelled += gapLeft;
+        const f = travelled / seg;
+        const mt = (wm + (nm - wm) * f) * cone(cum + travelled);
+        emit(wx + (nx - wx) * f, wy + (ny - wy) * f, mt);
+        gapLeft = Math.max(REPLAY_MIN_GAP_PX,
+          s.spacing * 2 * Math.max(0.25, s.baseR * mt));
+      }
+      gapLeft -= seg - travelled;
+      cum += seg;
+      wx = nx; wy = ny; wm = nm;
+    }
+    // l'ultimo punto registrato è il vertice vero: emesso sempre, il tratto
+    // finisce esattamente dove la penna si è alzata
+    emit(wx, wy, wm * cone(D));
+  }
+
+  // Bbox conservativo (px documento) dei pixel che il pass finale può
+  // cambiare: i dab della punta finale col loro VECCHIO ingombro — il nuovo
+  // è un sottoinsieme, il cono riduce soltanto. Il chiamante svuota i soli
+  // chunk intersecati e clippa il replay lì: il corpo del tratto non si
+  // ridisegna mai. null = si rifà il tratto intero (drop di tutto il buffer).
+  /** @returns {{x0: number, y0: number, x1: number, y1: number}|null} */
+  endPassRect() {
+    const s = this.snap, r = this._rec, n = this._recN;
+    if (!s || n === 0 || this._full) return null;
+    // ingombro massimo di un'emissione oltre il centro: nuvola scatter
+    // (offset + raggio particella), jitter di posizione, bordo morbido dello
+    // stamp e arrotondamenti
+    const spreadK = 1 + 2 * s.jPos + (s.scatter ? s.partSize : 0);
+    const pad = s.jPos * s.diam + 3;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    /** @type {(x: number, y: number, m: number) => void} */
+    const add = (x, y, m) => {
+      const e = Math.max(0.25, s.baseR * m) * spreadK + pad;
+      if (x - e < x0) x0 = x - e;
+      if (y - e < y0) y0 = y - e;
+      if (x + e > x1) x1 = x + e;
+      if (y + e > y1) y1 = y + e;
+    };
+    // punta: dall'ultima emissione a ritroso finché la distanza lungo la
+    // polilinea supera la punta; si include il primo nodo OLTRE il confine
+    // (in via continua cambia anche la capsula a cavallo del confine)
+    add(r[(n - 1) * REC_STRIDE], r[(n - 1) * REC_STRIDE + 1], r[(n - 1) * REC_STRIDE + 2]);
+    let cum = 0;
+    for (let i = n - 2; i >= 0; i--) {
+      const o = i * REC_STRIDE;
+      cum += Math.hypot(r[o + REC_STRIDE] - r[o], r[o + REC_STRIDE + 1] - r[o + 1]);
+      add(r[o], r[o + 1], r[o + 2]);
+      if (cum >= this._lbX) break;
+    }
+    return { x0: Math.floor(x0), y0: Math.floor(y0), x1: Math.ceil(x1), y1: Math.ceil(y1) };
+  }
 
   // ---- interni ----
 
@@ -374,7 +759,8 @@ export class StrokeEngine {
 
     if (this.snap.continuous) {
       if (dist >= 0.25) {
-        this._emitLive(x, y, this._pressMult(p));
+        const mP = this._pressMult(p);
+        this._emitLive(x, y, mP * this._fStart(this._moved), mP, false);
         this._lx = x; this._ly = y; this._lp = p;
       }
       return;
@@ -387,31 +773,43 @@ export class StrokeEngine {
       travelled += this._gapLeft;
       const f = travelled / dist;
       const px = this._lx + dx * f, py = this._ly + dy * f;
-      const m = this._pressMult(lerp(pa, p, f));
-      this._emitLive(px, py, m);
+      const mP = this._pressMult(lerp(pa, p, f));
+      const m = mP * this._fStart(this._moved - dist + travelled);
+      this._emitLive(px, py, m, mP, true);
       this._gapLeft = this._nextGap(Math.max(0.25, this.snap.baseR * m));
     }
     this._gapLeft -= dist - travelled;
     this._lx = x; this._ly = y; this._lp = p;
   }
 
-  // Moltiplicatore di spessore: pressione (reale solo dalla penna: mouse e
-  // tocco arrivano a 1 da input.js — con la penna le punte nascono dalla
-  // rampa di pressione al pen-down/lift-off).
+  // Fattore della punta d'inizio alla distanza campionata s dal pen-down
+  // (lunghezza e rapporto congelati alla chiusura della finestra di
+  // velocità). La punta di fine vive nel pass di replay().
+  /** @param {number} s */
+  _fStart(s) {
+    return tipFactor(s, this._la, this._th0);
+  }
+
+  // Moltiplicatore di pressione (reale solo dalla penna: mouse e tocco
+  // arrivano a 1 da input.js — con la penna le estremità si assottigliano
+  // anche per la rampa di pressione al pen-down/lift-off).
   /** @param {number} p */
   _pressMult(p) {
     return p < 1 ? Math.pow(Math.max(0.02, p), 1.5) : 1;
   }
 
-  // ---- emissione ----
+  // ---- registro + emissione ----
 
-  // Emette subito. Dove la pressione cambia il raggio di più di
-  // MAX_R_STEP_PX rispetto all'emissione precedente, si inseriscono dab
-  // intermedi interpolati — il bordo non fa gradini. La via continua non ne
-  // ha bisogno (le capsule interpolano il raggio), il dot fermo nemmeno
-  // (ristampa sul posto).
-  /** @param {number} x @param {number} y @param {number} m */
-  _emitLive(x, y, m) {
+  // Registra (per il pass finale) ed emette subito: il tratto live arriva
+  // pieno fino alla punta finale, zero ritardo. burn: nel live questo dab è
+  // seguito da un rng() di jitterSpacing (replay() deve bruciarlo per
+  // restare allineato allo stream del seed). Dove la dinamica cambia il
+  // raggio di più di MAX_R_STEP_PX rispetto all'emissione precedente, si
+  // inseriscono dab intermedi interpolati (registrati anche loro: il replay
+  // del corpo resta identico al live) — il bordo non fa gradini. La via
+  // continua non ne ha bisogno (le capsule interpolano il raggio).
+  /** @param {number} x @param {number} y @param {number} m @param {number} mP @param {boolean} burn */
+  _emitLive(x, y, m, mP, burn) {
     if (!this.snap.continuous && this._moved >= 1 && this._lemM >= 0) {
       const s = this.snap;
       const dr = Math.abs(s.baseR * (m - this._lemM));
@@ -422,13 +820,28 @@ export class StrokeEngine {
           const n = Math.min(64, Math.ceil(dr / MAX_R_STEP_PX));
           for (let k = 1; k < n; k++) {
             const f = k / n;
-            this._emitNow(lerp(this._lemX, x, f), lerp(this._lemY, y, f),
-              lerp(this._lemM, m, f));
+            this._emitRec(lerp(this._lemX, x, f), lerp(this._lemY, y, f),
+              lerp(this._lemM, m, f), lerp(this._lemP, mP, f), false);
           }
         }
       }
     }
-    this._lemX = x; this._lemY = y; this._lemM = m;
+    this._emitRec(x, y, m, mP, burn);
+  }
+
+  /** @param {number} x @param {number} y @param {number} m @param {number} mP @param {boolean} burn */
+  _emitRec(x, y, m, mP, burn) {
+    if (this._recN < REC_MAX) {
+      if (this._recN === this._recCap) {
+        const nb = new Float32Array(this._recCap * 2 * REC_STRIDE);
+        nb.set(this._rec);
+        this._rec = nb; this._recCap *= 2;
+      }
+      const o = this._recN * REC_STRIDE, r = this._rec;
+      r[o] = x; r[o + 1] = y; r[o + 2] = m; r[o + 3] = mP; r[o + 4] = burn ? 1 : 0;
+      this._recN++;
+    }
+    this._lemX = x; this._lemY = y; this._lemM = m; this._lemP = mP;
     this._emitNow(x, y, m);
   }
 
@@ -448,11 +861,15 @@ export class StrokeEngine {
       this._fx = x; this._fy = y; this._fr = r;
       this.dabsEmitted++;
     } else {
-      // Buildup: i dab più fitti del passo di spacing (suddivisione)
-      // accumulerebbero alpha in eccesso — esponente ∝ al passo effettivo,
-      // come per alphaCompPow. Ricavato dalle POSIZIONI (dist≈0 = ristampa
-      // del dot, alpha piena). Con jitterSpacing il passo è volutamente
-      // casuale: lì non si compensa, come prima.
+      // punta vera: sotto MIN_R_PX di raggio il dab non si stampa (il clamp
+      // a 0.25 px lo renderebbe un puntino visibile dove il cono è a zero)
+      if (s.baseR * m < MIN_R_PX) return;
+      // Buildup: i dab più fitti del passo di spacing (suddivisione, coda
+      // ricampionata) accumulerebbero alpha in eccesso — esponente ∝ al
+      // passo effettivo, come per alphaCompPow. Ricavato dalle POSIZIONI:
+      // live e replay lo ricalcolano identico dagli stessi punti (dist≈0 =
+      // ristampa del dot, alpha piena). Con jitterSpacing il passo è
+      // volutamente casuale: lì non si compensa, come prima.
       let aPow = 1;
       if (s.buildup && s.jSpacing === 0 && this._enValid) {
         const d = Math.hypot(x - this._enX, y - this._enY);
@@ -480,8 +897,8 @@ export class StrokeEngine {
   // Emette uno stamp; con scatter ON lo stamp diventa una nuvola di partN
   // particelle (raggio = partSize del dab, offset su disco con distribuzione
   // modellata da partDev, raggio nuvola esteso da jPos — semantica mvp4).
-  // Ogni particella tira i propri jitter. m: moltiplicatore di pressione
-  // già calcolato al momento del campionamento.
+  // Ogni particella tira i propri jitter. m: moltiplicatore di dinamica
+  // (punte + pressione) già calcolato al momento del campionamento.
   // aPow: esponente di compensazione buildup (passo effettivo / nominale).
   /** @param {number} x @param {number} y @param {number} m @param {number} aPow */
   _emitDab(x, y, m, aPow) {

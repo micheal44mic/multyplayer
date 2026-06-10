@@ -82,15 +82,17 @@ pub unsafe extern "C" fn dab(
                         let o_hi = u16x8_add(src_hi, div255_v(i16x8_mul(d_hi, u16x8_sub(v255, ma_hi))));
                         v128_store(dp as *mut v128, u8x16_narrow_i16x8(o_lo, o_hi));
                     } else {
-                        // wash: ma <= a255 sempre, quindi se il documento è già
-                        // a >= a255 su tutti e 4 i pixel nessuno può cambiare
+                        // wash, a parità vince l'ULTIMO dab (>=): ma <= a255
+                        // sempre, quindi se il documento è già OLTRE a255 su
+                        // tutti e 4 i pixel nessuno può scrivere. (ma == da == 0
+                        // riscrive zeri su zeri: stessi byte del salto JS.)
                         let da8 = splat_alpha(d);
-                        if !u8x16_all_true(u8x16_ge(da8, a255_v)) {
+                        if !u8x16_all_true(u8x16_gt(da8, a255_v)) {
                             let src_lo = div255_v(i16x8_mul(c16, ma_lo));
                             let src_hi = div255_v(i16x8_mul(c16, ma_hi));
                             let ma8 = u8x16_narrow_i16x8(ma_lo, ma_hi);
                             let src8 = u8x16_narrow_i16x8(src_lo, src_hi); // [R,G,B,ma]
-                            let cond = u8x16_gt(ma8, da8);
+                            let cond = u8x16_ge(ma8, da8);
                             v128_store(dp as *mut v128, v128_bitselect(src8, d, cond));
                         }
                     }
@@ -115,7 +117,7 @@ pub unsafe extern "C" fn dab(
                         *p.add(1) = (div255(cg * ma) + div255(*p.add(1) as u32 * inv)) as u8;
                         *p.add(2) = (div255(cb * ma) + div255(*p.add(2) as u32 * inv)) as u8;
                         *p.add(3) = (ma + div255(*p.add(3) as u32 * inv)) as u8;
-                    } else if ma > *p.add(3) as u32 {
+                    } else if ma >= *p.add(3) as u32 {
                         *p = div255(cr * ma) as u8;
                         *p.add(1) = div255(cg * ma) as u8;
                         *p.add(2) = div255(cb * ma) as u8;
@@ -202,13 +204,14 @@ pub unsafe extern "C" fn dab_tex_tile(
                         let o_hi = u16x8_add(src_hi, div255_v(i16x8_mul(d_hi, u16x8_sub(v255, ma_hi))));
                         v128_store(dp as *mut v128, u8x16_narrow_i16x8(o_lo, o_hi));
                     } else {
+                        // wash, a parità vince l'ULTIMO dab (vedi `dab`)
                         let da8 = splat_alpha(d);
-                        if !u8x16_all_true(u8x16_ge(da8, a255_v)) {
+                        if !u8x16_all_true(u8x16_gt(da8, a255_v)) {
                             let src_lo = div255_v(i16x8_mul(cl, ma_lo));
                             let src_hi = div255_v(i16x8_mul(ch, ma_hi));
                             let ma8 = u8x16_narrow_i16x8(ma_lo, ma_hi);
                             let src8 = u8x16_narrow_i16x8(src_lo, src_hi); // [R,G,B,ma]
-                            let cond = u8x16_gt(ma8, da8);
+                            let cond = u8x16_ge(ma8, da8);
                             v128_store(dp as *mut v128, v128_bitselect(src8, d, cond));
                         }
                     }
@@ -247,7 +250,7 @@ pub unsafe extern "C" fn dab_tex_tile(
                             *p.add(1) = (div255(g * ma) + div255(*p.add(1) as u32 * inv)) as u8;
                             *p.add(2) = (div255(b * ma) + div255(*p.add(2) as u32 * inv)) as u8;
                             *p.add(3) = (ma + div255(*p.add(3) as u32 * inv)) as u8;
-                        } else if ma > *p.add(3) as u32 {
+                        } else if ma >= *p.add(3) as u32 {
                             *p = div255(r * ma) as u8;
                             *p.add(1) = div255(g * ma) as u8;
                             *p.add(2) = div255(b * ma) as u8;
@@ -301,6 +304,9 @@ struct Caps {
 // Un pixel della capsula: identico, operazione per operazione, al loop JS.
 // Il pre-check su ma_max è esatto: ma <= ma_max sempre, quindi un pixel del
 // documento già a quell'alpha non può superare il test `ma > alpha`.
+// Qui il tie resta `>` (primo vince), a differenza dei dab: in via continua
+// colore e alpha per pixel sono identici tra nodi, a parità i byte non
+// cambierebbero — si salta e si tengono i bound esatti per riga.
 #[inline(always)]
 unsafe fn capsule_px(c: &Caps, p: *mut u8, px: f64, py: f64, py_dy: f64) -> bool {
     if *p.add(3) as u32 >= c.ma_max {

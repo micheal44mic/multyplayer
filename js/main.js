@@ -16,6 +16,7 @@ import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
 import { LayerManager, makeRasterLayer } from './layers.js';
+import { freeBlockBitmap } from './text_layer.js';
 import { Planes } from './planes.js';
 import { WasmHeap } from './wasm_core.js';
 
@@ -77,9 +78,13 @@ export class App {
       // un'entry esce per sempre dagli stack: se possiede un livello
       // eliminato, qui muore davvero (texture + slot wasm + pool)
       (e) => {
-        if (e.op === 'detach' && e.layer && e.layer.store) {
-          e.layer.store.destroy((c) => this.renderer.disposeChunkTex(c));
-          this._allStores.delete(e.layer.store);
+        if (e.op === 'detach' && e.layer) {
+          if (e.layer.store) {
+            e.layer.store.destroy((c) => this.renderer.disposeChunkTex(c));
+            this._allStores.delete(e.layer.store);
+          } else {
+            freeBlockBitmap(e.layer); // testo: blob dell'estrusione 3D
+          }
         }
       });
 
@@ -371,6 +376,8 @@ export class App {
       if (l.store) {
         l.store.destroy((c) => this.renderer.disposeChunkTex(c));
         this._allStores.delete(l.store);
+      } else {
+        freeBlockBitmap(l);
       }
     }
     this.layerMgr.layers.length = 0;

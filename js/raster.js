@@ -457,7 +457,7 @@ export class Rasterizer {
               d[di + 1] = div255(rgb[ci + 1] * ma) + div255(d[di + 1] * inv);
               d[di + 2] = div255(rgb[ci + 2] * ma) + div255(d[di + 2] * inv);
               d[di + 3] = ma + div255(d[di + 3] * inv);
-            } else if (ma > d[di + 3]) {
+            } else if (ma >= d[di + 3]) {
               d[di] = div255(rgb[ci] * ma);
               d[di + 1] = div255(rgb[ci + 1] * ma);
               d[di + 2] = div255(rgb[ci + 2] * ma);
@@ -551,8 +551,10 @@ export class Rasterizer {
                 d[di + 1] = lutG[ma] + div255(d[di + 1] * inv);
                 d[di + 2] = lutB[ma] + div255(d[di + 2] * inv);
                 d[di + 3] = ma + div255(d[di + 3] * inv);
-              } else if (ma > d[di + 3]) {
-                // wash: max(alpha) — i dab non si scuriscono tra loro
+              } else if (ma >= d[di + 3]) {
+                // wash: max(alpha) — i dab non si scuriscono tra loro. A
+                // parità vince l'ULTIMO dab (>=): con jitter di colore gli
+                // stamp nuovi coprono i vecchi, non il contrario.
                 d[di] = lutR[ma];
                 d[di + 1] = lutG[ma];
                 d[di + 2] = lutB[ma];
@@ -572,7 +574,7 @@ export class Rasterizer {
                 d[di + 1] = div255(cg * ma) + div255(d[di + 1] * inv);
                 d[di + 2] = div255(cb * ma) + div255(d[di + 2] * inv);
                 d[di + 3] = ma + div255(d[di + 3] * inv);
-              } else if (ma > d[di + 3]) {
+              } else if (ma >= d[di + 3]) {
                 d[di] = div255(cr * ma);
                 d[di + 1] = div255(cg * ma);
                 d[di + 2] = div255(cb * ma);
@@ -656,7 +658,7 @@ export class Rasterizer {
                 d[di + 1] = div255(rgbx[ci + 1] * ma) + div255(d[di + 1] * inv);
                 d[di + 2] = div255(rgbx[ci + 2] * ma) + div255(d[di + 2] * inv);
                 d[di + 3] = ma + div255(d[di + 3] * inv);
-              } else if (ma > d[di + 3]) {
+              } else if (ma >= d[di + 3]) {
                 d[di] = div255(rgbx[ci] * ma);
                 d[di + 1] = div255(rgbx[ci + 1] * ma);
                 d[di + 2] = div255(rgbx[ci + 2] * ma);
@@ -668,7 +670,7 @@ export class Rasterizer {
               d[di + 1] = (useLut ? lutG[ma] : div255(cg * ma)) + div255(d[di + 1] * inv);
               d[di + 2] = (useLut ? lutB[ma] : div255(cb * ma)) + div255(d[di + 2] * inv);
               d[di + 3] = ma + div255(d[di + 3] * inv);
-            } else if (ma > d[di + 3]) {
+            } else if (ma >= d[di + 3]) {
               d[di] = useLut ? lutR[ma] : div255(cr * ma);
               d[di + 1] = useLut ? lutG[ma] : div255(cg * ma);
               d[di + 2] = useLut ? lutB[ma] : div255(cb * ma);
@@ -755,6 +757,9 @@ export class Rasterizer {
             const a = falloff(Math.sqrt(dist2), rT, h) * (a0 + da * t);
             if (a <= 0) continue;
             const ma = (a * 255 + 0.5) | 0;
+            // qui il tie resta `>` (primo vince): in via continua colore e
+            // alpha per pixel sono identici tra nodi, a parità i byte non
+            // cambierebbero — si salta e si tengono i bound esatti per riga
             if (ma > d[di + 3]) {
               d[di] = lutR[ma];
               d[di + 1] = lutG[ma];

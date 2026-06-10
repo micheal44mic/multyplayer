@@ -79,7 +79,7 @@ function refDab(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0, a255, cr, cg, 
         d[di + 1] = div255(cg * ma) + div255(d[di + 1] * inv);
         d[di + 2] = div255(cb * ma) + div255(d[di + 2] * inv);
         d[di + 3] = ma + div255(d[di + 3] * inv);
-      } else if (ma > d[di + 3]) {
+      } else if (ma >= d[di + 3]) { // wash: a parità vince l'ultimo dab
         d[di] = div255(cr * ma);
         d[di + 1] = div255(cg * ma);
         d[di + 2] = div255(cb * ma);
@@ -227,7 +227,7 @@ function refDabTexTile(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0,
         d[di + 1] = div255(g * ma) + div255(d[di + 1] * inv);
         d[di + 2] = div255(b * ma) + div255(d[di + 2] * inv);
         d[di + 3] = ma + div255(d[di + 3] * inv);
-      } else if (ma > d[di + 3]) {
+      } else if (ma >= d[di + 3]) { // wash: a parità vince l'ultimo dab
         d[di] = div255(r * ma);
         d[di + 1] = div255(g * ma);
         d[di + 2] = div255(b * ma);

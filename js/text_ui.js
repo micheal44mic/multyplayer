@@ -28,18 +28,26 @@ export class TextUI {
   }
 
   // Bottone Testo: nuovo livello testo centrato nella vista corrente,
-  // largo ~80% dello schermo a qualunque zoom (M1M4.COM ≈ 5.7 em).
+  // proporzionale allo schermo (M1M4.COM ≈ 5.7 em) ma mai oltre 70px
+  // APPARENTI: il corpo è in px mondo, il tetto si applica in px schermo
+  // così a qualunque zoom il testo nasce leggibile e mai gigante.
   placeAtView() {
     const app = this.app;
     if (!app.layerMgr.canAdd) { alert('Massimo numero di livelli raggiunto.'); return; }
     const cam = app.camera;
     const fill = /** @type {HTMLInputElement} */ (document.getElementById('color')).value;
-    const size = Math.max(8, (cam.w / cam.zoom) * 0.8 / 5.7);
+    const size = Math.max(8, Math.min(70, cam.w * 0.8 / 5.7)) / cam.zoom;
     const item = makeTextItem(cam.x, cam.y, fill, size);
     const layer = makeTextLayer('Testo', item, defaultTextStyle());
     app.addLayer(layer);
     ensureFont(layer.style.font, layer.style.weight);
     this.open(true);
+    // si può riscrivere subito: focus dopo il sync di open (che rimette
+    // il testo del livello nel campo) e fuori dall'evento che ci ha chiamato
+    requestAnimationFrame(() => {
+      this._textInput.focus();
+      this._textInput.select();
+    });
   }
 
   /** @param {boolean} v */
@@ -79,6 +87,40 @@ export class TextUI {
       const l = this.layer;
       return l ? fn(l.style) : fallback;
     };
+    /** @type {(fn: (it: import('./text_layer.js').TextItem) => void) => void} */
+    const withItem = (fn) => {
+      const l = this.layer;
+      if (!l) return;
+      fn(l.item);
+      this._dirty();
+    };
+    /** @type {<T>(fn: (it: import('./text_layer.js').TextItem) => T, fallback: T) => T} */
+    const readItem = (fn, fallback) => {
+      const l = this.layer;
+      return l ? fn(l.item) : fallback;
+    };
+
+    body.appendChild(this._section('Testo'));
+    const txt = document.createElement('input');
+    txt.type = 'text';
+    txt.className = 'tp-text';
+    txt.placeholder = 'Scrivi qualcosa…';
+    txt.autocomplete = 'off';
+    txt.spellcheck = false;
+    // ogni tasto = un setAttribute al frame dopo (via styleDirty): l'SVG è
+    // vettoriale, il browser ridipinge solo quel piano — nessun raster
+    txt.addEventListener('input', () => withItem((it) => { it.text = txt.value; }));
+    txt.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === 'Escape') txt.blur();
+    });
+    this._sync.push(() => { txt.value = readItem((it) => it.text, ''); });
+    body.appendChild(txt);
+    this._textInput = txt;
+
+    body.appendChild(this._slider('Dimensione', 4, 2000, 1,
+      () => readItem((it) => it.size, 70),
+      (v) => withItem((it) => { it.size = v; }),
+      (v) => Math.round(v) + ' px', true));
 
     body.appendChild(this._section('Font'));
     const sel = document.createElement('select');
@@ -109,6 +151,14 @@ export class TextUI {
       (v) => withStyle((st) => { st.strokeColor = v; })));
 
     body.appendChild(this._section('Ombra'));
+    body.appendChild(this._toggle('Blocco 3D',
+      'estrusione solida invece dell\'ombra morbida',
+      () => readStyle((st) => st.block, false),
+      (v) => withStyle((st) => {
+        st.block = v;
+        // acceso con distanza 0 non si vedrebbe: parte da un blocco visibile
+        if (v && st.shadowDist === 0) st.shadowDist = 12;
+      })));
     body.appendChild(this._slider('Sfocatura', 0, 80, 1,
       () => readStyle((st) => st.shadowBlur, 0),
       (v) => withStyle((st) => { st.shadowBlur = v; }),
@@ -117,6 +167,14 @@ export class TextUI {
       () => readStyle((st) => st.shadowDist, 0),
       (v) => withStyle((st) => { st.shadowDist = v; }),
       (v) => v + ' px'));
+    body.appendChild(this._slider('Angolo', 0, 360, 1,
+      () => readStyle((st) => st.shadowAngle ?? 45, 45),
+      (v) => withStyle((st) => { st.shadowAngle = v; }),
+      (v) => Math.round(v) + '°'));
+    body.appendChild(this._slider('Opacità', 5, 100, 1,
+      () => readStyle((st) => (st.shadowOpacity ?? 0.65) * 100, 65),
+      (v) => withStyle((st) => { st.shadowOpacity = v / 100; }),
+      (v) => Math.round(v) + '%'));
     body.appendChild(this._color('Colore ombra',
       () => readStyle((st) => st.shadowColor, '#000000'),
       (v) => withStyle((st) => { st.shadowColor = v; })));
@@ -131,10 +189,13 @@ export class TextUI {
   }
 
   /**
+   * log: lo slider lavora in scala logaritmica (range enormi tipo il corpo
+   * del font), il valore del modello resta in unità vere.
    * @param {string} label @param {number} min @param {number} max @param {number} step
    * @param {() => number} get @param {(v: number) => void} set @param {(v: number) => string} fmt
+   * @param {boolean} [log]
    */
-  _slider(label, min, max, step, get, set, fmt) {
+  _slider(label, min, max, step, get, set, fmt, log) {
     const row = document.createElement('div');
     row.className = 'p-row';
     const head = document.createElement('div');
@@ -146,19 +207,56 @@ export class TextUI {
     head.append(name, val);
     const input = document.createElement('input');
     input.type = 'range';
-    input.min = String(min); input.max = String(max); input.step = String(step);
+    if (log) {
+      input.min = String(Math.log(min));
+      input.max = String(Math.log(max));
+      input.step = String((Math.log(max) - Math.log(min)) / 500);
+    } else {
+      input.min = String(min); input.max = String(max); input.step = String(step);
+    }
     const refresh = () => {
-      input.value = String(get());
-      val.textContent = fmt(get());
+      const v = get();
+      input.value = String(log ? Math.log(Math.max(min, Math.min(max, v))) : v);
+      val.textContent = fmt(v);
     };
     input.addEventListener('input', () => {
-      set(parseFloat(input.value));
+      let v = log ? Math.exp(parseFloat(input.value)) : parseFloat(input.value);
+      if (step >= 1) v = Math.round(v);
+      set(v);
       val.textContent = fmt(get());
     });
     this._sync.push(refresh);
     refresh();
     row.append(head, input);
     return row;
+  }
+
+  /**
+   * @param {string} label @param {string} hint
+   * @param {() => boolean} get @param {(v: boolean) => void} set
+   */
+  _toggle(label, hint, get, set) {
+    const lab = document.createElement('label');
+    lab.className = 'p-toggle';
+    const span = document.createElement('span');
+    span.textContent = label;
+    const h = document.createElement('span');
+    h.className = 'p-hint';
+    h.textContent = hint;
+    span.appendChild(h);
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = get();
+    input.addEventListener('change', () => {
+      set(input.checked);
+      // il set può toccare altri valori (es. la distanza): riallinea il pannello
+      for (const f of this._sync) f();
+    });
+    this._sync.push(() => { input.checked = get(); });
+    const knob = document.createElement('span');
+    knob.className = 'knob';
+    lab.append(span, input, knob);
+    return lab;
   }
 
   /**
