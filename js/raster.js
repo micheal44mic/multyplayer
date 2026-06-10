@@ -9,19 +9,29 @@ import { falloff } from './brush.js';
 import { CHUNK, CHUNK_SHIFT, forEachChunkInRect } from './store.js';
 import { T_DAB } from './stroke.js';
 
+/** @typedef {import('./store.js').Chunk} Chunk */
+/** @typedef {import('./store.js').ChunkStore} ChunkStore */
+/** @typedef {import('./stroke.js').Snap} Snap */
+/** @typedef {import('./stroke.js').DabQueue} DabQueue */
+/** @typedef {import('./brush.js').StampCache} StampCache */
+
 export class Rasterizer {
+  /** @param {ChunkStore} strokeStore @param {StampCache} stampCache */
   constructor(strokeStore, stampCache) {
     this.store = strokeStore;
     this.cache = stampCache;
+    /** @type {Snap|null} */
     this.snap = null;
     // stats per HUD
     this.lastPx = 0;
     this.lastDabs = 0;
   }
 
+  /** @param {Snap|null} snap */
   beginStroke(snap) { this.snap = snap; }
 
   // Drena la coda fino a esaurimento o budget (px toccati). Ritorna px usati.
+  /** @param {DabQueue} queue @param {number} budgetPx */
   run(queue, budgetPx) {
     const snap = this.snap;
     this.lastPx = 0;
@@ -64,6 +74,10 @@ export class Rasterizer {
   }
 
   // ---- via discreta: stamp dalla cache ----
+  /**
+   * @param {number} x @param {number} y @param {number} r @param {number} alpha
+   * @param {number} angle @param {number} cr @param {number} cg @param {number} cb
+   */
   _dab(x, y, r, alpha, angle, cr, cg, cb) {
     const snap = this.snap;
     const stamp = this.cache.getStamp(r, snap.hardness, snap.roundness, angle);
@@ -110,6 +124,10 @@ export class Rasterizer {
   }
 
   // ---- via continua: capsula con raggio e alpha interpolati ----
+  /**
+   * @param {number} x0 @param {number} y0 @param {number} r0 @param {number} a0
+   * @param {number} x1 @param {number} y1 @param {number} r1 @param {number} a1
+   */
   _capsule(x0, y0, r0, a0, x1, y1, r1, a1) {
     const snap = this.snap;
     const h = snap.hardness;
@@ -164,6 +182,12 @@ export class Rasterizer {
 
 // Composita UN chunk dello stroke buffer sul layer documento.
 // undoCapture(key, cx, cy, beforeDataOrNull) viene chiamato PRIMA di modificare.
+/**
+ * @param {ChunkStore} docStore
+ * @param {Chunk} sc
+ * @param {Snap|null} snap
+ * @param {(key: number, cx: number, cy: number, before: Uint8ClampedArray<ArrayBuffer>|null) => void} [undoCapture]
+ */
 export function commitChunk(docStore, sc, snap, undoCapture) {
   const op255 = Math.round((snap ? snap.globalOpacity : 1) * 255);
   const eraser = snap ? snap.eraser : false;

@@ -3,8 +3,31 @@
 import { brush } from './brush.js';
 import { hexToRgb, clamp } from './util.js';
 import { CHUNK } from './store.js';
+import { ZOOM_MIN, ZOOM_MAX } from './camera.js';
+
+/** @typedef {import('./main.js').App} App */
+/** @typedef {import('./brush.js').Tool} Tool */
+/** @typedef {import('./store.js').ChunkStore} ChunkStore */
+
+/**
+ * Voce del pannello: o una sezione ({sec}) o uno slider completo.
+ * @typedef {Object} SliderDef
+ * @property {string} [sec]
+ * @property {string} [id]
+ * @property {string} [label]
+ * @property {number} [min]
+ * @property {number} [max]
+ * @property {number} [step]
+ * @property {() => number} [get]
+ * @property {(v: number) => void} [set]
+ * @property {(v: number) => string} [fmt]
+ * @property {boolean} [log]
+ * @property {HTMLInputElement} [_input]
+ * @property {() => void} [_refresh]
+ */
 
 // Slider: min/max/step sono valori UI; to/from convertono da/verso il modello.
+/** @type {SliderDef[]} */
 const SLIDERS = [
   { sec: 'Base' },
   { id: 'size', label: 'Dimensione', min: 1, max: 512, step: 1, get: () => brush.size, set: v => brush.size = v, fmt: v => v + ' px', log: true },
@@ -30,6 +53,8 @@ const SLIDERS = [
   { id: 'jsat', label: 'Jitter saturazione', min: 0, max: 100, step: 1, get: () => brush.jitterSat * 100, set: v => brush.jitterSat = v / 100, fmt: v => v + '%' },
 ];
 
+/** @typedef {{id: string, label: string, hint?: string, get: () => boolean, set: (v: boolean) => void}} ToggleDef */
+/** @type {ToggleDef[]} */
 const TOGGLES = [
   { id: 'buildup', label: 'Accumula opacità', hint: 'ON: ogni stamp si somma nel tratto · OFF: tratto a opacità uniforme', get: () => brush.buildup, set: v => brush.buildup = v },
   { id: 'psize', label: 'Pressione → dimensione', get: () => brush.pressureSize, set: v => brush.pressureSize = v },
@@ -37,11 +62,15 @@ const TOGGLES = [
 ];
 
 export class UI {
+  /** @param {App} app */
   constructor(app) {
     this.app = app;
     this.panel = document.getElementById('panel');
     this.cursorEl = document.getElementById('cursor');
     this.zoomLabel = document.getElementById('zoom-label');
+    this.zoomOutBtn = /** @type {HTMLButtonElement} */ (document.getElementById('btn-zoom-out'));
+    this.zoomInBtn = /** @type {HTMLButtonElement} */ (document.getElementById('btn-zoom-in'));
+    /** @type {string[]} */
     this.recentColors = [];
     this._buildPanel();
     this._bindToolbar();
@@ -96,13 +125,13 @@ export class UI {
       input.type = 'range';
       // slider logaritmico per size e spacing (range enormi)
       if (def.log) {
-        input.min = Math.log(def.min);
-        input.max = Math.log(def.max);
-        input.step = (Math.log(def.max) - Math.log(def.min)) / 500;
-        input.value = Math.log(clamp(def.get(), def.min, def.max));
+        input.min = String(Math.log(def.min));
+        input.max = String(Math.log(def.max));
+        input.step = String((Math.log(def.max) - Math.log(def.min)) / 500);
+        input.value = String(Math.log(clamp(def.get(), def.min, def.max)));
       } else {
-        input.min = def.min; input.max = def.max; input.step = def.step;
-        input.value = def.get();
+        input.min = String(def.min); input.max = String(def.max); input.step = String(def.step);
+        input.value = String(def.get());
       }
       const refresh = () => {
         const v = def.log ? Math.exp(parseFloat(input.value)) : parseFloat(input.value);
@@ -122,25 +151,52 @@ export class UI {
       def._refresh = refresh;
     }
 
+    // Renderer: presentazione desynchronized (bassa latenza vs stabilità).
+    // Il cambio ricrea canvas e contesto al volo, il disegno resta intatto.
+    {
+      const sec = document.createElement('div');
+      sec.className = 'p-section';
+      sec.textContent = 'Renderer';
+      frag.appendChild(sec);
+
+      const lab = document.createElement('label');
+      lab.className = 'p-toggle';
+      const span = document.createElement('span');
+      span.textContent = 'Bassa latenza (desync)';
+      const hint = document.createElement('span');
+      hint.className = 'p-hint';
+      hint.textContent = 'ON: penna più reattiva · OFF se il tratto lampeggia (Chrome)';
+      span.appendChild(hint);
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = this.app.desync;
+      input.addEventListener('change', () => this.app.setDesynchronized(input.checked));
+      const knob = document.createElement('span');
+      knob.className = 'knob';
+      lab.append(span, input, knob);
+      frag.appendChild(lab);
+    }
+
     body.appendChild(frag);
   }
 
   syncSliders() {
     for (const def of SLIDERS) {
       if (!def._input) continue;
-      def._input.value = def.log ? Math.log(clamp(def.get(), def.min, def.max)) : def.get();
+      def._input.value = String(def.log ? Math.log(clamp(def.get(), def.min, def.max)) : def.get());
       def._refresh();
     }
   }
 
   _bindToolbar() {
     const app = this.app;
+    /** @type {Record<string, Tool>} */
     const tools = { 'tool-brush': 'brush', 'tool-eraser': 'eraser', 'tool-pan': 'pan' };
     for (const [id, tool] of Object.entries(tools)) {
       document.getElementById(id).addEventListener('click', () => this.setTool(tool));
     }
 
-    const colorInput = document.getElementById('color');
+    const colorInput = /** @type {HTMLInputElement} */ (document.getElementById('color'));
     colorInput.addEventListener('input', () => {
       hexToRgb(colorInput.value, brush.color);
     });
@@ -153,11 +209,20 @@ export class UI {
     });
     document.getElementById('btn-export').addEventListener('click', () => exportPng(app.docStore));
     document.getElementById('btn-resetview').addEventListener('click', () => app.camera.reset());
+    this.zoomOutBtn.addEventListener('click', () => this._zoomBy(0.8));
+    this.zoomInBtn.addEventListener('click', () => this._zoomBy(1.25));
     document.getElementById('btn-hud').addEventListener('click', () => app.hud.toggle());
     document.getElementById('btn-panel').addEventListener('click', () => this.panel.classList.toggle('open'));
     document.getElementById('panel-close').addEventListener('click', () => this.panel.classList.remove('open'));
   }
 
+  /** @param {number} factor */
+  _zoomBy(factor) {
+    const cam = this.app.camera;
+    cam.zoomAt(cam.w / 2, cam.h / 2, factor);
+  }
+
+  /** @param {Tool} tool */
   setTool(tool) {
     brush.tool = tool;
     for (const [id, t] of [['tool-brush', 'brush'], ['tool-eraser', 'eraser'], ['tool-pan', 'pan']]) {
@@ -166,6 +231,7 @@ export class UI {
     this.app.canvas.classList.toggle('panning', tool === 'pan');
   }
 
+  /** @param {string} hex */
   _pushSwatch(hex) {
     if (this.recentColors[0] === hex) return;
     this.recentColors = [hex, ...this.recentColors.filter(c => c !== hex)].slice(0, 6);
@@ -177,7 +243,7 @@ export class UI {
       b.style.background = c;
       b.title = c;
       b.addEventListener('click', () => {
-        document.getElementById('color').value = c;
+        /** @type {HTMLInputElement} */ (document.getElementById('color')).value = c;
         hexToRgb(c, brush.color);
       });
       wrap.appendChild(b);
@@ -205,6 +271,7 @@ export class UI {
   }
 
   // Anello cursore: dimensione pennello in px schermo
+  /** @param {import('./input.js').InputManager} input @param {import('./camera.js').Camera} camera */
   updateCursor(input, camera) {
     const el = this.cursorEl;
     const h = input.hover;
@@ -218,17 +285,22 @@ export class UI {
     el.style.top = h.y + 'px';
   }
 
+  /** @param {number} zoom */
   updateZoomLabel(zoom) {
     this.zoomLabel.textContent = (zoom * 100).toFixed(zoom < 0.1 ? 1 : 0) + '%';
+    this.zoomOutBtn.disabled = zoom <= ZOOM_MIN;
+    this.zoomInBtn.disabled = zoom >= ZOOM_MAX;
   }
 
+  /** @param {import('./undo.js').UndoManager} undoMgr */
   updateUndoButtons(undoMgr) {
-    document.getElementById('btn-undo').disabled = !undoMgr.canUndo;
-    document.getElementById('btn-redo').disabled = !undoMgr.canRedo;
+    /** @type {HTMLButtonElement} */ (document.getElementById('btn-undo')).disabled = !undoMgr.canUndo;
+    /** @type {HTMLButtonElement} */ (document.getElementById('btn-redo')).disabled = !undoMgr.canRedo;
   }
 }
 
 // Export PNG: bounding box dei chunk non vuoti, compositato su bianco.
+/** @param {ChunkStore} docStore */
 export function exportPng(docStore) {
   let cx0 = Infinity, cy0 = Infinity, cx1 = -Infinity, cy1 = -Infinity;
   let any = false;

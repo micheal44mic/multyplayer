@@ -50,7 +50,11 @@
       <button id="btn-resetview" class="tb-btn" title="Reimposta vista (0)">
         <svg viewBox="0 0 24 24"><path d="M12 5a7 7 0 1 0 7 7h2a9 9 0 1 1-9-9v2zm0-4 4 4-4 4V1z"/></svg>
       </button>
-      <span id="zoom-label" title="Zoom">100%</span>
+      <div id="zoom-controls" title="Zoom">
+        <button id="btn-zoom-out" class="tb-btn zoom-btn" title="Zoom indietro (-)" aria-label="Zoom indietro">-</button>
+        <span id="zoom-label">100%</span>
+        <button id="btn-zoom-in" class="tb-btn zoom-btn" title="Zoom avanti (+)" aria-label="Zoom avanti">+</button>
+      </div>
     </div>
 
     <div class="tb-spacer"></div>

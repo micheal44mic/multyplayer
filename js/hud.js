@@ -3,13 +3,38 @@
 
 const HISTORY = 120;
 
+/**
+ * Statistiche per frame, oggetto riusato dal main loop (zero allocazioni).
+ * @typedef {Object} Stats
+ * @property {number} frameMs
+ * @property {number} frameMaxMs
+ * @property {{input: number, sample: number, raster: number, upload: number, draw: number}} timings
+ * @property {number} budgetPx
+ * @property {number} rasterPx
+ * @property {number} queueDepth
+ * @property {number} dabsFrame
+ * @property {number} eventsPerSec
+ * @property {number} docChunks
+ * @property {number} strokeChunks
+ * @property {number} cpuBytes
+ * @property {number} gpuBytes
+ * @property {number} undoCount
+ * @property {number} undoBytes
+ * @property {number} stampCache
+ * @property {number} stampGen
+ * @property {number} zoom
+ * @property {number} dpr
+ * @property {string} renderer
+ * @property {boolean} contextLost
+ */
+
 export class Hud {
   constructor() {
     this.el = document.getElementById('hud');
     this.fpsEl = document.getElementById('hud-fps');
     this.textEl = document.getElementById('hud-text');
-    this.graph = document.getElementById('hud-graph');
-    this.gctx = this.graph.getContext('2d');
+    this.graph = /** @type {HTMLCanvasElement} */ (document.getElementById('hud-graph'));
+    this.gctx = /** @type {CanvasRenderingContext2D} */ (this.graph.getContext('2d'));
 
     this.frameTimes = new Float32Array(HISTORY);
     this.fi = 0;
@@ -30,6 +55,7 @@ export class Hud {
   toggle() { this.el.classList.toggle('collapsed'); }
 
   // stats: oggetto riusato dal main loop
+  /** @param {Stats} stats */
   update(stats) {
     const ft = stats.frameMs;
     this.frameTimes[this.fi] = ft;
@@ -53,6 +79,7 @@ export class Hud {
     if (now - this._lastText < 250) return;
     this._lastText = now;
 
+    /** @type {(b: number) => string} */
     const mb = (b) => (b / 1048576).toFixed(1);
     const t = stats.timings;
     this.textEl.innerHTML =
@@ -76,6 +103,7 @@ export class Hud {
     ctx.clearRect(0, 0, W, H);
 
     // linea 16.7ms (60fps) e 33.3ms (30fps)
+    /** @type {(ms: number) => number} */
     const yFor = (ms) => H - Math.min(H, (ms / 40) * H);
     ctx.strokeStyle = 'rgba(110,231,160,0.35)';
     ctx.beginPath(); ctx.moveTo(0, yFor(16.7)); ctx.lineTo(W, yFor(16.7)); ctx.stroke();

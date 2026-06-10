@@ -14,9 +14,12 @@ import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
 
-class App {
+/** @typedef {import('./store.js').Chunk} Chunk */
+/** @typedef {import('./stroke.js').Snap} Snap */
+
+export class App {
   constructor() {
-    this.canvas = document.getElementById('paint');
+    this.canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('paint'));
     this.camera = new Camera();
     this.docStore = new ChunkStore('doc');
     this.strokeStore = new ChunkStore('stroke');
@@ -26,7 +29,15 @@ class App {
     this.raster = new Rasterizer(this.strokeStore, this.stampCache);
     this.hud = new Hud();
 
-    let renderer = new GLRenderer(this.canvas);
+    // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
+    // può far lampeggiare il tratto (frame presentati fuori sincrono).
+    // Preferenza persistita; toggle nel pannello (sezione Renderer).
+    let desync = true;
+    try { desync = localStorage.getItem('fable-paint.desync') !== '0'; } catch { /* storage negato */ }
+    this.desync = desync;
+
+    /** @type {GLRenderer | Canvas2DRenderer} */
+    let renderer = new GLRenderer(this.canvas, { desynchronized: desync });
     if (!renderer.ok) renderer = new Canvas2DRenderer(this.canvas);
     this.renderer = renderer;
     renderer.trackStores(this.docStore, this.strokeStore);
@@ -37,6 +48,7 @@ class App {
     this.budgetPx = 1_500_000;
     this.strokeLive = false;      // c'è uno stroke non ancora compositato
     this.pendingCommit = false;   // pointer-up ricevuto: commit quando la coda è vuota
+    /** @type {{chunks: Chunk[], index: number, snap: Snap|null}|null} */
     this.commitJob = null;        // commit incrementale: {chunks, index, snap}
     this.COMMIT_CHUNKS_PER_FRAME = 24;
 
@@ -99,6 +111,7 @@ class App {
     this.renderer.resize(w, h, dpr);
   }
 
+  /** @param {number} x @param {number} y @param {number} p */
   startStroke(x, y, p) {
     // chiudi del tutto l'eventuale tratto precedente: drena la sua coda
     // (col suo snapshot), poi completa il commit in modo sincrono
@@ -131,6 +144,7 @@ class App {
   // resta corretto chunk per chunk (mai doppia applicazione).
   _beginCommit() {
     this.pendingCommit = false;
+    /** @type {Chunk[]} */
     const touched = [];
     for (const sc of this.strokeStore.map.values()) {
       if (sc.touched) touched.push(sc);
@@ -145,9 +159,11 @@ class App {
     this.commitJob = { chunks: touched, index: 0, snap: this.raster.snap };
   }
 
+  /** @param {number} maxChunks */
   _runCommit(maxChunks) {
     const job = this.commitJob;
     if (!job) return;
+    /** @type {(c: Chunk) => void} */
     const dispose = (c) => this.renderer.disposeChunkTex(c);
     let n = 0;
     while (job.index < job.chunks.length && n < maxChunks) {
@@ -182,6 +198,40 @@ class App {
     this.undoMgr.clear();
   }
 
+  // Cambia la modalità di presentazione. Gli attributi di un contesto WebGL
+  // sono immutabili: si sostituisce l'elemento canvas e si ricrea il renderer.
+  // I pixel CPU sono la verità: le texture rinascono on-demand alla vista.
+  /** @param {boolean} v */
+  setDesynchronized(v) {
+    if (v === this.desync) return;
+    this.desync = v;
+    try { localStorage.setItem('fable-paint.desync', v ? '1' : '0'); } catch { /* storage negato */ }
+    this._recreateRenderer();
+  }
+
+  _recreateRenderer() {
+    this.renderer.dispose();
+    const fresh = /** @type {HTMLCanvasElement} */ (this.canvas.cloneNode(false));
+    this.canvas.replaceWith(fresh);
+    this.canvas = fresh;
+    this.input.rebind(fresh);
+
+    // texture/canvas dei chunk appartengono al contesto morto
+    this.docStore.dropRendererResources();
+    this.strokeStore.dropRendererResources();
+    this.docStore.dirty.clear();
+    this.strokeStore.dirty.clear();
+
+    /** @type {GLRenderer | Canvas2DRenderer} */
+    let renderer = new GLRenderer(fresh, { desynchronized: this.desync });
+    if (!renderer.ok) renderer = new Canvas2DRenderer(fresh);
+    this.renderer = renderer;
+    renderer.trackStores(this.docStore, this.strokeStore);
+    this.stats.renderer = renderer.kind;
+    this._resize();
+  }
+
+  /** @param {number} t */
   _frame(t) {
     const stats = this.stats;
     const dtFrame = t - this._lastT;
@@ -264,4 +314,4 @@ class App {
   }
 }
 
-window.__app = new App();
+/** @type {any} */ (window).__app = new App();

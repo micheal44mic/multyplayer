@@ -1,13 +1,23 @@
 // Utility condivise: math, colore, divisioni intere veloci.
 
+/** @typedef {{r: number, g: number, b: number}} Rgb */
+/** @typedef {{h: number, s: number, v: number}} Hsv */
+
+/** @type {(v: number, lo: number, hi: number) => number} */
 export const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+/** @type {(a: number, b: number, t: number) => number} */
 export const lerp = (a, b, t) => a + (b - a) * t;
 
 // Divisione per 255 con arrotondamento, esatta per v in [0, 65025].
 // Usata in tutti i loop di blend premultiplied.
+/** @type {(v: number) => number} */
 export const div255 = (v) => ((v + 128) * 257) >> 16;
 
 // RGB (0..255) -> HSV (h 0..360, s 0..1, v 0..1)
+/**
+ * @param {number} r @param {number} g @param {number} b
+ * @param {Hsv} out
+ */
 export function rgbToHsv(r, g, b, out) {
   r /= 255; g /= 255; b /= 255;
   const max = Math.max(r, g, b), min = Math.min(r, g, b);
@@ -26,6 +36,10 @@ export function rgbToHsv(r, g, b, out) {
 }
 
 // HSV -> RGB (0..255), scrive in out {r,g,b}
+/**
+ * @param {number} h @param {number} s @param {number} v
+ * @param {Rgb} out
+ */
 export function hsvToRgb(h, s, v, out) {
   const c = v * s;
   const hp = ((h % 360) + 360) % 360 / 60;
@@ -44,6 +58,10 @@ export function hsvToRgb(h, s, v, out) {
   return out;
 }
 
+/**
+ * @param {string} hex
+ * @param {Rgb} out
+ */
 export function hexToRgb(hex, out) {
   const n = parseInt(hex.slice(1), 16);
   out.r = (n >> 16) & 255;
@@ -52,11 +70,13 @@ export function hexToRgb(hex, out) {
   return out;
 }
 
+/** @param {number} r @param {number} g @param {number} b */
 export function rgbToHex(r, g, b) {
   return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
 }
 
 // PRNG deterministico per stroke (mulberry32) — nessuna allocazione per chiamata.
+/** @param {number} seed @returns {() => number} */
 export function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {

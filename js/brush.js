@@ -4,6 +4,33 @@
 
 import { clamp } from './util.js';
 
+/** @typedef {'brush'|'eraser'|'pan'} Tool */
+
+/**
+ * @typedef {Object} Brush
+ * @property {number} size
+ * @property {number} opacity
+ * @property {number} hardness
+ * @property {number} smoothing
+ * @property {number} spacing
+ * @property {number} roundness
+ * @property {number} angle
+ * @property {number} scatter
+ * @property {number} jitterPos
+ * @property {number} jitterSize
+ * @property {number} jitterOpacity
+ * @property {number} jitterSpacing
+ * @property {number} jitterAngle
+ * @property {number} jitterBright
+ * @property {number} jitterSat
+ * @property {boolean} buildup
+ * @property {boolean} pressureSize
+ * @property {boolean} pressureOpacity
+ * @property {import('./util.js').Rgb} color
+ * @property {Tool} tool
+ */
+
+/** @type {Brush} */
 export const brush = {
   size: 24,            // diametro in px documento
   opacity: 1.0,        // wash: opacità del tratto; buildup: opacità di ogni stamp
@@ -29,6 +56,7 @@ export const brush = {
 
 // Falloff radiale condiviso da stamp e capsule: dist in px, r raggio, h durezza.
 // Banda AA di almeno 1px anche con durezza 1.
+/** @param {number} dist @param {number} r @param {number} h */
 export function falloff(dist, r, h) {
   const core = r * h;
   let w = r - core;
@@ -42,14 +70,25 @@ export function falloff(dist, r, h) {
 const RADIUS_LOG = Math.log(1.09); // bucket di raggio a passi del 9%
 const TWO_PI = Math.PI * 2;
 
+/**
+ * @typedef {Object} Stamp
+ * @property {number} size
+ * @property {number} half
+ * @property {Uint8Array} mask
+ * @property {number} r
+ */
+
 export class StampCache {
+  /** @param {number} [maxEntries] */
   constructor(maxEntries = 160) {
+    /** @type {Map<number, Stamp>} */
     this.map = new Map();
     this.max = maxEntries;
     this.generated = 0; // contatore per HUD
   }
 
   // Ritorna {size, half, mask, r} con mask Uint8Array(size*size).
+  /** @param {number} radius @param {number} hardness @param {number} roundness @param {number} angleRad */
   getStamp(radius, hardness, roundness, angleRad) {
     const rB = Math.max(0, Math.round(Math.log(Math.max(0.5, radius)) / RADIUS_LOG));
     const hB = Math.round(hardness * 12);
@@ -85,6 +124,10 @@ export class StampCache {
   clear() { this.map.clear(); }
 }
 
+/**
+ * @param {number} r @param {number} hardness @param {number} roundness @param {number} angle
+ * @returns {Stamp}
+ */
 function generateStamp(r, hardness, roundness, angle) {
   const half = Math.ceil(r) + 1;
   const size = half * 2;

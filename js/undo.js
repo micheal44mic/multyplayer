@@ -4,22 +4,53 @@
 
 import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
 
+/** @typedef {import('./store.js').Chunk} Chunk */
+/** @typedef {import('./store.js').ChunkStore} ChunkStore */
+
+/**
+ * Stato "prima" di un chunk. buf è raw (ArrayBuffer di CHUNK_BYTES) o
+ * compresso deflate-raw se zip è true; null se il chunk non esisteva.
+ * @typedef {Object} UndoChunk
+ * @property {number} key
+ * @property {number} cx
+ * @property {number} cy
+ * @property {boolean} existed
+ * @property {ArrayBuffer|null} buf
+ * @property {number} rawSize
+ * @property {boolean} [zip]
+ */
+
+/**
+ * @typedef {Object} UndoEntry
+ * @property {UndoChunk[]} chunks
+ * @property {number} rawSize
+ * @property {boolean} compressed
+ * @property {Promise<any>} ready
+ */
+
 const MAX_ENTRIES = 64;
 const MAX_RAW_BYTES = 256 * 1024 * 1024; // budget equivalente non compresso
 
 let nextMsgId = 1;
 
 export class UndoManager {
+  /** @param {() => void} [onChange] */
   constructor(onChange) {
+    /** @type {UndoEntry[]} */
     this.undoStack = [];
+    /** @type {UndoEntry[]} */
     this.redoStack = [];
     this.rawBytes = 0;        // somma dei rawSize in stack (per il cap)
     this.storedBytes = 0;     // byte realmente in memoria (compressi o raw)
     this.onChange = onChange || (() => {});
     this.busy = false;        // un'operazione undo/redo alla volta
+    /** @type {UndoEntry|null} */
     this._entry = null;
+    /** @type {Map<number, {resolve: (v: any) => void, reject: (e: Error) => void}>} */
     this._pending = new Map(); // msgId -> {resolve, reject}
 
+    /** @type {Worker|null} */
+    this.worker = null;
     try {
       this.worker = new Worker(new URL('./undo_worker.js', import.meta.url), { type: 'module' });
       this.worker.onmessage = (e) => {
@@ -34,6 +65,11 @@ export class UndoManager {
     }
   }
 
+  /**
+   * @param {{id: number, op: string, buffers: {key: number, buf: ArrayBuffer|null, rawSize?: number}[]}} msg
+   * @param {Transferable[]} transfer
+   * @returns {Promise<any>}
+   */
   _send(msg, transfer) {
     return new Promise((resolve, reject) => {
       this._pending.set(msg.id, { resolve, reject });
@@ -46,6 +82,10 @@ export class UndoManager {
     this._entry = { chunks: [], rawSize: 0, compressed: false, ready: Promise.resolve() };
   }
 
+  /**
+   * @param {number} key @param {number} cx @param {number} cy
+   * @param {Uint8ClampedArray<ArrayBuffer>|null} beforeDataOrNull
+   */
   captureChunk(key, cx, cy, beforeDataOrNull) {
     const e = this._entry;
     if (!e) return;
@@ -73,6 +113,7 @@ export class UndoManager {
     this.onChange();
   }
 
+  /** @param {UndoEntry} e */
   _compressEntry(e) {
     if (!this.worker) return;
     const toSend = e.chunks.filter(c => c.existed);
@@ -102,6 +143,7 @@ export class UndoManager {
     }).catch(() => { /* resta raw */ });
   }
 
+  /** @param {UndoEntry} e */
   async _materialize(e) {
     // riporta tutti i chunk dell'entry a raw (decomprimendo se serve)
     await e.ready;
@@ -123,6 +165,7 @@ export class UndoManager {
     this.redoStack.length = 0;
   }
 
+  /** @param {UndoEntry} e @param {number} sign */
   _account(e, sign) {
     this.rawBytes += sign * e.rawSize;
     let stored = 0;
@@ -140,9 +183,11 @@ export class UndoManager {
 
   // ---- applicazione ----
   // restore scambia lo stato: cattura il "corrente" per la direzione opposta.
+  /** @param {UndoEntry} entry @param {ChunkStore} docStore @param {(c: Chunk) => void} disposeTex */
   async _apply(entry, docStore, disposeTex) {
     await this._materialize(entry);
 
+    /** @type {UndoEntry} */
     const counter = { chunks: [], rawSize: 0, compressed: false, ready: Promise.resolve() };
     for (const c of entry.chunks) {
       const cur = docStore.getByKey(c.key);
@@ -165,6 +210,7 @@ export class UndoManager {
     return counter;
   }
 
+  /** @param {ChunkStore} docStore @param {(c: Chunk) => void} disposeTex */
   async undo(docStore, disposeTex) {
     if (this.busy || this.undoStack.length === 0) return false;
     this.busy = true;
@@ -182,6 +228,7 @@ export class UndoManager {
     return true;
   }
 
+  /** @param {ChunkStore} docStore @param {(c: Chunk) => void} disposeTex */
   async redo(docStore, disposeTex) {
     if (this.busy || this.redoStack.length === 0) return false;
     this.busy = true;

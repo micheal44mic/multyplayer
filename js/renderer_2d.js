@@ -5,7 +5,12 @@
 
 import { CHUNK } from './store.js';
 
+/** @typedef {import('./store.js').Chunk} Chunk */
+/** @typedef {import('./store.js').ChunkStore} ChunkStore */
+/** @typedef {import('./camera.js').Camera} Camera */
+
 export class Canvas2DRenderer {
+  /** @param {HTMLCanvasElement} canvas */
   constructor(canvas) {
     this.canvas = canvas;
     this.kind = 'Canvas2D';
@@ -18,6 +23,7 @@ export class Canvas2DRenderer {
     this._img = new ImageData(CHUNK, CHUNK);
   }
 
+  /** @param {number} wCss @param {number} hCss @param {number} dpr */
   resize(wCss, hCss, dpr) {
     const w = Math.round(wCss * dpr), h = Math.round(hCss * dpr);
     if (this.canvas.width !== w || this.canvas.height !== h) {
@@ -26,8 +32,10 @@ export class Canvas2DRenderer {
     }
   }
 
-  trackStores() {}
+  /** @param {...ChunkStore} _stores */
+  trackStores(..._stores) {}
 
+  /** @param {ChunkStore} store */
   uploadDirty(store) {
     let bytes = 0;
     for (const chunk of store.dirty) {
@@ -39,10 +47,12 @@ export class Canvas2DRenderer {
     return bytes;
   }
 
+  /** @param {Chunk} chunk */
   disposeChunkTex(chunk) {
     if (chunk.c2d) { chunk.c2d = null; this.texCount--; }
   }
 
+  /** @param {Chunk} chunk */
   _uploadNow(chunk) {
     if (!chunk.c2d) {
       chunk.c2d = document.createElement('canvas');
@@ -68,6 +78,7 @@ export class Canvas2DRenderer {
     this.uploadsThisFrame++;
   }
 
+  /** @param {ChunkStore} docStore @param {Camera} camera @param {number} [maxTex] */
   evict(docStore, camera, maxTex = 1024) {
     if (this.texCount <= maxTex) return;
     const r = camera.visibleRect(this._rect);
@@ -80,6 +91,10 @@ export class Canvas2DRenderer {
     }
   }
 
+  /**
+   * @param {Camera} camera @param {ChunkStore} docStore @param {ChunkStore} strokeStore
+   * @param {number} strokeOpacity @param {boolean} eraserLive
+   */
   render(camera, docStore, strokeStore, strokeOpacity, eraserLive) {
     const ctx = this.ctx;
     const dpr = camera.dpr;
@@ -121,6 +136,8 @@ export class Canvas2DRenderer {
       ctx.globalCompositeOperation = 'source-over';
     }
   }
+
+  dispose() {}
 
   get gpuBytes() { return this.texCount * CHUNK * CHUNK * 4; }
 }

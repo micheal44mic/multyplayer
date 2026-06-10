@@ -6,9 +6,21 @@ const PT_MOUSE = 0, PT_PEN = 1, PT_TOUCH = 2;
 const FIELDS = 7; // type, id, x, y, pressure, ptrType, buttons
 const CAP = 8192;
 
+/** @typedef {import('./camera.js').Camera} Camera */
+
+/**
+ * @typedef {Object} InputHooks
+ * @property {() => boolean} isPanTool
+ * @property {(x: number, y: number, p: number) => void} onStrokeStart
+ * @property {(x: number, y: number, p: number) => void} onStrokePoint
+ * @property {(x: number, y: number, p: number) => void} onStrokeEnd
+ * @property {() => void} onStrokeCancel
+ */
+
 export class InputManager {
   // hooks: onStrokeStart(x,y,p), onStrokePoint, onStrokeEnd(x,y,p), onStrokeCancel()
   // isPanTool() -> bool, camera
+  /** @param {HTMLCanvasElement} canvas @param {Camera} camera @param {InputHooks} hooks */
   constructor(canvas, camera, hooks) {
     this.canvas = canvas;
     this.camera = camera;
@@ -29,6 +41,7 @@ export class InputManager {
     this.strokeDist = 0;
     this.panningId = -1;
     this._panLast = { x: 0, y: 0 };
+    /** @type {Map<number, {x: number, y: number}>} */
     this.touches = new Map();        // id -> {x, y}
     this.gesture = false;
     this._gestA = -1; this._gestB = -1;
@@ -41,15 +54,23 @@ export class InputManager {
 
     this.hover = { x: -100, y: -100, visible: false, touch: false };
 
+    // Ultimo punto del tratto in corso (schermo), per chiusura da gesture
+    this._lastPoint = { x: 0, y: 0, p: 0 };
+
     // Pointer in contatto (down ricevuto, up/cancel non ancora).
     // Su mobile NON ci si può fidare di e.buttons: Safari iOS riporta
     // buttons=0 nei pointermove di tocchi e pencil attivi.
+    /** @type {Set<number>} */
     this._contact = new Set();
 
     this._tmpW = { x: 0, y: 0 };
     this._bind();
   }
 
+  /**
+   * @param {number} type @param {number} id @param {number} x @param {number} y
+   * @param {number} p @param {number} pt @param {number} buttons
+   */
   _push(type, id, x, y, p, pt, buttons) {
     const next = (this.tail + 1) % CAP;
     if (next === this.head) return; // pieno: scarta il più vecchio implicito
@@ -60,9 +81,43 @@ export class InputManager {
     this._evCount++;
   }
 
+  // Il canvas viene sostituito quando si ricrea il contesto WebGL (toggle
+  // desynchronized): si riallacciano i listener e si chiude pulito lo stato
+  // attivo (un eventuale tratto in corso viene cancellato via EV_CANCEL).
+  /** @param {HTMLCanvasElement} canvas */
+  rebind(canvas) {
+    this.canvas = canvas;
+    if (this.drawingId !== -1) this._push(EV_CANCEL, this.drawingId, 0, 0, 0, 0, 0);
+    this.panningId = -1;
+    this.gesture = false;
+    this._gestA = -1; this._gestB = -1;
+    this.touches.clear();
+    this._contact.clear();
+    this._bindCanvas();
+  }
+
   _bind() {
+    this._bindCanvas();
+
+    // Listener a livello window: agganciati una volta sola, sopravvivono
+    // alla sostituzione del canvas (rebind).
+    for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) {
+      window.addEventListener(ev, (e) => e.preventDefault());
+    }
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space' && !e.repeat) this.spaceHeld = true;
+    });
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'Space') this.spaceHeld = false;
+    });
+    window.addEventListener('blur', () => { this.spaceHeld = false; });
+  }
+
+  _bindCanvas() {
     const c = this.canvas;
+    /** @type {(e: PointerEvent) => number} */
     const ptType = (e) => e.pointerType === 'pen' ? PT_PEN : e.pointerType === 'touch' ? PT_TOUCH : PT_MOUSE;
+    /** @type {(e: PointerEvent, pt: number) => number} */
     const press = (e, pt) => pt === PT_MOUSE ? 1 : (e.pressure > 0 ? e.pressure : 0.5);
 
     c.addEventListener('pointerdown', (e) => {
@@ -95,6 +150,7 @@ export class InputManager {
       e.preventDefault();
     });
 
+    /** @param {PointerEvent} e */
     const up = (e) => {
       const pt = ptType(e);
       this._contact.delete(e.pointerId);
@@ -120,9 +176,6 @@ export class InputManager {
     // non interferisce con i pointer event, che restano la fonte di verità).
     c.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
     c.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
-    for (const ev of ['gesturestart', 'gesturechange', 'gestureend']) {
-      window.addEventListener(ev, (e) => e.preventDefault());
-    }
 
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
@@ -132,14 +185,6 @@ export class InputManager {
     }, { passive: false });
 
     c.addEventListener('contextmenu', (e) => e.preventDefault());
-
-    window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space' && !e.repeat) this.spaceHeld = true;
-    });
-    window.addEventListener('keyup', (e) => {
-      if (e.code === 'Space') this.spaceHeld = false;
-    });
-    window.addEventListener('blur', () => { this.spaceHeld = false; });
   }
 
   // Drenato una volta per frame dal frame loop.
@@ -173,6 +218,10 @@ export class InputManager {
     }
   }
 
+  /**
+   * @param {number} id @param {number} x @param {number} y @param {number} p
+   * @param {number} pt @param {number} buttons
+   */
   _onDown(id, x, y, p, pt, buttons) {
     const H = this.hooks, cam = this.camera;
 
@@ -220,6 +269,7 @@ export class InputManager {
     H.onStrokeStart(this._tmpW.x, this._tmpW.y, p);
   }
 
+  /** @param {number} id @param {number} x @param {number} y @param {number} p @param {number} pt */
   _onMove(id, x, y, p, pt) {
     const H = this.hooks, cam = this.camera;
 
@@ -248,6 +298,10 @@ export class InputManager {
     }
   }
 
+  /**
+   * @param {number} id @param {number} x @param {number} y @param {number} p
+   * @param {number} pt @param {boolean} cancelled
+   */
   _onUp(id, x, y, p, pt, cancelled) {
     const H = this.hooks, cam = this.camera;
 

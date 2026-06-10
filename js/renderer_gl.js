@@ -4,6 +4,10 @@
 
 import { CHUNK } from './store.js';
 
+/** @typedef {import('./store.js').Chunk} Chunk */
+/** @typedef {import('./store.js').ChunkStore} ChunkStore */
+/** @typedef {import('./camera.js').Camera} Camera */
+
 const VS_CHUNK = `
 attribute vec2 aPos;
 uniform mat3 uMat;
@@ -62,6 +66,7 @@ void main() {
   gl_FragColor = vec4(col, 1.0);
 }`;
 
+/** @param {WebGLRenderingContext} gl @param {number} type @param {string} src */
 function compile(gl, type, src) {
   const sh = gl.createShader(type);
   gl.shaderSource(sh, src);
@@ -72,6 +77,7 @@ function compile(gl, type, src) {
   return sh;
 }
 
+/** @param {WebGLRenderingContext} gl @param {string} vs @param {string} fs */
 function link(gl, vs, fs) {
   const p = gl.createProgram();
   gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs));
@@ -84,21 +90,28 @@ function link(gl, vs, fs) {
 }
 
 export class GLRenderer {
-  constructor(canvas) {
+  /** @param {HTMLCanvasElement} canvas @param {{desynchronized?: boolean}} [opts] */
+  constructor(canvas, opts) {
     this.canvas = canvas;
     this.kind = 'WebGL';
     this.contextLost = false;
     this.texCount = 0;
     this.uploadsThisFrame = 0;
+    /** @type {ChunkStore[]} */
     this._stores = [];
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
 
-    const opts = {
+    // desynchronized: presentazione a bassa latenza (Chrome). Può lampeggiare
+    // su alcuni sistemi: il frame va a schermo fuori sincrono col loop.
+    // Safari ignora l'opzione. Configurabile dal toggle nel pannello.
+    const ctxOpts = {
       alpha: false, antialias: false, depth: false, stencil: false,
-      preserveDrawingBuffer: false, desynchronized: true,
+      preserveDrawingBuffer: false,
+      desynchronized: opts && opts.desynchronized !== undefined ? opts.desynchronized : true,
       powerPreference: 'high-performance',
     };
-    this.gl = canvas.getContext('webgl', opts) || canvas.getContext('experimental-webgl', opts);
+    this.gl = /** @type {WebGLRenderingContext} */ (
+      canvas.getContext('webgl', ctxOpts) || canvas.getContext('experimental-webgl', ctxOpts));
     if (!this.gl) { this.ok = false; return; }
     this.ok = true;
 
@@ -107,11 +120,11 @@ export class GLRenderer {
       this.contextLost = true;
     });
     canvas.addEventListener('webglcontextrestored', () => {
-      // la CPU è la verità: si ricrea tutto dai buffer
+      // la CPU è la verità: si ricrea tutto dai buffer.
+      // dropRendererResources copre anche i chunk nel pool: le loro texture
+      // appartengono al contesto perso e ribinderle sarebbe INVALID_OPERATION.
       this._init();
-      for (const st of this._stores) {
-        for (const c of st.map.values()) { c.tex = null; c.texDirty = true; }
-      }
+      for (const st of this._stores) st.dropRendererResources();
       this.contextLost = false;
     });
 
@@ -160,6 +173,7 @@ export class GLRenderer {
       new Uint8Array(4));
   }
 
+  /** @param {number} wCss @param {number} hCss @param {number} dpr */
   resize(wCss, hCss, dpr) {
     const w = Math.round(wCss * dpr), h = Math.round(hCss * dpr);
     if (this.canvas.width !== w || this.canvas.height !== h) {
@@ -168,8 +182,10 @@ export class GLRenderer {
     }
   }
 
+  /** @param {...ChunkStore} stores */
   trackStores(...stores) { this._stores = stores; }
 
+  /** @param {Chunk} chunk */
   _ensureTex(chunk) {
     const gl = this.gl;
     if (!chunk.tex) {
@@ -187,6 +203,7 @@ export class GLRenderer {
   }
 
   // Upload dei soli chunk sporchi. Ritorna i byte caricati.
+  /** @param {ChunkStore} store */
   uploadDirty(store) {
     if (this.contextLost) { store.dirty.clear(); return 0; }
     const gl = this.gl;
@@ -204,6 +221,7 @@ export class GLRenderer {
     return bytes;
   }
 
+  /** @param {Chunk} chunk */
   disposeChunkTex(chunk) {
     if (chunk.tex) {
       if (!this.contextLost) this.gl.deleteTexture(chunk.tex);
@@ -212,6 +230,10 @@ export class GLRenderer {
     }
   }
 
+  /**
+   * @param {Camera} camera @param {ChunkStore} docStore @param {ChunkStore} strokeStore
+   * @param {number} strokeOpacity @param {boolean} eraserLive
+   */
   render(camera, docStore, strokeStore, strokeOpacity, eraserLive) {
     if (this.contextLost) return;
     const gl = this.gl;
@@ -285,6 +307,7 @@ export class GLRenderer {
 
   // Upload immediato di un chunk la cui texture è assente o stantia
   // (eviction, pool, context restore). La CPU è la verità.
+  /** @param {Chunk} chunk */
   _uploadNow(chunk) {
     const gl = this.gl;
     gl.bindTexture(gl.TEXTURE_2D, this._ensureTex(chunk));
@@ -294,6 +317,10 @@ export class GLRenderer {
     this.uploadsThisFrame++;
   }
 
+  /**
+   * @param {ChunkStore} store
+   * @param {number} cx0 @param {number} cy0 @param {number} cx1 @param {number} cy1
+   */
   _drawStore(store, cx0, cy0, cx1, cy1) {
     const gl = this.gl;
     for (const chunk of store.map.values()) {
@@ -307,6 +334,7 @@ export class GLRenderer {
 
   // Tiene la VRAM limitata: oltre maxTex, le texture dei chunk fuori
   // schermo vengono liberate (verranno ricaricate on-demand alla vista).
+  /** @param {ChunkStore} docStore @param {Camera} camera @param {number} [maxTex] */
   evict(docStore, camera, maxTex = 1024) {
     if (this.contextLost || this.texCount <= maxTex) return;
     const r = camera.visibleRect(this._rect);
@@ -322,6 +350,14 @@ export class GLRenderer {
         this.texCount--;
       }
     }
+  }
+
+  // Il canvas sta per essere sostituito (cambio attributi di contesto):
+  // rilascia il contesto subito invece di aspettare il GC dell'elemento.
+  dispose() {
+    if (!this.gl) return;
+    const ext = this.gl.getExtension('WEBGL_lose_context');
+    if (ext) ext.loseContext();
   }
 
   get gpuBytes() { return this.texCount * CHUNK * CHUNK * 4; }

@@ -16,23 +16,33 @@ export class Camera {
     this.changed = true; // per sapere se ridisegnare
   }
 
+  /** @param {number} w @param {number} h @param {number} dpr */
   resize(w, h, dpr) {
     this.w = w; this.h = h; this.dpr = dpr;
     this.changed = true;
   }
 
+  /**
+   * @param {number} sx @param {number} sy
+   * @param {{x: number, y: number}} out
+   */
   screenToWorld(sx, sy, out) {
     out.x = (sx - this.w * 0.5) / this.zoom + this.x;
     out.y = (sy - this.h * 0.5) / this.zoom + this.y;
     return out;
   }
 
+  /**
+   * @param {number} wx @param {number} wy
+   * @param {{x: number, y: number}} out
+   */
   worldToScreen(wx, wy, out) {
     out.x = (wx - this.x) * this.zoom + this.w * 0.5;
     out.y = (wy - this.y) * this.zoom + this.h * 0.5;
     return out;
   }
 
+  /** @param {number} dxScreen @param {number} dyScreen */
   panBy(dxScreen, dyScreen) {
     this.x -= dxScreen / this.zoom;
     this.y -= dyScreen / this.zoom;
@@ -40,6 +50,7 @@ export class Camera {
   }
 
   // Zoom mantenendo fisso il punto schermo (sx, sy)
+  /** @param {number} sx @param {number} sy @param {number} factor */
   zoomAt(sx, sy, factor) {
     const z = clamp(this.zoom * factor, ZOOM_MIN, ZOOM_MAX);
     if (z === this.zoom) return;
@@ -68,6 +79,7 @@ export class Camera {
   }
 
   // Rettangolo mondo visibile {x0,y0,x1,y1}
+  /** @param {{x0: number, y0: number, x1: number, y1: number}} out */
   visibleRect(out) {
     const hw = this.w * 0.5 / this.zoom;
     const hh = this.h * 0.5 / this.zoom;

@@ -4,6 +4,42 @@
 
 import { clamp, lerp, rgbToHsv, hsvToRgb, mulberry32 } from './util.js';
 
+/** @typedef {import('./brush.js').Brush} Brush */
+
+/**
+ * Fotografia immutabile del pennello per la durata di uno stroke.
+ * @typedef {Object} Snap
+ * @property {number} baseR
+ * @property {number} diam
+ * @property {number} opacity
+ * @property {number} hardness
+ * @property {number} roundness
+ * @property {number} baseAngle
+ * @property {number} spacing
+ * @property {number} smoothing
+ * @property {number} scatter
+ * @property {number} jPos
+ * @property {number} jSize
+ * @property {number} jOp
+ * @property {number} jSpacing
+ * @property {number} jAngle
+ * @property {number} jBright
+ * @property {number} jSat
+ * @property {boolean} buildup
+ * @property {number} alphaCompPow
+ * @property {boolean} pressureSize
+ * @property {boolean} pressureOpacity
+ * @property {number} colR
+ * @property {number} colG
+ * @property {number} colB
+ * @property {import('./util.js').Hsv} hsv
+ * @property {boolean} eraser
+ * @property {boolean} continuous
+ * @property {number} globalOpacity
+ * @property {() => number} rng
+ * @property {import('./util.js').Rgb} tmpRgb
+ */
+
 export const T_DAB = 0;
 export const T_SEG = 1;
 const STRIDE = 10;
@@ -16,6 +52,7 @@ const CONTINUOUS_THRESHOLD = 0.05;
 const MIN_BUILDUP_SPACING = 0.03;
 
 export class DabQueue {
+  /** @param {number} [cap] */
   constructor(cap = 1 << 15) {
     this.cap = cap;
     this.buf = new Float32Array(cap * STRIDE);
@@ -33,6 +70,10 @@ export class DabQueue {
     }
     this.buf = nb; this.cap *= 2; this.head = 0; this.tail = this.count;
   }
+  /**
+   * @param {number} t @param {number} a @param {number} b @param {number} c @param {number} d
+   * @param {number} e @param {number} f @param {number} g @param {number} h @param {number} i
+   */
   push(t, a, b, c, d, e, f, g, h, i) {
     if (this.count === this.cap) this._grow();
     const o = this.tail * STRIDE, q = this.buf;
@@ -49,9 +90,11 @@ export class DabQueue {
 let strokeSeed = 1;
 
 export class StrokeEngine {
+  /** @param {DabQueue} queue */
   constructor(queue) {
     this.q = queue;
     this.active = false;
+    /** @type {Snap|null} */
     this.snap = null;
     this.dabsEmitted = 0;
     // stato smoother
@@ -66,6 +109,7 @@ export class StrokeEngine {
 
   // Fotografa il pennello: lo stroke è deterministico e indipendente
   // da cambi di impostazioni a metà tratto.
+  /** @param {number} x @param {number} y @param {number} p @param {Brush} brush */
   begin(x, y, p, brush) {
     const baseR = Math.max(0.5, brush.size * 0.5);
     const eraser = brush.tool === 'eraser';
@@ -137,6 +181,7 @@ export class StrokeEngine {
     }
   }
 
+  /** @param {number} x @param {number} y @param {number} p */
   move(x, y, p) {
     if (!this.active) return;
     const s = this.snap;
@@ -149,6 +194,7 @@ export class StrokeEngine {
   }
 
   // Catch-up: a fine tratto lo stabilizzatore raggiunge il punto grezzo
+  /** @param {number} x @param {number} y @param {number} p */
   end(x, y, p) {
     if (!this.active) return;
     if (this.snap.smoothing > 0) {
@@ -167,6 +213,7 @@ export class StrokeEngine {
 
   // ---- interni ----
 
+  /** @param {number} x @param {number} y @param {number} p */
   _advance(x, y, p) {
     const dx = x - this._lx, dy = y - this._ly;
     const dist = Math.sqrt(dx * dx + dy * dy);
@@ -200,16 +247,19 @@ export class StrokeEngine {
     this._lx = x; this._ly = y; this._lp = p;
   }
 
+  /** @param {number} p */
   _radius(p) {
     const s = this.snap;
     return Math.max(0.25, s.baseR * (s.pressureSize ? Math.pow(Math.max(0.02, p), 1.5) : 1));
   }
 
+  /** @param {number} p */
   _alphaDyn(p) {
     const s = this.snap;
     return s.pressureOpacity ? Math.pow(clamp(p, 0, 1), 1.2) : 1;
   }
 
+  /** @param {number} r */
   _nextGap(r) {
     const s = this.snap;
     let gap = Math.max(0.5, s.spacing * Math.max(1, r * 2));
@@ -220,6 +270,7 @@ export class StrokeEngine {
     return gap;
   }
 
+  /** @param {number} x @param {number} y @param {number} p */
   _emitDab(x, y, p) {
     const s = this.snap;
     const rng = s.rng;
