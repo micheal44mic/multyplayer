@@ -25,10 +25,47 @@ export class Rasterizer {
     // stats per HUD
     this.lastPx = 0;
     this.lastDabs = 0;
+    // LUT riusate (zero allocazioni per dab):
+    // _maLut[m] = div255(m * a255)  — alpha del dab applicata alla maschera
+    // _lutR/G/B[ma] = div255(c * ma) — colore premultiplied per ogni alpha
+    this._maLut = new Uint8Array(256);
+    this._lutA = -1;        // a255 per cui _maLut è valida
+    this._lutR = new Uint8Array(256);
+    this._lutG = new Uint8Array(256);
+    this._lutB = new Uint8Array(256);
+    this._lutColorKey = -1; // (cr<<16)|(cg<<8)|cb per cui le LUT colore sono valide
   }
 
   /** @param {Snap|null} snap */
-  beginStroke(snap) { this.snap = snap; }
+  beginStroke(snap) {
+    this.snap = snap;
+    this._lutA = -1;
+    this._lutColorKey = -1;
+  }
+
+  // Stessa identica aritmetica dei loop per-pixel, fattorizzata in tabelle:
+  // 256 voci battono qualunque dab più grande di ~16x16.
+  /** @param {number} a255 */
+  _ensureMaLut(a255) {
+    if (a255 === this._lutA) return;
+    const L = this._maLut;
+    if (a255 === 255) { for (let i = 0; i < 256; i++) L[i] = i; }
+    else { for (let i = 0; i < 256; i++) L[i] = div255(i * a255); }
+    this._lutA = a255;
+  }
+
+  /** @param {number} cr @param {number} cg @param {number} cb */
+  _ensureColorLut(cr, cg, cb) {
+    const key = (cr << 16) | (cg << 8) | cb;
+    if (key === this._lutColorKey) return;
+    const R = this._lutR, G = this._lutG, B = this._lutB;
+    for (let i = 0; i < 256; i++) {
+      R[i] = div255(cr * i);
+      G[i] = div255(cg * i);
+      B[i] = div255(cb * i);
+    }
+    this._lutColorKey = key;
+  }
 
   // Drena la coda fino a esaurimento o budget (px toccati). Ritorna px usati.
   /** @param {DabQueue} queue @param {number} budgetPx */
@@ -90,6 +127,19 @@ export class Rasterizer {
     const buildup = snap.buildup;
     const store = this.store;
 
+    // Le LUT convengono se sono già valide (alpha/colore stabili nel tratto)
+    // o se il dab è grande abbastanza da ammortizzare le ~1280 op di rebuild
+    // (jitter colore/opacità le invalida a ogni dab; i pixel scritti sono ben
+    // meno dell'area del quadrato, quindi la soglia è prudente).
+    const useLut = (this._lutA === a255 && this._lutColorKey === ((cr << 16) | (cg << 8) | cb)) ||
+      sSize * sSize >= 4096;
+    if (useLut) {
+      this._ensureMaLut(a255);
+      this._ensureColorLut(cr, cg, cb);
+    }
+    const maLut = this._maLut;
+    const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
+
     forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
       (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
         store.markDirty(chunk);
@@ -98,25 +148,45 @@ export class Rasterizer {
         for (let y2 = ly0; y2 <= ly1; y2++) {
           let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
           let mi = (y2 + oy - iy) * sSize + (lx0 + ox - ix);
-          for (let x2 = lx0; x2 <= lx1; x2++, di += 4, mi++) {
-            const m = mask[mi];
-            if (m === 0) continue;
-            const ma = div255(m * a255);
-            if (ma === 0) continue;
-            if (buildup) {
-              const inv = 255 - ma;
-              d[di] = div255(cr * ma) + div255(d[di] * inv);
-              d[di + 1] = div255(cg * ma) + div255(d[di + 1] * inv);
-              d[di + 2] = div255(cb * ma) + div255(d[di + 2] * inv);
-              d[di + 3] = ma + div255(d[di + 3] * inv);
-            } else if (ma > d[di + 3]) {
-              // wash: max(alpha) — i dab non si scuriscono tra loro
-              d[di] = div255(cr * ma);
-              d[di + 1] = div255(cg * ma);
-              d[di + 2] = div255(cb * ma);
-              d[di + 3] = ma;
+          if (useLut) {
+            for (let x2 = lx0; x2 <= lx1; x2++, di += 4, mi++) {
+              const ma = maLut[mask[mi]];
+              if (ma === 0) continue;
+              if (buildup) {
+                const inv = 255 - ma;
+                d[di] = lutR[ma] + div255(d[di] * inv);
+                d[di + 1] = lutG[ma] + div255(d[di + 1] * inv);
+                d[di + 2] = lutB[ma] + div255(d[di + 2] * inv);
+                d[di + 3] = ma + div255(d[di + 3] * inv);
+              } else if (ma > d[di + 3]) {
+                // wash: max(alpha) — i dab non si scuriscono tra loro
+                d[di] = lutR[ma];
+                d[di + 1] = lutG[ma];
+                d[di + 2] = lutB[ma];
+                d[di + 3] = ma;
+              }
+              wrote = true;
             }
-            wrote = true;
+          } else {
+            for (let x2 = lx0; x2 <= lx1; x2++, di += 4, mi++) {
+              const m = mask[mi];
+              if (m === 0) continue;
+              const ma = div255(m * a255);
+              if (ma === 0) continue;
+              if (buildup) {
+                const inv = 255 - ma;
+                d[di] = div255(cr * ma) + div255(d[di] * inv);
+                d[di + 1] = div255(cg * ma) + div255(d[di + 1] * inv);
+                d[di + 2] = div255(cb * ma) + div255(d[di + 2] * inv);
+                d[di + 3] = ma + div255(d[di + 3] * inv);
+              } else if (ma > d[di + 3]) {
+                d[di] = div255(cr * ma);
+                d[di + 1] = div255(cg * ma);
+                d[di + 2] = div255(cb * ma);
+                d[di + 3] = ma;
+              }
+              wrote = true;
+            }
           }
         }
         if (wrote) chunk.touched = true;
@@ -133,6 +203,8 @@ export class Rasterizer {
     const h = snap.hardness;
     const cr = snap.colR, cg = snap.colG, cb = snap.colB;
     const store = this.store;
+    this._ensureColorLut(cr, cg, cb);
+    const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
 
     const maxR = Math.max(r0, r1) + 1;
     const bx0 = Math.floor(Math.min(x0, x1) - maxR);
@@ -167,9 +239,9 @@ export class Rasterizer {
             if (a <= 0) continue;
             const ma = (a * 255 + 0.5) | 0;
             if (ma > d[di + 3]) {
-              d[di] = div255(cr * ma);
-              d[di + 1] = div255(cg * ma);
-              d[di + 2] = div255(cb * ma);
+              d[di] = lutR[ma];
+              d[di + 1] = lutG[ma];
+              d[di + 2] = lutB[ma];
               d[di + 3] = ma;
               wrote = true;
             }
@@ -197,19 +269,42 @@ export function commitChunk(docStore, sc, snap, undoCapture) {
   if (undoCapture) undoCapture(sc.key, sc.cx, sc.cy, existing ? existing.data : null);
   const doc = existing || docStore.getOrCreate(sc.cx, sc.cy);
   const s = sc.data, d = doc.data;
+  // Viste u32 per saltare in fretta i pixel vuoti (premultiplied: parola 0 =
+  // pixel non toccato) e copiare in blocco quelli opachi. byteOffset esplicito:
+  // il buffer sottostante può essere la memoria lineare wasm.
+  const su = new Uint32Array(s.buffer, s.byteOffset, s.length >> 2);
+  const du = new Uint32Array(d.buffer, d.byteOffset, d.length >> 2);
+  const full = op255 === 255;
 
   if (eraser) {
-    for (let o = 0; o < s.length; o += 4) {
-      const sa = div255(s[o + 3] * op255);
+    for (let i = 0, o = 0; i < su.length; i++, o += 4) {
+      if (su[i] === 0) continue;
+      const sa = full ? s[o + 3] : div255(s[o + 3] * op255);
       if (sa === 0) continue;
+      if (sa === 255) { du[i] = 0; continue; } // gomma piena: azzera la parola
       const inv = 255 - sa;
       d[o] = div255(d[o] * inv);
       d[o + 1] = div255(d[o + 1] * inv);
       d[o + 2] = div255(d[o + 2] * inv);
       d[o + 3] = div255(d[o + 3] * inv);
     }
+  } else if (full) {
+    // opacità 1: div255(x*255) = x, quindi niente moltiplicazioni sulla sorgente
+    for (let i = 0, o = 0; i < su.length; i++, o += 4) {
+      const v = su[i];
+      if (v === 0) continue;
+      const sa = s[o + 3];
+      if (sa === 0) continue;
+      if (sa === 255) { du[i] = v; continue; } // sorgente opaca: copia la parola
+      const inv = 255 - sa;
+      d[o] = s[o] + div255(d[o] * inv);
+      d[o + 1] = s[o + 1] + div255(d[o + 1] * inv);
+      d[o + 2] = s[o + 2] + div255(d[o + 2] * inv);
+      d[o + 3] = sa + div255(d[o + 3] * inv);
+    }
   } else {
-    for (let o = 0; o < s.length; o += 4) {
+    for (let i = 0, o = 0; i < su.length; i++, o += 4) {
+      if (su[i] === 0) continue;
       const sa = div255(s[o + 3] * op255);
       if (sa === 0) continue;
       const inv = 255 - sa;

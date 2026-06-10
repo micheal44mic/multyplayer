@@ -1,0 +1,11 @@
+# Target e flag fissati qui: `cargo build --release` dentro wasm/ basta.
+# simd128 è il requisito minimo (Chrome 91+, Firefox 89+, Safari 16.4+);
+# se il browser non lo supporta l'app resta sul rasterizer JS.
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+simd128",
+  "-C", "link-arg=--export=__heap_base",
+]
