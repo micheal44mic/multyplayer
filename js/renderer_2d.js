@@ -23,6 +23,8 @@ export class Canvas2DRenderer {
     this.uploadsThisFrame = 0;
     this.ctx = canvas.getContext('2d');
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
+    // mondo -> schermo device del frame corrente (vedi render)
+    this._s = 1; this._tx = 0; this._ty = 0;
     this._img = new ImageData(CHUNK, CHUNK);
     // scratch per la gomma live: chunk del livello attivo - maschera stroke,
     // composto fuori dal canvas principale per non bucare i livelli sotto
@@ -115,12 +117,14 @@ export class Canvas2DRenderer {
     // piano trasparente: griglia CSS e piani sottostanti restano visibili
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
-    // mondo -> schermo device
-    ctx.setTransform(
-      camera.zoom * dpr, 0, 0, camera.zoom * dpr,
-      (-camera.x * camera.zoom + camera.w * 0.5) * dpr,
-      (-camera.y * camera.zoom + camera.h * 0.5) * dpr
-    );
+    // mondo -> schermo device, applicato PER CHUNK con bordi arrotondati e
+    // condivisi tra vicini: con la transform frazionaria drawImage antialiasa
+    // il bordo di ogni chunk verso il trasparente e tra chunk adiacenti resta
+    // una cucitura di ~1px (si vede ciò che sta dietro). Coi bordi arrotondati
+    // la copertura è piena per costruzione (errore < 1px, invisibile).
+    this._s = camera.zoom * dpr;
+    this._tx = (-camera.x * camera.zoom + camera.w * 0.5) * dpr;
+    this._ty = (-camera.y * camera.zoom + camera.h * 0.5) * dpr;
     // liscio in minificazione e fino a 380% di ingrandimento; oltre, pixel
     // nitidi per il lavoro di dettaglio (stessa soglia del renderer WebGL)
     ctx.imageSmoothingEnabled = camera.zoom <= 3.8;
@@ -151,10 +155,15 @@ export class Canvas2DRenderer {
    * @param {number} cx0 @param {number} cy0 @param {number} cx1 @param {number} cy1
    */
   _drawStore(ctx, store, cx0, cy0, cx1, cy1) {
+    const s = this._s, tx = this._tx, ty = this._ty;
     for (const chunk of store.map.values()) {
       if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
       if (!chunk.c2d || chunk.texDirty) this._uploadNow(chunk);
-      ctx.drawImage(chunk.c2d, chunk.cx * CHUNK, chunk.cy * CHUNK);
+      const x0 = Math.round(chunk.cx * CHUNK * s + tx);
+      const y0 = Math.round(chunk.cy * CHUNK * s + ty);
+      const x1 = Math.round((chunk.cx + 1) * CHUNK * s + tx);
+      const y1 = Math.round((chunk.cy + 1) * CHUNK * s + ty);
+      ctx.drawImage(chunk.c2d, x0, y0, x1 - x0, y1 - y0);
     }
   }
 
@@ -173,6 +182,7 @@ export class Canvas2DRenderer {
       this._scratch.height = CHUNK;
     }
     const sctx = this._scratch.getContext('2d');
+    const s = this._s, tx = this._tx, ty = this._ty;
     for (const chunk of layer.store.map.values()) {
       if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
       if (!chunk.c2d || chunk.texDirty) this._uploadNow(chunk);
@@ -191,7 +201,11 @@ export class Canvas2DRenderer {
         sctx.globalAlpha = 1;
       }
       ctx.globalAlpha = layer.opacity;
-      ctx.drawImage(this._scratch, chunk.cx * CHUNK, chunk.cy * CHUNK);
+      const x0 = Math.round(chunk.cx * CHUNK * s + tx);
+      const y0 = Math.round(chunk.cy * CHUNK * s + ty);
+      const x1 = Math.round((chunk.cx + 1) * CHUNK * s + tx);
+      const y1 = Math.round((chunk.cy + 1) * CHUNK * s + ty);
+      ctx.drawImage(this._scratch, x0, y0, x1 - x0, y1 - y0);
     }
     ctx.globalAlpha = 1;
   }
