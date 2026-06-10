@@ -1,6 +1,8 @@
 // FRAME LOOP — unico orologio del sistema.
 // 1. drena input  2. sampler -> descrittori  3. raster con budget
-// 4. upload tile sporchi  5. present. Zero allocazioni nel path per-frame.
+// 4. upload tile sporchi  5. present (piani). Zero allocazioni nel path
+// per-frame. Il documento è una lista di livelli (raster + testo); pennello
+// e gomma scrivono sul livello attivo, i piani DOM compongono la pila.
 
 import { Camera } from './camera.js';
 import { ChunkStore } from './store.js';
@@ -13,26 +15,40 @@ import { InputManager } from './input.js';
 import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
-import { TextLayer } from './text_layer.js';
+import { LayerManager, makeRasterLayer } from './layers.js';
+import { Planes } from './planes.js';
 import { WasmHeap } from './wasm_core.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./stroke.js').Snap} Snap */
+/** @typedef {import('./layers.js').Layer} Layer */
 
 export class App {
   /** @param {WasmHeap|null} [heap] core SIMD; null = rasterizer JS */
   constructor(heap = null) {
     this.canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('paint'));
+    this.planesEl = document.getElementById('planes');
+    this.gridEl = document.getElementById('grid');
     this.camera = new Camera();
     this.heap = heap;
-    this.docStore = new ChunkStore('doc', heap);
+
+    // Tutti gli store con pixel in memoria wasm, anche quelli dei livelli
+    // eliminati che vivono solo nello stack di undo: memory.grow stacca il
+    // buffer e OGNI vista va rigenerata.
+    /** @type {Set<ChunkStore>} */
+    this._allStores = new Set();
+
+    this.layerMgr = new LayerManager();
+    const first = makeRasterLayer('Livello 1', heap);
+    this.layerMgr.insert(first);
+    this._allStores.add(first.store);
+
     this.strokeStore = new ChunkStore('stroke', heap);
+    this._allStores.add(this.strokeStore);
     this.stampCache = new StampCache(160, heap);
     if (heap) {
-      // memory.grow stacca il buffer: ogni vista va rigenerata subito
       heap.onGrow = () => {
-        this.docStore.refreshViews();
-        this.strokeStore.refreshViews();
+        for (const s of this._allStores) s.refreshViews();
         this.stampCache.refreshViews();
       };
     }
@@ -40,7 +56,6 @@ export class App {
     this.engine = new StrokeEngine(this.queue);
     this.raster = new Rasterizer(this.strokeStore, this.stampCache, heap);
     this.hud = new Hud();
-    this.textLayer = new TextLayer();
 
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
     // può far lampeggiare il tratto (frame presentati fuori sincrono).
@@ -53,23 +68,38 @@ export class App {
     let renderer = new GLRenderer(this.canvas, { desynchronized: desync });
     if (!renderer.ok) renderer = new Canvas2DRenderer(this.canvas);
     this.renderer = renderer;
-    renderer.trackStores(this.docStore, this.strokeStore);
+    renderer.trackStores(() => [...this._allStores]);
 
-    this.undoMgr = new UndoManager(() => this.ui.updateUndoButtons(this.undoMgr));
+    this.planes = new Planes(this.planesEl, this.gridEl);
+
+    this.undoMgr = new UndoManager(
+      () => this.ui.updateUndoButtons(this.undoMgr),
+      // un'entry esce per sempre dagli stack: se possiede un livello
+      // eliminato, qui muore davvero (texture + slot wasm + pool)
+      (e) => {
+        if (e.op === 'detach' && e.layer && e.layer.store) {
+          e.layer.store.destroy((c) => this.renderer.disposeChunkTex(c));
+          this._allStores.delete(e.layer.store);
+        }
+      });
 
     // budget raster adattivo (px toccati per frame), target ~6 ms
     this.budgetPx = 1_500_000;
     this.strokeLive = false;      // c'è uno stroke non ancora compositato
     this.pendingCommit = false;   // pointer-up ricevuto: commit quando la coda è vuota
-    /** @type {{chunks: Chunk[], index: number, snap: Snap|null}|null} */
-    this.commitJob = null;        // commit incrementale: {chunks, index, snap}
+    this._strokeLayerId = 0;      // livello di destinazione del tratto in corso
+    /** @type {{chunks: Chunk[], index: number, snap: Snap|null, store: ChunkStore, layerId: number}|null} */
+    this.commitJob = null;        // commit incrementale spalmato sui frame
     this.COMMIT_CHUNKS_PER_FRAME = 24;
 
-    this.input = new InputManager(this.canvas, this.camera, {
+    // l'input vive sul CONTAINER dei piani: sopravvive alla sostituzione del
+    // canvas (toggle desync) e i piani figli sono pointer-events: none
+    this.input = new InputManager(this.planesEl, this.camera, {
       isPanTool: () => brush.tool === 'pan',
       onStrokeStart: (x, y, p, t) => this.startStroke(x, y, p, t),
-      onStrokePoint: (x, y, p, t) => this.engine.move(x, y, p, t),
+      onStrokePoint: (x, y, p, t) => { if (this.strokeLive) this.engine.move(x, y, p, t); },
       onStrokeEnd: (x, y, p, t) => {
+        if (!this.strokeLive) return;
         this.engine.end(x, y, p, t);
         if (this.engine.endPassNeeded) this._endPass();
         this.pendingCommit = true;
@@ -127,10 +157,79 @@ export class App {
     const dpr = Math.min(3, window.devicePixelRatio || 1);
     this.camera.resize(w, h, dpr);
     this.renderer.resize(w, h, dpr);
+    this.planes.resize(w, h, dpr);
   }
+
+  // ---- livelli (operazioni annullabili) ----
+
+  // Inserisce sopra il livello attivo e registra l'undo.
+  /** @param {Layer} layer */
+  addLayer(layer) {
+    if (!this.layerMgr.canAdd) return false;
+    const index = this.layerMgr.insert(layer);
+    if (layer.store) this._allStores.add(layer.store);
+    this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'attach', layerId: layer.id, index }));
+    this.ui.layersUI.sync();
+    this.ui.layersUI.scheduleThumbs();
+    return true;
+  }
+
+  /** @param {number} id */
+  deleteLayer(id) {
+    const d = this.layerMgr.detach(id);
+    if (!d) return;
+    // i pixel CPU restano (per l'undo); texture e canvas-chunk si liberano
+    if (d.layer.store) {
+      d.layer.store.forEachChunkAll((c) => {
+        this.renderer.disposeChunkTex(c);
+        c.c2d = null;
+        c.texDirty = true;
+      });
+    }
+    this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'detach', layer: d.layer, index: d.index }));
+    this.ui.layersUI.sync();
+  }
+
+  /** @param {number} from @param {number} to */
+  moveLayerUndoable(from, to) {
+    if (from === to) return;
+    this.layerMgr.move(from, to);
+    this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'move', from, to }));
+    this.ui.layersUI.sync();
+  }
+
+  // Host delle operazioni di undo: risolve gli store e applica la struttura.
+  _undoHost() {
+    return {
+      /** @param {number} layerId */
+      storeFor: (layerId) => {
+        const l = this.layerMgr.byId(layerId);
+        if (!l || !l.store) return null;
+        l.thumbDirty = true;
+        return l.store;
+      },
+      /** @param {Chunk} c */
+      disposeTex: (c) => this.renderer.disposeChunkTex(c),
+      /** @param {Layer} layer @param {number} index */
+      attachLayer: (layer, index) => {
+        this.layerMgr.insert(layer, index);
+        if (layer.store) this._allStores.add(layer.store);
+        if (layer.kind === 'text') layer.styleDirty = true;
+        layer.thumbDirty = true;
+      },
+      /** @param {number} id */
+      detachLayer: (id) => this.layerMgr.detach(id),
+      /** @param {number} from @param {number} to */
+      moveLayer: (from, to) => this.layerMgr.move(from, to),
+    };
+  }
+
+  // ---- stroke ----
 
   /** @param {number} x @param {number} y @param {number} p @param {number} t */
   startStroke(x, y, p, t) {
+    const target = this.layerMgr.paintTarget;
+    if (!target) return; // attivo non dipingibile (testo/nascosto): ignora
     // chiudi del tutto l'eventuale tratto precedente: drena la sua coda
     // (col suo snapshot), poi completa il commit in modo sincrono
     if (this.strokeLive) {
@@ -138,6 +237,7 @@ export class App {
       if (this.pendingCommit) this._beginCommit();
     }
     if (this.commitJob) this._runCommit(Infinity);
+    this._strokeLayerId = target.id;
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
     this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom);
     this.raster.beginStroke(this.engine.snap);
@@ -169,11 +269,19 @@ export class App {
     this.raster.run(this.queue, Infinity);
   }
 
-  // Avvia il commit incrementale: composito sul layer spalmato sui frame.
+  // Avvia il commit incrementale: composito sul livello spalmato sui frame.
   // Ogni chunk committato esce subito dallo stroke buffer, quindi il render
   // resta corretto chunk per chunk (mai doppia applicazione).
   _beginCommit() {
     this.pendingCommit = false;
+    const layer = this.layerMgr.byId(this._strokeLayerId);
+    if (!layer || !layer.store) {
+      // il livello è stato eliminato durante il tratto: il tratto muore
+      this.queue.clear();
+      this._dropStrokeBuffer();
+      this.strokeLive = false;
+      return;
+    }
     /** @type {Chunk[]} */
     const touched = [];
     for (const sc of this.strokeStore.map.values()) {
@@ -185,8 +293,8 @@ export class App {
       this.strokeLive = false;
       return;
     }
-    this.undoMgr.captureBegin();
-    this.commitJob = { chunks: touched, index: 0, snap: this.raster.snap };
+    this.undoMgr.captureBegin(layer.id);
+    this.commitJob = { chunks: touched, index: 0, snap: this.raster.snap, store: layer.store, layerId: layer.id };
   }
 
   /** @param {number} maxChunks */
@@ -198,7 +306,7 @@ export class App {
     let n = 0;
     while (job.index < job.chunks.length && n < maxChunks) {
       const sc = job.chunks[job.index++];
-      commitChunk(this.docStore, sc, job.snap,
+      commitChunk(job.store, sc, job.snap,
         (key, cx, cy, before) => this.undoMgr.captureChunk(key, cx, cy, before),
         this.heap);
       this.strokeStore.remove(sc.key, dispose);
@@ -209,25 +317,44 @@ export class App {
       this.undoMgr.captureEnd();
       this._dropStrokeBuffer(); // residui (non touched) e dirty set
       this.strokeLive = false;
+      this.layerMgr.noteContent(job.layerId);
+      this.ui.layersUI.scheduleThumbs();
     }
   }
 
   async undo() {
     if (this.strokeLive || this.commitJob) return;
-    await this.undoMgr.undo(this.docStore, (c) => this.renderer.disposeChunkTex(c));
+    await this.undoMgr.undo(this._undoHost());
+    this.planes.invalidate();
+    this.ui.layersUI.sync();
+    this.ui.layersUI.scheduleThumbs();
   }
 
   async redo() {
     if (this.strokeLive || this.commitJob) return;
-    await this.undoMgr.redo(this.docStore, (c) => this.renderer.disposeChunkTex(c));
+    await this.undoMgr.redo(this._undoHost());
+    this.planes.invalidate();
+    this.ui.layersUI.sync();
+    this.ui.layersUI.scheduleThumbs();
   }
 
   clearAll() {
     this.commitJob = null;
     this.cancelStroke();
-    this.docStore.releaseAll((c) => this.renderer.disposeChunkTex(c), true);
-    this.textLayer.clear();
+    for (const l of this.layerMgr.layers) {
+      if (l.store) {
+        l.store.destroy((c) => this.renderer.disposeChunkTex(c));
+        this._allStores.delete(l.store);
+      }
+    }
+    this.layerMgr.layers.length = 0;
+    const first = makeRasterLayer('Livello 1', this.heap);
+    this.layerMgr.insert(first);
+    this._allStores.add(first.store);
     this.undoMgr.clear();
+    this.planes.invalidate();
+    this.ui.layersUI.sync();
+    this.ui.layersUI.scheduleThumbs();
   }
 
   // Cambia la modalità di presentazione. Gli attributi di un contesto WebGL
@@ -246,20 +373,20 @@ export class App {
     const fresh = /** @type {HTMLCanvasElement} */ (this.canvas.cloneNode(false));
     this.canvas.replaceWith(fresh);
     this.canvas = fresh;
-    this.input.rebind(fresh);
 
     // texture/canvas dei chunk appartengono al contesto morto
-    this.docStore.dropRendererResources();
-    this.strokeStore.dropRendererResources();
-    this.docStore.dirty.clear();
-    this.strokeStore.dirty.clear();
+    for (const s of this._allStores) {
+      s.dropRendererResources();
+      s.dirty.clear();
+    }
 
     /** @type {GLRenderer | Canvas2DRenderer} */
     let renderer = new GLRenderer(fresh, { desynchronized: this.desync });
     if (!renderer.ok) renderer = new Canvas2DRenderer(fresh);
     this.renderer = renderer;
-    renderer.trackStores(this.docStore, this.strokeStore);
+    renderer.trackStores(() => [...this._allStores]);
     this.stats.renderer = renderer.kind;
+    this.layerMgr.bump(); // i piani reinseriscono il canvas nuovo
     this._resize();
   }
 
@@ -295,20 +422,19 @@ export class App {
     if (this.commitJob) this._runCommit(this.COMMIT_CHUNKS_PER_FRAME);
     const t2b = performance.now();
 
-    // 4. upload dei soli tile sporchi
-    this.renderer.uploadDirty(this.docStore);
-    this.renderer.uploadDirty(this.strokeStore);
-    const t3 = performance.now();
-
-    // 5. present (il livello testo è un overlay SVG: qui si aggiorna solo il
-    // suo viewBox quando la camera cambia, il paint vettoriale lo fa il browser)
-    this.textLayer.update(this.camera);
+    // 4+5. upload dei tile sporchi e present, piano per piano
     const snap = this.raster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
-    this.renderer.render(this.camera, this.docStore, this.strokeStore, liveOpacity, liveEraser);
-    // VRAM limitata: eviction delle texture fuori schermo (riupload on-demand)
-    this.renderer.evict(this.docStore, this.camera, 1024);
+    const pres = this.planes.render({
+      camera: this.camera, mgr: this.layerMgr, strokeStore: this.strokeStore,
+      liveOpacity, eraserLive: liveEraser,
+      bottom: this.renderer, bottomCanvas: this.canvas,
+    });
+    // VRAM limitata: eviction delle texture fuori schermo (riupload on-demand).
+    // I chunk dei piani 2D hanno tex nulla: il loop li salta da solo.
+    this.renderer.evict(this.layerMgr.rasterStores(), this.camera, 1024);
+    this.planes.evict(this.camera);
     const t4 = performance.now();
 
     // budget adattivo: tiene il raster sotto ~6 ms anche su hardware lento
@@ -326,18 +452,20 @@ export class App {
     stats.timings.raster = rasterMs;
     stats.timings.tex = texMs;
     stats.timings.commit = t2b - t2;
-    stats.timings.upload = t3 - t2b;
-    stats.timings.draw = t4 - t3;
+    stats.timings.upload = pres.uploadMs;
+    stats.timings.draw = pres.drawMs;
     stats.texDabs = texDabs;
     stats.budgetPx = this.budgetPx;
     stats.rasterPx = rasterPx;
     stats.queueDepth = this.queue.count;
     stats.dabsFrame = this.raster.lastDabs;
     stats.eventsPerSec = this.input.eventsPerSec;
-    stats.docChunks = this.docStore.count;
+    let docChunks = 0, cpuBytes = this.strokeStore.cpuBytes;
+    for (const s of this.layerMgr.rasterStores()) { docChunks += s.count; cpuBytes += s.cpuBytes; }
+    stats.docChunks = docChunks;
     stats.strokeChunks = this.strokeStore.count;
-    stats.cpuBytes = this.docStore.cpuBytes + this.strokeStore.cpuBytes;
-    stats.gpuBytes = this.renderer.gpuBytes;
+    stats.cpuBytes = cpuBytes;
+    stats.gpuBytes = this.renderer.gpuBytes + this.planes.gpuBytes;
     stats.undoCount = this.undoMgr.undoStack.length;
     stats.undoBytes = this.undoMgr.storedBytes;
     stats.stampCache = this.stampCache.map.size;
@@ -347,6 +475,7 @@ export class App {
     stats.contextLost = this.renderer.contextLost;
     this.hud.update(stats);
 
+    this.ui.layersUI.sync();
     this.ui.updateCursor(this.input, this.camera);
     this.ui.updateZoomLabel(this.camera.zoom);
 

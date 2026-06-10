@@ -1,9 +1,12 @@
-// Pannello Testo — laterale destro, non modale: si regola lo stile vedendo
-// il risultato live sul canvas. Stesse classi di riga del Brush Studio.
+// Pannello Testo — laterale destro, non modale: edita lo stile del livello
+// testo SELEZIONATO vedendo il risultato live. Il bottone Testo in toolbar
+// crea ogni volta un NUOVO livello testo sopra quello attivo.
 
-import { TEXT_FONTS, ensureFont } from './text_layer.js';
+import { TEXT_FONTS, ensureFont, defaultTextStyle, makeTextItem } from './text_layer.js';
+import { makeTextLayer } from './layers.js';
 
 /** @typedef {import('./main.js').App} App */
+/** @typedef {import('./layers.js').Layer} Layer */
 
 export class TextUI {
   /** @param {App} app */
@@ -17,22 +20,34 @@ export class TextUI {
     document.getElementById('tp-close').addEventListener('click', () => this.open(false));
   }
 
-  get layer() { return this.app.textLayer; }
+  // Livello testo in editing: quello attivo, se è un testo.
+  /** @returns {Layer|null} */
+  get layer() {
+    const l = this.app.layerMgr.active;
+    return l && l.kind === 'text' ? l : null;
+  }
 
-  // Click sul bottone Testo: il testo appare centrato nella vista corrente,
-  // largo ~80% dello schermo a qualunque zoom (M1M4.COM ≈ 5.7 em di larghezza).
+  // Bottone Testo: nuovo livello testo centrato nella vista corrente,
+  // largo ~80% dello schermo a qualunque zoom (M1M4.COM ≈ 5.7 em).
   placeAtView() {
-    const cam = this.app.camera;
+    const app = this.app;
+    if (!app.layerMgr.canAdd) { alert('Massimo numero di livelli raggiunto.'); return; }
+    const cam = app.camera;
     const fill = /** @type {HTMLInputElement} */ (document.getElementById('color')).value;
     const size = Math.max(8, (cam.w / cam.zoom) * 0.8 / 5.7);
-    this.layer.place(cam.x, cam.y, fill, size);
+    const item = makeTextItem(cam.x, cam.y, fill, size);
+    const layer = makeTextLayer('Testo', item, defaultTextStyle());
+    app.addLayer(layer);
+    ensureFont(layer.style.font, layer.style.weight);
     this.open(true);
   }
 
   /** @param {boolean} v */
   open(v) {
+    if (v && !this.layer) return; // niente livello testo selezionato
     this.panel.classList.toggle('open', v);
     if (!v) return;
+    this.app.ui.layersUI.open(false); // un pannello alla volta sul lato destro
     for (const f of this._sync) f();
     if (!this._fontsKicked) {
       // pre-carica tutta la lista in background: il cambio font è istantaneo
@@ -41,10 +56,29 @@ export class TextUI {
     }
   }
 
+  // Lo stile è cambiato: SVG da risincronizzare + miniatura del pannello.
+  _dirty() {
+    const l = this.layer;
+    if (!l) return;
+    l.styleDirty = true;
+    l.thumbDirty = true;
+    this.app.ui.layersUI.scheduleThumbs();
+  }
+
   _build() {
     const body = document.getElementById('tp-body');
-    const st = this.layer.style; // identità stabile: mai sostituito
-    const dirty = () => { this.layer.styleDirty = true; };
+    /** @type {(fn: (st: import('./text_layer.js').TextStyle) => void) => void} */
+    const withStyle = (fn) => {
+      const l = this.layer;
+      if (!l) return;
+      fn(l.style);
+      this._dirty();
+    };
+    /** @type {<T>(fn: (st: import('./text_layer.js').TextStyle) => T, fallback: T) => T} */
+    const readStyle = (fn, fallback) => {
+      const l = this.layer;
+      return l ? fn(l.style) : fallback;
+    };
 
     body.appendChild(this._section('Font'));
     const sel = document.createElement('select');
@@ -56,24 +90,36 @@ export class TextUI {
       o.style.fontFamily = `"${f.family}", sans-serif`;
       sel.appendChild(o);
     }
-    sel.value = st.font;
-    sel.addEventListener('change', () => this.layer.setFont(sel.value));
-    this._sync.push(() => { sel.value = st.font; });
+    sel.addEventListener('change', () => {
+      const def = TEXT_FONTS.find((f) => f.family === sel.value);
+      if (!def) return;
+      withStyle((st) => { st.font = def.family; st.weight = def.weight; });
+      ensureFont(def.family, def.weight);
+    });
+    this._sync.push(() => { sel.value = readStyle((st) => st.font, 'Orbitron'); });
     body.appendChild(sel);
 
     body.appendChild(this._section('Bordo'));
     body.appendChild(this._slider('Spessore', 0, 24, 0.5,
-      () => st.stroke, (v) => { st.stroke = v; dirty(); }, (v) => v.toFixed(1) + ' px'));
+      () => readStyle((st) => st.stroke, 0),
+      (v) => withStyle((st) => { st.stroke = v; }),
+      (v) => v.toFixed(1) + ' px'));
     body.appendChild(this._color('Colore bordo',
-      () => st.strokeColor, (v) => { st.strokeColor = v; dirty(); }));
+      () => readStyle((st) => st.strokeColor, '#ffffff'),
+      (v) => withStyle((st) => { st.strokeColor = v; })));
 
     body.appendChild(this._section('Ombra'));
     body.appendChild(this._slider('Sfocatura', 0, 80, 1,
-      () => st.shadowBlur, (v) => { st.shadowBlur = v; dirty(); }, (v) => v + ' px'));
+      () => readStyle((st) => st.shadowBlur, 0),
+      (v) => withStyle((st) => { st.shadowBlur = v; }),
+      (v) => v + ' px'));
     body.appendChild(this._slider('Distanza', 0, 80, 1,
-      () => st.shadowDist, (v) => { st.shadowDist = v; dirty(); }, (v) => v + ' px'));
+      () => readStyle((st) => st.shadowDist, 0),
+      (v) => withStyle((st) => { st.shadowDist = v; }),
+      (v) => v + ' px'));
     body.appendChild(this._color('Colore ombra',
-      () => st.shadowColor, (v) => { st.shadowColor = v; dirty(); }));
+      () => readStyle((st) => st.shadowColor, '#000000'),
+      (v) => withStyle((st) => { st.shadowColor = v; })));
   }
 
   /** @param {string} title */

@@ -22,7 +22,9 @@ const CAP = 8192;
 export class InputManager {
   // hooks: onStrokeStart(x,y,p), onStrokePoint, onStrokeEnd(x,y,p), onStrokeCancel()
   // isPanTool() -> bool, camera
-  /** @param {HTMLCanvasElement} canvas @param {Camera} camera @param {InputHooks} hooks */
+  // Il bersaglio è il CONTAINER dei piani (i piani figli sono pointer-events:
+  // none): sopravvive alla sostituzione del canvas WebGL (toggle desync).
+  /** @param {HTMLElement} canvas @param {Camera} camera @param {InputHooks} hooks */
   constructor(canvas, camera, hooks) {
     this.canvas = canvas;
     this.camera = camera;
@@ -85,10 +87,9 @@ export class InputManager {
     this._evCount++;
   }
 
-  // Il canvas viene sostituito quando si ricrea il contesto WebGL (toggle
-  // desynchronized): si riallacciano i listener e si chiude pulito lo stato
-  // attivo (un eventuale tratto in corso viene cancellato via EV_CANCEL).
-  /** @param {HTMLCanvasElement} canvas */
+  // Il bersaglio viene sostituito: si riallacciano i listener e si chiude
+  // pulito lo stato attivo (un tratto in corso viene cancellato via EV_CANCEL).
+  /** @param {HTMLElement} canvas */
   rebind(canvas) {
     this.canvas = canvas;
     if (this.drawingId !== -1) this._push(EV_CANCEL, this.drawingId, 0, 0, 0, 0, 0, performance.now());

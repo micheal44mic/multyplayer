@@ -26,26 +26,30 @@ html, body {
   -webkit-touch-callout: none; /* niente lente/callout iOS al long-press */
 }
 
-#paint {
+/* container dei piani: riceve TUTTO l'input; i piani figli sono inerti */
+#planes {
   position: fixed;
   inset: 0;
-  width: 100%;
-  height: 100%;
+  background: #ffffff;
   touch-action: none;
   cursor: crosshair;
-  display: block;
 }
-#paint.panning { cursor: grab; }
-#paint.panning:active { cursor: grabbing; }
+#planes.panning { cursor: grab; }
+#planes.panning:active { cursor: grabbing; }
 
-/* livello testo vettoriale: SVG sopra il canvas, sotto cursore e UI */
-#textsvg {
-  position: fixed;
+#planes > * {
+  position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   pointer-events: none;
-  z-index: 4;
+  display: block;
+}
+
+/* griglia di puntini zoom-aware (era nello shader: il canvas ora è trasparente) */
+#grid {
+  background-image: radial-gradient(circle, #404554 1.5px, transparent 2.2px);
+  opacity: 0.16;
 }
 
 #cursor {
@@ -449,6 +453,150 @@ html, body {
 .p-toggle .knob:has(~ *) { }
 .p-toggle input:checked + .knob::after { left: 20px; }
 .p-toggle .p-hint { display: block; font-size: 11px; color: var(--ui-dim); }
+
+/* ---------- pannello livelli (laterale destro, non modale) ---------- */
+#layerspanel {
+  position: fixed;
+  right: 8px;
+  top: calc(max(8px, env(safe-area-inset-top)) + 58px);
+  bottom: max(8px, env(safe-area-inset-bottom));
+  width: min(300px, calc(100vw - 16px));
+  display: flex;
+  flex-direction: column;
+  background: var(--ui-bg);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--ui-line);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+  z-index: 23;
+  transform: translateX(calc(100% + 16px));
+  transition: transform 0.2s ease;
+  pointer-events: none;
+}
+#layerspanel.open { transform: translateX(0); pointer-events: auto; }
+
+#ly-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 8px 8px 16px;
+  font-weight: 600;
+  flex: none;
+}
+.ly-actions { display: flex; gap: 2px; }
+.ly-actions .tb-btn { min-width: 30px; height: 30px; font-size: 15px; }
+
+#ly-opacity { flex: none; margin: 0 16px 8px; }
+
+#ly-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+}
+
+.ly-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid transparent;
+  cursor: pointer;
+  user-select: none;
+}
+.ly-row.selected { border-color: var(--accent); background: rgba(79, 140, 255, 0.14); }
+.ly-row.dragging { position: relative; z-index: 2; opacity: 0.92; box-shadow: var(--shadow); }
+
+.ly-handle {
+  flex: none;
+  width: 22px;
+  text-align: center;
+  color: var(--ui-dim);
+  font-size: 15px;
+  cursor: grab;
+  touch-action: none;
+}
+.ly-row.dragging .ly-handle { cursor: grabbing; }
+
+.ly-thumb {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  border-radius: 8px;
+  border: 1px solid var(--ui-line);
+  background:
+    repeating-conic-gradient(#d8d8de 0% 25%, #ffffff 0% 50%) 0 0 / 12px 12px;
+}
+
+.ly-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ly-btns { display: flex; gap: 2px; flex: none; }
+.ly-mini {
+  border: none;
+  border-radius: 7px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ly-mini:hover { background: rgba(255, 255, 255, 0.16); }
+.ly-mini.off { opacity: 0.4; }
+
+/* frecce su/giù impilate in colonna a fine riga */
+.ly-updown {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: none;
+}
+.ly-arrow {
+  border: none;
+  border-radius: 6px;
+  width: 24px;
+  height: 19px;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ui-fg);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ly-arrow svg { width: 14px; height: 14px; fill: currentColor; }
+.ly-arrow:hover { background: rgba(255, 255, 255, 0.18); }
+.ly-arrow:disabled { opacity: 0.25; cursor: default; }
+.ly-arrow:disabled:hover { background: rgba(255, 255, 255, 0.08); }
+
+@media (max-width: 640px) {
+  #layerspanel {
+    left: 0;
+    right: 0;
+    top: auto;
+    bottom: 0;
+    width: auto;
+    max-height: 48vh;
+    border-radius: 16px 16px 0 0;
+    transform: translateY(110%);
+  }
+  #layerspanel.open { transform: translateY(0); }
+}
 
 /* ---------- pannello testo (laterale destro, non modale) ---------- */
 #textpanel {

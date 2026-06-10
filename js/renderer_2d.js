@@ -1,13 +1,16 @@
-// Fallback Canvas2D dietro la stessa interfaccia del renderer WebGL.
-// Ogni chunk ha un piccolo canvas; putImageData solo sui chunk sporchi.
-// I dati sono premultiplied, ImageData vuole straight alpha: si de-premoltiplica
-// in upload (è un fallback: correttezza prima di tutto).
+// Renderer Canvas2D dietro la stessa interfaccia del renderer WebGL.
+// Due ruoli: fallback completo quando WebGL manca, e renderer dei gruppi
+// raster SOPRA un livello testo (piani 2D del sandwich). Ogni chunk ha un
+// piccolo canvas; putImageData solo sui chunk sporchi. I dati sono
+// premultiplied, ImageData vuole straight alpha: si de-premoltiplica in
+// upload (pochi chunk per frame, solo quelli toccati).
 
 import { CHUNK } from './store.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
 /** @typedef {import('./camera.js').Camera} Camera */
+/** @typedef {import('./layers.js').Layer} Layer */
 
 export class Canvas2DRenderer {
   /** @param {HTMLCanvasElement} canvas */
@@ -21,6 +24,10 @@ export class Canvas2DRenderer {
     this.ctx = canvas.getContext('2d');
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
     this._img = new ImageData(CHUNK, CHUNK);
+    // scratch per la gomma live: chunk del livello attivo - maschera stroke,
+    // composto fuori dal canvas principale per non bucare i livelli sotto
+    /** @type {HTMLCanvasElement|null} */
+    this._scratch = null;
   }
 
   /** @param {number} wCss @param {number} hCss @param {number} dpr */
@@ -32,8 +39,8 @@ export class Canvas2DRenderer {
     }
   }
 
-  /** @param {...ChunkStore} _stores */
-  trackStores(..._stores) {}
+  /** @param {() => ChunkStore[]} _fn */
+  trackStores(_fn) {}
 
   /** @param {ChunkStore} store */
   uploadDirty(store) {
@@ -78,31 +85,35 @@ export class Canvas2DRenderer {
     this.uploadsThisFrame++;
   }
 
-  /** @param {ChunkStore} docStore @param {Camera} camera @param {number} [maxTex] */
-  evict(docStore, camera, maxTex = 1024) {
+  /** @param {ChunkStore[]} stores @param {Camera} camera @param {number} [maxTex] */
+  evict(stores, camera, maxTex = 1024) {
     if (this.texCount <= maxTex) return;
     const r = camera.visibleRect(this._rect);
     const cx0 = Math.floor(r.x0 / CHUNK), cy0 = Math.floor(r.y0 / CHUNK);
     const cx1 = Math.floor(r.x1 / CHUNK), cy1 = Math.floor(r.y1 / CHUNK);
-    for (const chunk of docStore.map.values()) {
-      if (this.texCount <= maxTex) break;
-      if (chunk.cx >= cx0 && chunk.cx <= cx1 && chunk.cy >= cy0 && chunk.cy <= cy1) continue;
-      if (chunk.c2d) { chunk.c2d = null; chunk.texDirty = true; this.texCount--; }
+    for (const store of stores) {
+      for (const chunk of store.map.values()) {
+        if (this.texCount <= maxTex) return;
+        if (chunk.cx >= cx0 && chunk.cx <= cx1 && chunk.cy >= cy0 && chunk.cy <= cy1) continue;
+        if (chunk.c2d) { chunk.c2d = null; chunk.texDirty = true; this.texCount--; }
+      }
     }
   }
 
   /**
-   * @param {Camera} camera @param {ChunkStore} docStore @param {ChunkStore} strokeStore
-   * @param {number} strokeOpacity @param {boolean} eraserLive
+   * Disegna i livelli raster del gruppo dal basso verso l'alto (opacità per
+   * livello, stroke live sopra il livello attivo, gomma via scratch).
+   * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
+   * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
    */
-  render(camera, docStore, strokeStore, strokeOpacity, eraserLive) {
+  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive) {
     const ctx = this.ctx;
     const dpr = camera.dpr;
     this.uploadsThisFrame = 0;
 
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    // piano trasparente: griglia CSS e piani sottostanti restano visibili
+    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
     // mondo -> schermo device
     ctx.setTransform(
@@ -118,25 +129,71 @@ export class Canvas2DRenderer {
     const cx0 = Math.floor(r.x0 / CHUNK), cy0 = Math.floor(r.y0 / CHUNK);
     const cx1 = Math.floor(r.x1 / CHUNK), cy1 = Math.floor(r.y1 / CHUNK);
 
-    for (const chunk of docStore.map.values()) {
+    for (const layer of layers) {
+      if (layer.kind !== 'raster' || !layer.visible || layer.opacity <= 0) continue;
+      const live = layer.id === activeId && strokeStore && strokeStore.map.size > 0;
+      if (live && eraserLive) {
+        this._drawErase(ctx, layer, strokeStore, strokeOpacity, cx0, cy0, cx1, cy1);
+        continue;
+      }
+      ctx.globalAlpha = layer.opacity;
+      this._drawStore(ctx, layer.store, cx0, cy0, cx1, cy1);
+      if (live) {
+        ctx.globalAlpha = strokeOpacity * layer.opacity;
+        this._drawStore(ctx, strokeStore, cx0, cy0, cx1, cy1);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  /**
+   * @param {CanvasRenderingContext2D} ctx @param {ChunkStore} store
+   * @param {number} cx0 @param {number} cy0 @param {number} cx1 @param {number} cy1
+   */
+  _drawStore(ctx, store, cx0, cy0, cx1, cy1) {
+    for (const chunk of store.map.values()) {
       if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
       if (!chunk.c2d || chunk.texDirty) this._uploadNow(chunk);
       ctx.drawImage(chunk.c2d, chunk.cx * CHUNK, chunk.cy * CHUNK);
     }
+  }
 
-    if (strokeStore.map.size > 0) {
-      ctx.globalAlpha = strokeOpacity;
-      // nota: destination-out qui taglierebbe anche lo sfondo bianco appena
-      // disegnato — visivamente equivalente perché lo sfondo pagina è bianco
-      ctx.globalCompositeOperation = eraserLive ? 'destination-out' : 'source-over';
-      for (const chunk of strokeStore.map.values()) {
-        if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
-        if (!chunk.c2d || chunk.texDirty) this._uploadNow(chunk);
-        ctx.drawImage(chunk.c2d, chunk.cx * CHUNK, chunk.cy * CHUNK);
-      }
-      ctx.globalAlpha = 1;
-      ctx.globalCompositeOperation = 'source-over';
+  // Gomma live: per ogni chunk visibile del livello attivo si compone
+  // (chunk - maschera) in uno scratch e si presenta il risultato — il
+  // destination-out non tocca mai i livelli già disegnati sotto.
+  /**
+   * @param {CanvasRenderingContext2D} ctx @param {Layer} layer
+   * @param {ChunkStore} strokeStore @param {number} strokeOpacity
+   * @param {number} cx0 @param {number} cy0 @param {number} cx1 @param {number} cy1
+   */
+  _drawErase(ctx, layer, strokeStore, strokeOpacity, cx0, cy0, cx1, cy1) {
+    if (!this._scratch) {
+      this._scratch = document.createElement('canvas');
+      this._scratch.width = CHUNK;
+      this._scratch.height = CHUNK;
     }
+    const sctx = this._scratch.getContext('2d');
+    for (const chunk of layer.store.map.values()) {
+      if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
+      if (!chunk.c2d || chunk.texDirty) this._uploadNow(chunk);
+      const sc = strokeStore.getByKey(chunk.key);
+      if (sc && (!sc.c2d || sc.texDirty)) this._uploadNow(sc);
+      sctx.setTransform(1, 0, 0, 1, 0, 0);
+      sctx.globalCompositeOperation = 'source-over';
+      sctx.globalAlpha = 1;
+      sctx.clearRect(0, 0, CHUNK, CHUNK);
+      sctx.drawImage(chunk.c2d, 0, 0);
+      if (sc && sc.c2d) {
+        sctx.globalCompositeOperation = 'destination-out';
+        sctx.globalAlpha = strokeOpacity;
+        sctx.drawImage(sc.c2d, 0, 0);
+        sctx.globalCompositeOperation = 'source-over';
+        sctx.globalAlpha = 1;
+      }
+      ctx.globalAlpha = layer.opacity;
+      ctx.drawImage(this._scratch, chunk.cx * CHUNK, chunk.cy * CHUNK);
+    }
+    ctx.globalAlpha = 1;
   }
 
   dispose() {}

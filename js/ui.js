@@ -8,6 +8,8 @@ import { ZOOM_MIN, ZOOM_MAX } from './camera.js';
 import { BrushPreview } from './brush_preview.js';
 import { textureFromFile, defaultGrainTexture } from './texture.js';
 import { TextUI } from './text_ui.js';
+import { LayersUI } from './layers_ui.js';
+import { shadowCss } from './text_layer.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Tool} Tool */
@@ -167,6 +169,7 @@ export class UI {
     this._toggleSync = [];
     /** @type {(() => void)|null} */
     this._texRefresh = null;
+    this.layersUI = new LayersUI(app);
     this.textUI = new TextUI(app);
     this._buildStudio();
     this._bindToolbar();
@@ -540,12 +543,13 @@ export class UI {
     document.getElementById('btn-clear').addEventListener('click', () => {
       if (confirm('Cancellare tutto il disegno?')) app.clearAll();
     });
-    document.getElementById('btn-export').addEventListener('click', () => exportPng(app.docStore));
+    document.getElementById('btn-export').addEventListener('click', () => exportPng(app.layerMgr));
     document.getElementById('btn-resetview').addEventListener('click', () => app.camera.reset());
     this.zoomOutBtn.addEventListener('click', () => this._zoomBy(0.8));
     this.zoomInBtn.addEventListener('click', () => this._zoomBy(1.25));
     document.getElementById('btn-hud').addEventListener('click', () => app.hud.toggle());
     document.getElementById('btn-text').addEventListener('click', () => this.textUI.placeAtView());
+    document.getElementById('btn-layers').addEventListener('click', () => this.layersUI.toggle());
     document.getElementById('btn-panel').addEventListener('click', () => this.toggleStudio());
   }
 
@@ -561,7 +565,7 @@ export class UI {
     for (const [id, t] of [['tool-brush', 'brush'], ['tool-eraser', 'eraser'], ['tool-pan', 'pan']]) {
       document.getElementById(id).classList.toggle('active', t === tool);
     }
-    this.app.canvas.classList.toggle('panning', tool === 'pan');
+    this.app.planesEl.classList.toggle('panning', tool === 'pan');
   }
 
   /** @param {string} hex */
@@ -597,7 +601,8 @@ export class UI {
       else if (k === 'h') this.setTool('pan');
       else if (k === 'p') this.toggleStudio();
       else if (k === 't') this.textUI.placeAtView();
-      else if (k === 'escape') { this.toggleStudio(false); this.textUI.open(false); }
+      else if (k === 'l') this.layersUI.toggle();
+      else if (k === 'escape') { this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); }
       else if (k === '`' || k === '\\') app.hud.toggle();
       else if (k === '0') app.camera.reset();
       else if (k === '[') { brush.size = stepSize(brush.size, -1); this.syncSliders(); this._settingChanged(); }
@@ -636,26 +641,47 @@ export class UI {
   }
 }
 
-// Export PNG: bounding box dei chunk non vuoti, compositato su bianco.
-/** @param {ChunkStore} docStore */
-export function exportPng(docStore) {
-  let cx0 = Infinity, cy0 = Infinity, cx1 = -Infinity, cy1 = -Infinity;
+// Export PNG: tutti i livelli visibili compositati in ordine su bianco —
+// raster con la loro opacità, testo ridisegnato come vettore (bordo+ombra)
+// alla risoluzione del documento. Bbox = chunk non vuoti ∪ ingombro testi.
+/** @param {import('./layers.js').LayerManager} mgr */
+export function exportPng(mgr) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   let any = false;
-  for (const c of docStore.map.values()) {
-    // un chunk può esistere ma essere tutto trasparente (dopo gomma/undo)
-    let empty = true;
-    const d = c.data;
-    for (let o = 3; o < d.length; o += 4) if (d[o] !== 0) { empty = false; break; }
-    if (empty) continue;
-    any = true;
-    if (c.cx < cx0) cx0 = c.cx;
-    if (c.cy < cy0) cy0 = c.cy;
-    if (c.cx > cx1) cx1 = c.cx;
-    if (c.cy > cy1) cy1 = c.cy;
+  const measurer = document.createElement('canvas').getContext('2d');
+
+  for (const layer of mgr.layers) {
+    if (!layer.visible || layer.opacity <= 0) continue;
+    if (layer.kind === 'raster') {
+      for (const c of layer.store.map.values()) {
+        // un chunk può esistere ma essere tutto trasparente (gomma/undo)
+        let empty = true;
+        const d = c.data;
+        for (let o = 3; o < d.length; o += 4) if (d[o] !== 0) { empty = false; break; }
+        if (empty) continue;
+        any = true;
+        if (c.cx * CHUNK < x0) x0 = c.cx * CHUNK;
+        if (c.cy * CHUNK < y0) y0 = c.cy * CHUNK;
+        if ((c.cx + 1) * CHUNK > x1) x1 = (c.cx + 1) * CHUNK;
+        if ((c.cy + 1) * CHUNK > y1) y1 = (c.cy + 1) * CHUNK;
+      }
+    } else {
+      const it = layer.item, st = layer.style;
+      measurer.font = `${st.weight} ${it.size}px "${st.font}", sans-serif`;
+      const m = measurer.measureText(it.text);
+      const hw = (m.width / 2) + st.stroke + st.shadowBlur + st.shadowDist + 4;
+      const hh = (it.size * 0.75) + st.stroke + st.shadowBlur + st.shadowDist + 4;
+      any = true;
+      if (it.x - hw < x0) x0 = it.x - hw;
+      if (it.y - hh < y0) y0 = it.y - hh;
+      if (it.x + hw > x1) x1 = it.x + hw;
+      if (it.y + hh > y1) y1 = it.y + hh;
+    }
   }
   if (!any) { alert('Niente da esportare: il canvas è vuoto.'); return; }
 
-  const w = (cx1 - cx0 + 1) * CHUNK, h = (cy1 - cy0 + 1) * CHUNK;
+  x0 = Math.floor(x0); y0 = Math.floor(y0);
+  const w = Math.ceil(x1) - x0, h = Math.ceil(y1) - y0;
   if (w > 16384 || h > 16384) {
     alert(`Disegno troppo esteso per un singolo PNG (${w}×${h}). Limite 16384px per lato.`);
     return;
@@ -667,20 +693,63 @@ export function exportPng(docStore) {
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, w, h);
 
-  const img = ctx.createImageData(CHUNK, CHUNK);
-  for (const c of docStore.map.values()) {
-    if (c.cx < cx0 || c.cx > cx1 || c.cy < cy0 || c.cy > cy1) continue;
-    const s = c.data, d = img.data;
-    // premultiplied su bianco -> opaco: out = c + 255*(1-a)
-    for (let o = 0; o < s.length; o += 4) {
-      const inv = 255 - s[o + 3];
-      d[o] = Math.min(255, s[o] + inv);
-      d[o + 1] = Math.min(255, s[o + 1] + inv);
-      d[o + 2] = Math.min(255, s[o + 2] + inv);
-      d[o + 3] = 255;
+  const tmp = document.createElement('canvas');
+  tmp.width = CHUNK; tmp.height = CHUNK;
+  const tctx = tmp.getContext('2d');
+  const img = tctx.createImageData(CHUNK, CHUNK);
+
+  for (const layer of mgr.layers) {
+    if (!layer.visible || layer.opacity <= 0) continue;
+    ctx.globalAlpha = layer.opacity;
+    if (layer.kind === 'raster') {
+      for (const c of layer.store.map.values()) {
+        const s = c.data, d = img.data;
+        let empty = true;
+        // premultiplied -> straight (composizione via drawImage, non su bianco)
+        for (let o = 0; o < s.length; o += 4) {
+          const a = s[o + 3];
+          if (a === 0) { d[o] = 0; d[o + 1] = 0; d[o + 2] = 0; d[o + 3] = 0; continue; }
+          empty = false;
+          const inv = 255 / a;
+          d[o] = Math.min(255, s[o] * inv);
+          d[o + 1] = Math.min(255, s[o + 1] * inv);
+          d[o + 2] = Math.min(255, s[o + 2] * inv);
+          d[o + 3] = a;
+        }
+        if (empty) continue;
+        tctx.putImageData(img, 0, 0);
+        ctx.drawImage(tmp, c.cx * CHUNK - x0, c.cy * CHUNK - y0);
+      }
+    } else {
+      // stessa resa dell'SVG: bordo sotto il fill, ombra sulla sagoma
+      const it = layer.item, st = layer.style;
+      ctx.font = `${st.weight} ${it.size}px "${st.font}", sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.lineJoin = 'round';
+      const tx = it.x - x0, ty = it.y - y0;
+      if (st.shadowBlur > 0 || st.shadowDist > 0) {
+        ctx.shadowColor = shadowCss(st.shadowColor);
+        ctx.shadowBlur = st.shadowBlur;
+        ctx.shadowOffsetX = st.shadowDist * 0.7071;
+        ctx.shadowOffsetY = st.shadowDist * 0.7071;
+      }
+      if (st.stroke > 0) {
+        ctx.strokeStyle = st.strokeColor;
+        ctx.lineWidth = st.stroke * 2;
+        ctx.strokeText(it.text, tx, ty);
+        ctx.shadowColor = 'rgba(0,0,0,0)';
+        ctx.fillStyle = it.fill;
+        ctx.fillText(it.text, tx, ty);
+      } else {
+        ctx.fillStyle = it.fill;
+        ctx.fillText(it.text, tx, ty);
+        ctx.shadowColor = 'rgba(0,0,0,0)';
+      }
+      ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
     }
-    ctx.putImageData(img, (c.cx - cx0) * CHUNK, (c.cy - cy0) * CHUNK);
   }
+  ctx.globalAlpha = 1;
 
   cnv.toBlob((blob) => {
     const a = document.createElement('a');

@@ -91,6 +91,8 @@ function runStroke(app, cfg, path) {
   app.engine.begin(path[0].x, path[0].y, path[0].p, path[0].t, cfg, undefined, 1);
   app.raster.beginStroke(app.engine.snap);
   app.strokeLive = true;
+  // il bench scavalca startStroke: il commit va indirizzato al livello attivo
+  app._strokeLayerId = app.layerMgr.activeId;
   for (let i = 1; i < path.length - 1; i++) app.engine.move(path[i].x, path[i].y, path[i].p, path[i].t);
   const last = path[path.length - 1];
   app.engine.end(last.x, last.y, last.p, last.t);
@@ -133,7 +135,7 @@ export function runBench(app, reps = 3) {
         runStroke(app, /** @type {Brush} */ ({ ...BASE, ...sc.prep }), makePath(300));
       }
       const r = runStroke(app, cfg, path);
-      if (rep === 0) sum = checksum(app.docStore).toString(16);
+      if (rep === 0) sum = checksum(app.layerMgr.active.store).toString(16);
       if (!best || r.rasterMs < best.rasterMs) best = r;
     }
     results[sc.name] = {
@@ -142,7 +144,7 @@ export function runBench(app, reps = 3) {
       rasterMs: +best.rasterMs.toFixed(2),
       mpxS: +(best.px / 1e6 / (best.rasterMs / 1000)).toFixed(1),
       commitMs: +best.commitMs.toFixed(2),
-      chunks: app.docStore.count,
+      chunks: app.layerMgr.active.store.count,
       checksum: sum,
     };
   }

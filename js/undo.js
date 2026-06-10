@@ -1,11 +1,16 @@
-// UNDO tile-diff. Per ogni stroke salva i chunk "prima" (null = non esisteva).
-// La compressione avviene nel worker, mai nel path del dito.
-// undo/redo sono swap: prima di ripristinare si fotografa lo stato corrente.
+// UNDO tile-diff + operazioni di struttura sui livelli.
+// Per ogni stroke salva i chunk "prima" (null = non esisteva) e il livello
+// su cui è avvenuto. La compressione avviene nel worker, mai nel path del
+// dito. undo/redo sono swap: prima di ripristinare si fotografa lo stato
+// corrente. Le operazioni di struttura (aggiungi/elimina/sposta livello)
+// sono entry leggere; un'eliminazione tiene VIVO il livello dentro l'entry
+// finché questa non esce dallo stack (hook onDrop per liberarlo davvero).
 
 import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
+/** @typedef {import('./layers.js').Layer} Layer */
 
 /**
  * Stato "prima" di un chunk. buf è raw (ArrayBuffer di CHUNK_BYTES) o
@@ -21,11 +26,33 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  */
 
 /**
+ * Entry di stroke (kind 'stroke') o di struttura (kind 'struct').
+ * struct: op 'attach' (il livello è in lista; undo = staccarlo),
+ * op 'detach' (l'entry POSSIEDE il livello; undo = reinserirlo a index),
+ * op 'move' (sposta da from a to; undo = inverso).
  * @typedef {Object} UndoEntry
+ * @property {'stroke'|'struct'} kind
  * @property {UndoChunk[]} chunks
  * @property {number} rawSize
  * @property {boolean} compressed
  * @property {Promise<any>} ready
+ * @property {number} [layerId] stroke: livello di destinazione
+ * @property {'attach'|'detach'|'move'} [op]
+ * @property {Layer} [layer] solo op 'detach'
+ * @property {number} [index] solo op 'attach'/'detach'
+ * @property {number} [from] solo op 'move'
+ * @property {number} [to]
+ */
+
+/**
+ * Chi applica davvero le operazioni: l'App. storeFor risolve il livello di
+ * uno stroke (null = livello sparito, entry da scartare in silenzio).
+ * @typedef {Object} UndoHost
+ * @property {(layerId: number) => ChunkStore|null} storeFor
+ * @property {(c: Chunk) => void} disposeTex
+ * @property {(layer: Layer, index: number) => void} attachLayer
+ * @property {(layerId: number) => {layer: Layer, index: number}|null} detachLayer
+ * @property {(from: number, to: number) => void} moveLayer
  */
 
 const MAX_ENTRIES = 64;
@@ -34,8 +61,8 @@ const MAX_RAW_BYTES = 256 * 1024 * 1024; // budget equivalente non compresso
 let nextMsgId = 1;
 
 export class UndoManager {
-  /** @param {() => void} [onChange] */
-  constructor(onChange) {
+  /** @param {() => void} [onChange] @param {(e: UndoEntry) => void} [onDrop] */
+  constructor(onChange, onDrop) {
     /** @type {UndoEntry[]} */
     this.undoStack = [];
     /** @type {UndoEntry[]} */
@@ -43,6 +70,9 @@ export class UndoManager {
     this.rawBytes = 0;        // somma dei rawSize in stack (per il cap)
     this.storedBytes = 0;     // byte realmente in memoria (compressi o raw)
     this.onChange = onChange || (() => {});
+    // un'entry esce per sempre dagli stack (trim/clear/ramo redo scartato):
+    // se possiede un livello eliminato, qui lo si libera davvero
+    this.onDrop = onDrop || (() => {});
     this.busy = false;        // un'operazione undo/redo alla volta
     /** @type {UndoEntry|null} */
     this._entry = null;
@@ -78,8 +108,9 @@ export class UndoManager {
   }
 
   // ---- cattura (chiamata da commitStroke) ----
-  captureBegin() {
-    this._entry = { chunks: [], rawSize: 0, compressed: false, ready: Promise.resolve() };
+  /** @param {number} layerId */
+  captureBegin(layerId) {
+    this._entry = { kind: 'stroke', layerId, chunks: [], rawSize: 0, compressed: false, ready: Promise.resolve() };
   }
 
   /**
@@ -110,6 +141,23 @@ export class UndoManager {
     this._dropRedo();
     this._trim();
     this._compressEntry(e);
+    this.onChange();
+  }
+
+  // Operazione di struttura già ESEGUITA dal chiamante: qui si registra solo.
+  // detach: l'entry possiede il livello staccato (rawSize = i suoi byte CPU,
+  // così il budget di memoria spinge fuori le eliminazioni vecchie).
+  /** @param {UndoEntry} e */
+  pushStruct(e) {
+    e.kind = 'struct';
+    e.chunks = [];
+    e.compressed = false;
+    e.ready = Promise.resolve();
+    e.rawSize = e.op === 'detach' && e.layer && e.layer.store ? e.layer.store.cpuBytes : 0;
+    this.undoStack.push(e);
+    this.rawBytes += e.rawSize;
+    this._dropRedo();
+    this._trim();
     this.onChange();
   }
 
@@ -161,7 +209,7 @@ export class UndoManager {
   }
 
   _dropRedo() {
-    for (const e of this.redoStack) this._account(e, -1);
+    for (const e of this.redoStack) { this._account(e, -1); this.onDrop(e); }
     this.redoStack.length = 0;
   }
 
@@ -178,19 +226,23 @@ export class UndoManager {
       const e = this.undoStack.shift();
       if (!e) break;
       this._account(e, -1);
+      this.onDrop(e);
     }
   }
 
   // ---- applicazione ----
   // restore scambia lo stato: cattura il "corrente" per la direzione opposta.
-  /** @param {UndoEntry} entry @param {ChunkStore} docStore @param {(c: Chunk) => void} disposeTex */
-  async _apply(entry, docStore, disposeTex) {
+  // Ritorna null se il livello dello stroke non esiste più (entry scartata).
+  /** @param {UndoEntry} entry @param {UndoHost} host @returns {Promise<UndoEntry|null>} */
+  async _apply(entry, host) {
+    const store = host.storeFor(entry.layerId);
+    if (!store) return null;
     await this._materialize(entry);
 
     /** @type {UndoEntry} */
-    const counter = { chunks: [], rawSize: 0, compressed: false, ready: Promise.resolve() };
+    const counter = { kind: 'stroke', layerId: entry.layerId, chunks: [], rawSize: 0, compressed: false, ready: Promise.resolve() };
     for (const c of entry.chunks) {
-      const cur = docStore.getByKey(c.key);
+      const cur = store.getByKey(c.key);
       if (cur) {
         counter.chunks.push({ key: c.key, cx: c.cx, cy: c.cy, existed: true, buf: cur.data.slice().buffer, rawSize: CHUNK_BYTES });
         counter.rawSize += CHUNK_BYTES;
@@ -199,28 +251,63 @@ export class UndoManager {
       }
 
       if (c.existed) {
-        const chunk = docStore.getOrCreate(c.cx, c.cy);
+        const chunk = store.getOrCreate(c.cx, c.cy);
         chunk.data.set(new Uint8ClampedArray(c.buf));
         chunk.touched = true;
-        docStore.markDirty(chunk);
+        store.markDirty(chunk);
       } else {
-        docStore.remove(c.key, disposeTex);
+        store.remove(c.key, host.disposeTex);
       }
     }
     return counter;
   }
 
-  /** @param {ChunkStore} docStore @param {(c: Chunk) => void} disposeTex */
-  async undo(docStore, disposeTex) {
-    if (this.busy || this.undoStack.length === 0) return false;
+  // Esegue l'INVERSO di e; il counter, ri-applicato, esegue l'inverso di sé
+  // (round-trip perfetto). L'ownership del livello passa di mano: dopo un
+  // undo di 'attach' è il counter ('detach') a possederlo.
+  /** @param {UndoEntry} e @param {UndoHost} host @returns {UndoEntry|null} */
+  _applyStruct(e, host) {
+    if (e.op === 'attach') {
+      const d = host.detachLayer(e.layerId);
+      if (!d) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'detach', layer: d.layer, index: d.index,
+        chunks: [], compressed: false, ready: Promise.resolve(),
+        rawSize: d.layer.store ? d.layer.store.cpuBytes : 0,
+      });
+    }
+    if (e.op === 'detach') {
+      host.attachLayer(e.layer, e.index);
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'attach', layerId: e.layer.id, index: e.index,
+        chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
+    if (e.op === 'move') {
+      host.moveLayer(e.to, e.from);
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'move', from: e.to, to: e.from,
+        chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
+    return null;
+  }
+
+  /** @param {UndoEntry[]} fromStack @param {UndoEntry[]} toStack @param {UndoHost} host */
+  async _swap(fromStack, toStack, host) {
+    if (this.busy || fromStack.length === 0) return false;
     this.busy = true;
     try {
-      const e = this.undoStack.pop();
+      const e = fromStack.pop();
       this._account(e, -1);
-      const counter = await this._apply(e, docStore, disposeTex);
-      this.redoStack.push(counter);
-      this._account(counter, +1);
-      this._compressEntry(counter);
+      const counter = e.kind === 'struct'
+        ? this._applyStruct(e, host)
+        : await this._apply(e, host);
+      if (counter) {
+        toStack.push(counter);
+        this._account(counter, +1);
+        if (counter.kind === 'stroke') this._compressEntry(counter);
+      }
     } finally {
       this.busy = false;
       this.onChange();
@@ -228,25 +315,15 @@ export class UndoManager {
     return true;
   }
 
-  /** @param {ChunkStore} docStore @param {(c: Chunk) => void} disposeTex */
-  async redo(docStore, disposeTex) {
-    if (this.busy || this.redoStack.length === 0) return false;
-    this.busy = true;
-    try {
-      const e = this.redoStack.pop();
-      this._account(e, -1);
-      const counter = await this._apply(e, docStore, disposeTex);
-      this.undoStack.push(counter);
-      this._account(counter, +1);
-      this._compressEntry(counter);
-    } finally {
-      this.busy = false;
-      this.onChange();
-    }
-    return true;
-  }
+  /** @param {UndoHost} host */
+  undo(host) { return this._swap(this.undoStack, this.redoStack, host); }
+
+  /** @param {UndoHost} host */
+  redo(host) { return this._swap(this.redoStack, this.undoStack, host); }
 
   clear() {
+    for (const e of this.undoStack) this.onDrop(e);
+    for (const e of this.redoStack) this.onDrop(e);
     this.undoStack.length = 0;
     this.redoStack.length = 0;
     this.rawBytes = 0;

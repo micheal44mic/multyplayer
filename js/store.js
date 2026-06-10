@@ -143,6 +143,31 @@ export class ChunkStore {
     this._release(c, disposeTex, disposeAll);
   }
 
+  // Tutti i chunk, vivi E nel pool (migrazione tra piani, context cleanup).
+  /** @param {(c: Chunk) => void} cb */
+  forEachChunkAll(cb) {
+    for (const c of this.map.values()) cb(c);
+    for (const c of this._pool) cb(c);
+  }
+
+  // Morte definitiva dello store (livello eliminato per sempre): libera
+  // texture, slot wasm e pool — releaseAll non basta, il pool tiene vivi
+  // i buffer per il riuso.
+  /** @param {(c: Chunk) => void} disposeTex */
+  destroy(disposeTex) {
+    for (const c of this.map.values()) {
+      if (disposeTex) disposeTex(c);
+      if (this.heap && c.ptr) this.heap.free(c.ptr, CHUNK_BYTES);
+    }
+    this.map.clear();
+    this.dirty.clear();
+    for (const c of this._pool) {
+      if (disposeTex) disposeTex(c);
+      if (this.heap && c.ptr) this.heap.free(c.ptr, CHUNK_BYTES);
+    }
+    this._pool.length = 0;
+  }
+
   // Il renderer è stato sostituito o il contesto perso: texture e canvas dei
   // chunk — vivi E nel pool — appartengono al contesto morto, vanno dimenticati
   // (mai dispose: i loro handle non sono più validi).
