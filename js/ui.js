@@ -528,7 +528,7 @@ export class UI {
   _bindToolbar() {
     const app = this.app;
     /** @type {Record<string, Tool>} */
-    const tools = { 'tool-eraser': 'eraser', 'tool-pan': 'pan' };
+    const tools = { 'tool-eraser': 'eraser', 'tool-move': 'move', 'tool-pan': 'pan' };
     for (const [id, tool] of Object.entries(tools)) {
       document.getElementById(id).addEventListener('click', () => this.setTool(tool));
     }
@@ -570,10 +570,12 @@ export class UI {
   /** @param {Tool} tool */
   setTool(tool) {
     brush.tool = tool;
-    for (const [id, t] of [['tool-brush', 'brush'], ['tool-eraser', 'eraser'], ['tool-pan', 'pan']]) {
+    for (const [id, t] of [['tool-brush', 'brush'], ['tool-eraser', 'eraser'],
+      ['tool-move', 'move'], ['tool-pan', 'pan']]) {
       document.getElementById(id).classList.toggle('active', t === tool);
     }
     this.app.planesEl.classList.toggle('panning', tool === 'pan');
+    this.app.planesEl.classList.toggle('moving', tool === 'move');
     if (tool !== 'brush') this.presetsUI.open(false);
   }
 
@@ -619,11 +621,15 @@ export class UI {
         else this.setTool('brush');
       }
       else if (k === 'e') this.setTool('eraser');
+      else if (k === 'v') this.setTool('move');
       else if (k === 'h') this.setTool('pan');
       else if (k === 'p') this.toggleStudio();
       else if (k === 't') this.textUI.placeAtView();
       else if (k === 'l') this.layersUI.toggle();
-      else if (k === 'escape') { this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); this.presetsUI.open(false); }
+      else if (k === 'enter') {
+        if (app.transform.pending) { e.preventDefault(); app.transform.confirm(); }
+      }
+      else if (k === 'escape') { app.transform.cancel(); this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); this.presetsUI.open(false); }
       else if (k === '`' || k === '\\') app.hud.toggle();
       else if (k === '0') app.fitActiveBoard();
       else if (k === '[') { brush.size = stepSize(brush.size, -1); this.syncSliders(); this._settingChanged(); }
@@ -638,7 +644,7 @@ export class UI {
   updateCursor(input, camera) {
     const el = this.cursorEl;
     const h = input.hover;
-    const show = h.visible && brush.tool !== 'pan' && !input.gesture;
+    const show = h.visible && brush.tool !== 'pan' && brush.tool !== 'move' && !input.gesture;
     el.style.display = show ? 'block' : 'none';
     if (!show) return;
     const d = Math.max(4, brush.size * camera.zoom);

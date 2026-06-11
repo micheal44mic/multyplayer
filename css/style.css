@@ -37,6 +37,7 @@ html, body {
 }
 #planes.panning { cursor: grab; }
 #planes.panning:active { cursor: grabbing; }
+#planes.moving { cursor: move; }
 
 #planes > * {
   position: absolute;
@@ -141,6 +142,56 @@ html, body {
 #distortgizmo circle:active { cursor: grabbing; }
 #distortgizmo .dg-anchor { fill: #fff; stroke: var(--accent); }
 #distortgizmo .dg-handle { fill: var(--accent); stroke: #fff; }
+
+/* gizmo dello strumento Sposta/Trasforma: stessa filosofia della gabbia —
+   root trasparente ai pointer, maniglie e bottoni catturano */
+#tfgizmo {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 6;
+  display: none;
+  pointer-events: none;
+}
+#tfgizmo .tg-edge {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 6 4;
+  opacity: 0.85;
+}
+#tfgizmo .tg-spoke {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1;
+  opacity: 0.5;
+}
+#tfgizmo circle {
+  pointer-events: auto;
+  touch-action: none;
+  stroke-width: 1.5;
+}
+#tfgizmo .tg-corner { fill: #fff; stroke: var(--accent); cursor: nwse-resize; }
+#tfgizmo .tg-side { fill: #fff; stroke: var(--accent); cursor: move; }
+#tfgizmo .tg-rot { fill: var(--accent); stroke: #fff; cursor: grab; }
+#tfgizmo .tg-rot:active { cursor: grabbing; }
+
+.tg-btn {
+  position: fixed;
+  z-index: 7;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+.tg-ok { background: var(--accent); color: #fff; }
+.tg-no { background: #fff; color: var(--accent); }
 
 /* ---------- popup preset pennello ---------- */
 /* ancorato sotto il bottone Pennello (posizione calcolata da presets_ui.js) */

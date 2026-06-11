@@ -464,7 +464,7 @@ const measurer = document.createElement('canvas').getContext('2d');
 // blur. La larghezza misurata può essere corta se il font non è ancora
 // pronto: il fallback per-carattere tiene il box abbondante.
 /** @param {TextItem} it @param {TextStyle} st */
-function blockBox(it, st) {
+export function blockBox(it, st) {
   const pad = st.shadowBlur * 1.5 + 2;
   // la corsa dell'effetto estende il box solo dal lato verso cui punta
   const { ux, uy } = shadowDir(st);

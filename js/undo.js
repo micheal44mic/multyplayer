@@ -26,24 +26,36 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  */
 
 /**
- * Entry di stroke (kind 'stroke') o di struttura (kind 'struct').
+ * Entry di stroke (kind 'stroke'), di struttura (kind 'struct') o di
+ * traslazione pixel (kind 'move').
  * struct: op 'attach' (il livello è in lista; undo = staccarlo),
  * op 'detach' (l'entry POSSIEDE il livello; undo = reinserirlo a index),
  * op 'move' (sposta da from a to; undo = inverso),
  * op 'replace' (rasterizza testo: l'entry POSSIEDE il livello sostituito,
- * layerId è quello vivo in lista; undo = scambiarli di nuovo).
+ * layerId è quello vivo in lista; undo = scambiarli di nuovo),
+ * op 'textform' (item del testo spostato/scalato: posizione e corpo
+ * prima (x0,y0,s0) e dopo (x1,y1,s1); undo = rimettere i "prima").
+ * move: i pixel del livello layerId sono stati traslati di dx/dy; undo =
+ * traslare all'indietro e ripristinare i chunks (stati "prima" dei chunk
+ * che hanno perso pixel nel clip al board — la traslazione è lossless,
+ * solo il bordo va fotografato).
  * @typedef {Object} UndoEntry
- * @property {'stroke'|'struct'} kind
+ * @property {'stroke'|'struct'|'move'} kind
  * @property {UndoChunk[]} chunks
  * @property {number} rawSize
  * @property {boolean} compressed
  * @property {Promise<any>} ready
- * @property {number} [layerId] stroke: livello di destinazione; replace: livello vivo
- * @property {'attach'|'detach'|'move'|'replace'} [op]
+ * @property {number} [layerId] stroke/move: livello di destinazione; replace: livello vivo
+ * @property {'attach'|'detach'|'move'|'replace'|'textform'} [op]
  * @property {Layer} [layer] solo op 'detach'/'replace'
  * @property {number} [index] solo op 'attach'/'detach'
  * @property {number} [from] solo op 'move'
  * @property {number} [to]
+ * @property {number} [dx] kind 'move'
+ * @property {number} [dy]
+ * @property {number} [x0] op 'textform': item prima/dopo
+ * @property {number} [y0] @property {number} [s0]
+ * @property {number} [x1] @property {number} [y1] @property {number} [s1]
  * @property {number} [boardId] struct: canvas di appartenenza dell'operazione
  */
 
@@ -58,6 +70,8 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * @property {(layer: Layer, index: number, boardId: number) => void} attachLayer
  * @property {(layerId: number) => {layer: Layer, index: number, boardId: number}|null} detachLayer
  * @property {(from: number, to: number, boardId: number) => void} moveLayer
+ * @property {(layerId: number, dx: number, dy: number) => UndoChunk[]|null} translateLayer
+ * @property {(layerId: number, x: number, y: number, size: number) => boolean} setTextForm
  */
 
 const MAX_ENTRIES = 64;
@@ -164,6 +178,23 @@ export class UndoManager {
     this.rawBytes += e.rawSize;
     this._dropRedo();
     this._trim();
+    this.onChange();
+  }
+
+  // Traslazione pixel già ESEGUITA dal chiamante: e.chunks sono gli stati
+  // "prima" dei chunk persi nel clip (vanno compressi come uno stroke).
+  /** @param {UndoEntry} e */
+  pushMove(e) {
+    e.kind = 'move';
+    e.compressed = false;
+    e.ready = Promise.resolve();
+    e.rawSize = e.chunks.reduce((s, c) => s + c.rawSize, 0);
+    this.undoStack.push(e);
+    this.rawBytes += e.rawSize;
+    this.storedBytes += e.rawSize;
+    this._dropRedo();
+    this._trim();
+    this._compressEntry(e);
     this.onChange();
   }
 
@@ -308,7 +339,40 @@ export class UndoManager {
         rawSize: d.layer.store ? d.layer.store.cpuBytes : 0,
       });
     }
+    if (e.op === 'textform') {
+      if (!host.setTextForm(e.layerId, e.x0, e.y0, e.s0)) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'textform', layerId: e.layerId, boardId: e.boardId,
+        x0: e.x1, y0: e.y1, s0: e.s1, x1: e.x0, y1: e.y0, s1: e.s0,
+        chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
     return null;
+  }
+
+  // Inverte una traslazione di pixel: trasla all'indietro (raccogliendo gli
+  // eventuali persi della corsa inversa, di norma nessuno) e ripristina gli
+  // stati "prima" dei chunk che il clip aveva mangiato. Il counter è la
+  // stessa operazione a segno invertito: round-trip perfetto.
+  /** @param {UndoEntry} e @param {UndoHost} host @returns {Promise<UndoEntry|null>} */
+  async _applyMove(e, host) {
+    const store = host.storeFor(e.layerId);
+    if (!store) return null;
+    await this._materialize(e);
+    const lost = host.translateLayer(e.layerId, -e.dx, -e.dy);
+    if (!lost) return null;
+    for (const c of e.chunks) {
+      const chunk = store.getOrCreate(c.cx, c.cy);
+      chunk.data.set(new Uint8ClampedArray(c.buf));
+      chunk.touched = true;
+      store.markDirty(chunk);
+    }
+    return /** @type {UndoEntry} */ ({
+      kind: 'move', layerId: e.layerId, dx: -e.dx, dy: -e.dy,
+      boardId: e.boardId, chunks: lost, compressed: false,
+      ready: Promise.resolve(),
+      rawSize: lost.reduce((s, c) => s + c.rawSize, 0),
+    });
   }
 
   /** @param {UndoEntry[]} fromStack @param {UndoEntry[]} toStack @param {UndoHost} host */
@@ -320,11 +384,13 @@ export class UndoManager {
       this._account(e, -1);
       const counter = e.kind === 'struct'
         ? this._applyStruct(e, host)
-        : await this._apply(e, host);
+        : e.kind === 'move'
+          ? await this._applyMove(e, host)
+          : await this._apply(e, host);
       if (counter) {
         toStack.push(counter);
         this._account(counter, +1);
-        if (counter.kind === 'stroke') this._compressEntry(counter);
+        if (counter.kind !== 'struct') this._compressEntry(counter);
       }
     } finally {
       this.busy = false;

@@ -4,7 +4,7 @@
 
 import { clamp } from './util.js';
 
-/** @typedef {'brush'|'eraser'|'pan'} Tool */
+/** @typedef {'brush'|'eraser'|'move'|'pan'} Tool */
 
 /**
  * @typedef {Object} Brush
@@ -82,7 +82,7 @@ export const brush = {
   textureMoving: false, // false: grana fissa sul canvas (carta); true: segue lo stamp
   textureUseColor: false, // true: il tratto usa i colori della texture, non il colore pennello
   color: { r: 26, g: 26, b: 31 },
-  tool: 'brush',       // 'brush' | 'eraser' | 'pan'
+  tool: 'brush',       // 'brush' | 'eraser' | 'move' | 'pan'
 };
 
 // Falloff radiale condiviso da stamp e capsule: dist in px, r raggio, h durezza.

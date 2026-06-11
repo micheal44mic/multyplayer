@@ -78,6 +78,23 @@ function link(gl, vs, fs) {
   return p;
 }
 
+/**
+ * Sessione dello strumento Sposta/Trasforma: il livello layerId NON si
+ * disegna dai suoi chunk ma come UN SOLO quad — la texture piatta del
+ * contenuto (hull chunk-aligned x,y,w,h, costruita una volta per sessione,
+ * id = timbro) trasformata dall'affine mondo m e clippata al board. Un quad
+ * unico evita le cuciture che il filtro bilineare aprirebbe tra chunk
+ * adiacenti sotto rotazione/scala.
+ * @typedef {Object} TransformFrame
+ * @property {number} id timbro di sessione: cambia = texture da ricostruire
+ * @property {number} layerId
+ * @property {import('./store.js').ChunkStore} store
+ * @property {number} x @property {number} y origine mondo della texture
+ * @property {number} w @property {number} h
+ * @property {number[]} m affine mondo [a,b,c,d,e,f]
+ * @property {{x0:number,y0:number,x1:number,y1:number}} clip
+ */
+
 export class GLRenderer {
   /** @param {HTMLCanvasElement} canvas @param {{desynchronized?: boolean}} [opts] */
   constructor(canvas, opts) {
@@ -159,6 +176,14 @@ export class GLRenderer {
     gl.disable(gl.DEPTH_TEST);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     this.texCount = 0;
+
+    // texture piatta della sessione di trasformazione (vedi TransformFrame):
+    // appartiene al contesto, al restore si dimentica e rinasce on-demand
+    /** @type {WebGLTexture|null} */
+    this._tfTex = null;
+    /** @type {number} */
+    this._tfId = 0;
+    this._tfMat = new Float32Array(9);
 
     // texture 1x1 trasparente per i chunk senza maschera gomma
     this.dummyTex = gl.createTexture();
@@ -312,16 +337,24 @@ export class GLRenderer {
    * I layer nel set proxies.skip non si disegnano: al loro posto ci sono i
    * quad piatti dei board (proxies.quads), uno per board — lo zoom-out non
    * paga più un draw e una texture per ogni chunk.
+   * transform: il livello in sessione Sposta/Trasforma si disegna come quad
+   * unico con la matrice della sessione e scissor sul board — anteprima
+   * fedele del commit, zero pixel mossi (vedi TransformFrame).
    * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
    * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
    * @param {import('./board_proxy.js').ProxyFrame|null} [proxies]
+   * @param {TransformFrame|null} [transform]
    */
-  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive, proxies = null) {
+  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive, proxies = null, transform = null) {
     if (this.contextLost) return;
     const gl = this.gl;
     this.uploadsThisFrame = 0;
     this._wantMips = camera.zoom < 1;
     this._wantNearest = camera.zoom > MAG_NEAREST_ZOOM;
+    // sessione finita o cambiata: la texture piatta vecchia si libera subito
+    if (this._tfTex && (transform === null || transform.id !== this._tfId)) {
+      this._freeTransformTex();
+    }
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     // piano trasparente: la griglia CSS (e i piani sotto) restano visibili
     gl.clearColor(0, 0, 0, 0);
@@ -351,6 +384,25 @@ export class GLRenderer {
     for (const layer of layers) {
       if (layer.kind !== 'raster' || !layer.visible || layer.opacity <= 0) continue;
       if (skip !== null && skip.has(layer.id)) continue;
+      if (transform !== null && transform.layerId === layer.id) {
+        // sessione Sposta/Trasforma: un quad con matrice camera·T
+        this._ensureTransformTex(transform);
+        this._scissorClip(camera, transform.clip);
+        const t = transform.m, cm = camera.matrix(), M = this._tfMat;
+        M[0] = cm[0] * t[0]; M[1] = cm[4] * t[1]; M[2] = 0;
+        M[3] = cm[0] * t[2]; M[4] = cm[4] * t[3]; M[5] = 0;
+        M[6] = cm[0] * t[4] + cm[6]; M[7] = cm[4] * t[5] + cm[7]; M[8] = 1;
+        gl.uniformMatrix3fv(this.uMat, false, M);
+        gl.uniform1f(this.uAlpha, layer.opacity);
+        gl.uniform2f(this.uSize, transform.w, transform.h);
+        gl.uniform2f(this.uOrigin, transform.x, transform.y);
+        gl.bindTexture(gl.TEXTURE_2D, this._tfTex);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.uniformMatrix3fv(this.uMat, false, cm); // stato per i layer dopo
+        gl.uniform2f(this.uSize, CHUNK, CHUNK);
+        gl.disable(gl.SCISSOR_TEST);
+        continue;
+      }
       const live = layer.id === activeId && strokeStore && strokeStore.map.size > 0;
       if (live && eraserLive) {
         this._drawErase(camera, layer, strokeStore, strokeOpacity, cx0, cy0, cx1, cy1);
@@ -365,6 +417,57 @@ export class GLRenderer {
         }
       }
     }
+  }
+
+  // Costruisce (una volta per sessione) la texture piatta del livello:
+  // i chunk copiati fianco a fianco — dentro UN livello non si sovrappongono,
+  // quindi niente compositing, solo texSubImage2D. LINEAR per la rotazione.
+  /** @param {TransformFrame} tf */
+  _ensureTransformTex(tf) {
+    if (this._tfId === tf.id && this._tfTex) return;
+    this._freeTransformTex();
+    const gl = this.gl;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tf.w, tf.h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    for (const c of tf.store.map.values()) {
+      const ox = c.cx * CHUNK - tf.x, oy = c.cy * CHUNK - tf.y;
+      if (ox < 0 || oy < 0 || ox + CHUNK > tf.w || oy + CHUNK > tf.h) continue;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, ox, oy, CHUNK, CHUNK, gl.RGBA, gl.UNSIGNED_BYTE,
+        new Uint8Array(c.data.buffer, c.data.byteOffset, c.data.length));
+    }
+    this._tfTex = tex;
+    this._tfId = tf.id;
+  }
+
+  _freeTransformTex() {
+    if (this._tfTex) {
+      this.gl.deleteTexture(this._tfTex);
+      this._tfTex = null;
+    }
+    this._tfId = 0;
+  }
+
+  // Scissor sul rettangolo mondo [clip.x0..x1]×[clip.y0..y1] (inclusivo):
+  // l'origine GL è in basso a sinistra, quindi la y va ribaltata.
+  /** @param {Camera} camera @param {TransformFrame['clip']} clip */
+  _scissorClip(camera, clip) {
+    const gl = this.gl, d = camera.dpr, z = camera.zoom;
+    const x0 = ((clip.x0 - camera.x) * z + camera.w * 0.5) * d;
+    const y0 = ((clip.y0 - camera.y) * z + camera.h * 0.5) * d;
+    const x1 = ((clip.x1 + 1 - camera.x) * z + camera.w * 0.5) * d;
+    const y1 = ((clip.y1 + 1 - camera.y) * z + camera.h * 0.5) * d;
+    const left = Math.max(0, Math.round(x0));
+    const right = Math.min(this.canvas.width, Math.round(x1));
+    const top = Math.max(0, Math.round(y0));
+    const bottom = Math.min(this.canvas.height, Math.round(y1));
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(left, this.canvas.height - bottom,
+      Math.max(0, right - left), Math.max(0, bottom - top));
   }
 
   // Gomma live sul livello attivo: chunk * (1 - maschera stroke) * opacità.

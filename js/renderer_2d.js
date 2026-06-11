@@ -30,6 +30,10 @@ export class Canvas2DRenderer {
     // composto fuori dal canvas principale per non bucare i livelli sotto
     /** @type {HTMLCanvasElement|null} */
     this._scratch = null;
+    // canvas piatto della sessione di trasformazione (vedi TransformFrame)
+    /** @type {HTMLCanvasElement|null} */
+    this._tfCanvas = null;
+    this._tfId = 0;
   }
 
   /** @param {number} wCss @param {number} hCss @param {number} dpr */
@@ -106,11 +110,14 @@ export class Canvas2DRenderer {
    * Disegna i livelli raster del gruppo dal basso verso l'alto (opacità per
    * livello, stroke live sopra il livello attivo, gomma via scratch).
    * _proxies è ignorato: il fallback 2D resta sul path per-chunk.
+   * transform: il livello in sessione Sposta/Trasforma si disegna come
+   * canvas piatto unico con setTransform e clip al board (vedi renderer_gl).
    * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
    * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
    * @param {import('./board_proxy.js').ProxyFrame|null} [_proxies]
+   * @param {import('./renderer_gl.js').TransformFrame|null} [transform]
    */
-  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive, _proxies = null) {
+  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive, _proxies = null, transform = null) {
     const ctx = this.ctx;
     const dpr = camera.dpr;
     this.uploadsThisFrame = 0;
@@ -137,6 +144,25 @@ export class Canvas2DRenderer {
 
     for (const layer of layers) {
       if (layer.kind !== 'raster' || !layer.visible || layer.opacity <= 0) continue;
+      if (transform !== null && transform.layerId === layer.id) {
+        // sessione Sposta/Trasforma: canvas piatto unico con la matrice
+        this._ensureTransformCanvas(transform);
+        const t = transform.m, s = this._s, tx = this._tx, ty = this._ty;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(transform.clip.x0 * s + tx, transform.clip.y0 * s + ty,
+          (transform.clip.x1 + 1 - transform.clip.x0) * s,
+          (transform.clip.y1 + 1 - transform.clip.y0) * s);
+        ctx.clip();
+        ctx.globalAlpha = layer.opacity;
+        ctx.imageSmoothingEnabled = true; // la rotazione vuole il filtro
+        // device ∘ T: il drawImage riceve coordinate MONDO
+        ctx.setTransform(s * t[0], s * t[1], s * t[2], s * t[3], s * t[4] + tx, s * t[5] + ty);
+        ctx.drawImage(this._tfCanvas, transform.x, transform.y);
+        ctx.restore();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        continue;
+      }
       const live = layer.id === activeId && strokeStore && strokeStore.map.size > 0;
       if (live && eraserLive) {
         this._drawErase(ctx, layer, strokeStore, strokeOpacity, cx0, cy0, cx1, cy1);
@@ -150,6 +176,37 @@ export class Canvas2DRenderer {
       }
     }
     ctx.globalAlpha = 1;
+  }
+
+  // Canvas piatto della sessione di trasformazione: i chunk de-premoltiplicati
+  // copiati fianco a fianco, una volta per sessione (id = timbro).
+  /** @param {import('./renderer_gl.js').TransformFrame} tf */
+  _ensureTransformCanvas(tf) {
+    if (this._tfId === tf.id && this._tfCanvas) return;
+    const cnv = this._tfCanvas || document.createElement('canvas');
+    cnv.width = tf.w;
+    cnv.height = tf.h;
+    const ctx = cnv.getContext('2d');
+    for (const c of tf.store.map.values()) {
+      const ox = c.cx * CHUNK - tf.x, oy = c.cy * CHUNK - tf.y;
+      if (ox < 0 || oy < 0 || ox + CHUNK > tf.w || oy + CHUNK > tf.h) continue;
+      const src = c.data, dst = this._img.data;
+      for (let o = 0; o < src.length; o += 4) {
+        const a = src[o + 3];
+        if (a === 0) {
+          dst[o] = 0; dst[o + 1] = 0; dst[o + 2] = 0; dst[o + 3] = 0;
+        } else {
+          const inv = 255 / a;
+          dst[o] = Math.min(255, src[o] * inv);
+          dst[o + 1] = Math.min(255, src[o + 1] * inv);
+          dst[o + 2] = Math.min(255, src[o + 2] * inv);
+          dst[o + 3] = a;
+        }
+      }
+      ctx.putImageData(this._img, ox, oy);
+    }
+    this._tfCanvas = cnv;
+    this._tfId = tf.id;
   }
 
   /**

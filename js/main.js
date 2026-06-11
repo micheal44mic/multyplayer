@@ -8,7 +8,7 @@
 
 import { Camera, ZOOM_MIN, ZOOM_MAX } from './camera.js';
 import { clamp } from './util.js';
-import { ChunkStore, chunkKey, CHUNK, CHUNK_SHIFT } from './store.js';
+import { ChunkStore, chunkKey, translateStore, CHUNK, CHUNK_SHIFT } from './store.js';
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
@@ -22,6 +22,7 @@ import { makeRasterLayer } from './layers.js';
 import { BoardManager, MAX_BOARDS } from './boards.js';
 import { drawTextDocument, freeBlockBitmap, setBlockDebug3d, setTextGpu } from './text_layer.js';
 import { Planes } from './planes.js';
+import { TransformTool } from './transform_ui.js';
 import { BoardProxyCache } from './board_proxy.js';
 import { WasmHeap } from './wasm_core.js';
 import { strokeProfiler } from './stroke_profiler.js';
@@ -116,8 +117,15 @@ export class App {
     this.input = new InputManager(this.planesEl, this.camera, {
       isPanTool: () => brush.tool === 'pan',
       onStrokeStart: (x, y, p, t) => this.startStroke(x, y, p, t),
-      onStrokePoint: (x, y, p, t) => { if (this.strokeLive) this.engine.move(x, y, p, t); },
+      onStrokePoint: (x, y, p, t) => {
+        if (this.transform.dragging) return this.transform.dragMove(x, y);
+        if (this.strokeLive) this.engine.move(x, y, p, t);
+      },
       onStrokeEnd: (x, y, p, t) => {
+        if (this.transform.dragging) {
+          this.transform.dragMove(x, y);
+          return this.transform.dragEnd();
+        }
         if (!this.strokeLive) return;
         this.engine.end(x, y, p, t);
         strokeProfiler.penUp();
@@ -128,10 +136,15 @@ export class App {
         }
         this.pendingCommit = true;
       },
-      onStrokeCancel: () => this.cancelStroke(),
+      onStrokeCancel: () => {
+        if (this.transform.dragging) return this.transform.dragCancel();
+        this.cancelStroke();
+      },
     });
 
     this.ui = new UI(this);
+    // strumento Sposta/Trasforma: sessione con bbox, ✓/✗, anteprima a quad
+    this.transform = new TransformTool(this);
 
     // stats riusate (zero allocazioni nel loop)
     this.stats = {
@@ -372,6 +385,28 @@ export class App {
         const d = b.mgr.detach(id);
         return d ? { layer: d.layer, index: d.index, boardId: b.id } : null;
       },
+      /** @param {number} layerId @param {number} dx @param {number} dy */
+      translateLayer: (layerId, dx, dy) => {
+        const b = this.boards.boardOfLayer(layerId);
+        const layer = b && b.mgr.byId(layerId);
+        if (!layer || !layer.store) return null;
+        const clip = { x0: b.x, y0: b.y, x1: b.x + b.w - 1, y1: b.y + b.h - 1 };
+        const lost = translateStore(layer.store, dx, dy, clip,
+          (c) => this.renderer.disposeChunkTex(c));
+        layer.thumbDirty = true;
+        return lost;
+      },
+      /** @param {number} layerId @param {number} x @param {number} y @param {number} size */
+      setTextForm: (layerId, x, y, size) => {
+        const layer = this.boards.layerById(layerId);
+        if (!layer || layer.kind !== 'text') return false;
+        layer.item.x = x;
+        layer.item.y = y;
+        layer.item.size = size;
+        layer.styleDirty = true;
+        layer.thumbDirty = true;
+        return true;
+      },
       /** @param {number} from @param {number} to @param {number} boardId */
       moveLayer: (from, to, boardId) => {
         const b = this.boards.byId(boardId);
@@ -398,20 +433,11 @@ export class App {
     // appena selezionato e ancora in caricamento: il tratto partirebbe
     // alla cieca sotto il quad del proxy
     if (this.renderer instanceof GLRenderer && this.proxy.isLoading(board.id)) return;
+    // strumento Sposta/Trasforma: il drag sul canvas trasla la sessione
+    if (brush.tool === 'move') return this.transform.dragStart(x, y);
     const target = board.mgr.paintTarget;
     if (!target) return; // attivo non dipingibile (testo/nascosto): ignora
-    // chiudi del tutto l'eventuale tratto precedente: drena la sua coda
-    // (col suo snapshot e il suo clip), poi completa il commit in sincrono
-    if (this.strokeLive || this.commitJob) {
-      const tp = performance.now();
-      if (this.strokeLive) {
-        if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
-        if (this.pendingCommit) this._beginCommit();
-      }
-      if (this.commitJob) this._runCommit(Infinity);
-      strokeProfiler.event('flush sincrono', performance.now() - tp);
-      strokeProfiler.finish('chiuso dal tratto successivo');
-    }
+    this._flushPendingStroke();
     this._strokeLayerId = target.id;
     this._strokeClip = { x0: board.x, y0: board.y, x1: board.x + board.w - 1, y1: board.y + board.h - 1 };
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
@@ -441,6 +467,20 @@ export class App {
       `zoom ${(this.camera.zoom * 100).toFixed(0)}% · dpr ${this.camera.dpr}`;
   }
 
+  // Chiude del tutto l'eventuale tratto precedente: drena la sua coda
+  // (col suo snapshot e il suo clip), poi completa il commit in sincrono.
+  _flushPendingStroke() {
+    if (!this.strokeLive && !this.commitJob) return;
+    const tp = performance.now();
+    if (this.strokeLive) {
+      if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+      if (this.pendingCommit) this._beginCommit();
+    }
+    if (this.commitJob) this._runCommit(Infinity);
+    strokeProfiler.event('flush sincrono', performance.now() - tp);
+    strokeProfiler.finish('chiuso dal tratto successivo');
+  }
+
   cancelStroke() {
     strokeProfiler.cancel();
     this.engine.cancel();
@@ -449,6 +489,7 @@ export class App {
     this.strokeLive = false;
     this.pendingCommit = false;
   }
+
 
   _dropStrokeBuffer() {
     // i chunk tornano al pool (texture riusata) o liberano la texture
@@ -547,16 +588,20 @@ export class App {
   }
 
   async undo() {
-    if (this.strokeLive || this.commitJob) return;
+    // trasformazione pendente: prima ✓ o ✗ (i bottoni sono lì apposta)
+    if (this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging) return;
     await this.undoMgr.undo(this._undoHost());
+    // l'undo può aver cambiato i pixel sotto la sessione: si rifotografa
+    this.transform.rebind();
     this.planes.invalidate();
     this.ui.layersUI.sync();
     this.ui.layersUI.scheduleThumbs();
   }
 
   async redo() {
-    if (this.strokeLive || this.commitJob) return;
+    if (this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging) return;
     await this.undoMgr.redo(this._undoHost());
+    this.transform.rebind();
     this.planes.invalidate();
     this.ui.layersUI.sync();
     this.ui.layersUI.scheduleThumbs();
@@ -668,12 +713,16 @@ export class App {
       ? this.proxy.update(this.renderer, this.boards, this.boards.activeId,
         this.camera, !this.strokeLive)
       : null;
+    // sessione Sposta/Trasforma: ciclo di vita (auto-commit al cambio di
+    // bersaglio) + frame del quad per i renderer; il gizmo si riposiziona qui
+    this.transform.sync(this.camera);
+    const tfFrame = this.transform.frame();
     const pres = this.planes.render({
       camera: this.camera, boards: this.boards, activeId: this.layerMgr.activeId,
       strokeStore: this.strokeStore,
       liveOpacity, eraserLive: liveEraser,
       bottom: this.renderer, bottomCanvas: this.canvas,
-      proxies,
+      proxies, transform: tfFrame,
     });
     // gabbia della distorsione testo: segue camera e modifiche (uscita a
     // confronto di stringa quando non c'è niente da fare)

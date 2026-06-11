@@ -183,6 +183,7 @@ export class Planes {
    * @param {GLRenderer|Canvas2DRenderer} o.bottom
    * @param {HTMLCanvasElement} o.bottomCanvas
    * @param {import('./board_proxy.js').ProxyFrame|null} [o.proxies] board coperti dal quad piatto (zoom-out)
+   * @param {import('./renderer_gl.js').TransformFrame|null} [o.transform] sessione Sposta/Trasforma
    * @returns {{uploadMs: number, drawMs: number}}
    */
   render(o) {
@@ -272,20 +273,24 @@ export class Planes {
       }
       const hasActive = g.layers.some((l) => l.id === activeId);
       const stroke = hasActive ? strokeStore : null;
+      const tf = o.transform || null;
       if (!bottomDone) {
         bottomDone = true;
         bottom.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive,
-          o.proxies || null);
+          o.proxies || null, tf);
       } else {
         const r = this._pool[c2dIdx++];
         const liveHere = stroke && stroke.map.size > 0;
-        if (camChanged || r.uploadsThisFrame > 0 || liveHere || this._forceDraw) {
-          r.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive);
+        // un livello del gruppo è in sessione Sposta/Trasforma: la matrice
+        // può cambiare a ogni frame, il piano va ridipinto
+        const tfHere = tf !== null && g.layers.some((l) => l.id === tf.layerId);
+        if (camChanged || r.uploadsThisFrame > 0 || liveHere || tfHere || this._forceDraw) {
+          r.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive, null, tf);
         }
       }
     }
     // niente gruppi raster: il bottom presenta comunque (pulisce il canvas)
-    if (!bottomDone) bottom.render(camera, [], activeId, null, 1, false, o.proxies || null);
+    if (!bottomDone) bottom.render(camera, [], activeId, null, 1, false, o.proxies || null, null);
     this._forceDraw = false;
     const t2 = performance.now();
 
