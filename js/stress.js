@@ -25,11 +25,17 @@ const PITCH = BOARD_SIZE + CHUNK;
 const SIDE = (BOARD_SIZE / CHUNK) | 0;   // chunk per lato (8)
 const PER_LAYER = SIDE * SIDE;           // chunk per layer pieno (64)
 const SLICE_MS = 8;                      // budget di una fetta di riempimento
-// VRAM stimata oltre la quale "inquadra tutto" non parte da solo a fine
-// riempimento: l'upload massivo on-demand del primo frame può perdere il
-// contesto WebGL. Provocarlo è parte del test, ma con un click consapevole.
-const AUTO_FIT_VRAM = 768 << 20;
 
+// iOS non tollera PICCHI di allocazione: un commit improvviso di centinaia
+// di MB (pre-grow monolitico, o fette di riempimento back-to-back) fa
+// scattare jetsam anche quando il dispositivo reggerebbe quella memoria a
+// regime (un iPad arriva a ~3 GB senza problemi). Quindi: heap cresciuto a
+// passi piccoli durante il riempimento e pause tra le fette per dare al
+// sistema il tempo di assorbire. Nessun tetto artificiale.
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const GROW_STEP = 256;                   // chunk per passo di crescita (64 MB)
+const PACE_MS = IS_IOS ? 24 : 0;         // respiro tra le fette su iOS
 /** @param {number} b */
 const fmtBytes = (b) => b >= (1 << 30) ? (b / (1 << 30)).toFixed(2) + ' GB'
   : Math.max(1, Math.round(b / (1 << 20))) + ' MB';
@@ -198,7 +204,9 @@ export class StressTest {
     this.show(true);
 
     const layers = this._buildDocument(B, L);
-    this._preGrow(Math.round(layers.length * PER_LAYER * cov));
+    // niente pre-grow monolitico: il heap cresce a passi di GROW_STEP
+    // dentro _tick (su iOS il commit gigante in un colpo solo = jetsam)
+    this._preGrow(GROW_STEP);
 
     this._job = {
       layers, li: 0, ci: 0, filled: 0,
@@ -269,9 +277,11 @@ export class StressTest {
     return d;
   }
 
-  // Una sola crescita del heap wasm invece di ~250 incrementali (ogni grow
-  // rigenera le viste di tutti i chunk). Se la crescita fallisce si procede
-  // comunque: l'alloc incrementale si fermerà da solo al tetto.
+  // Garantisce headroom per `chunks` chunk nel heap wasm (no-op se c'è già
+  // spazio). Chiamata a passi di GROW_STEP durante il riempimento: pochi grow
+  // (ogni grow rigenera le viste di tutti i chunk) ma mai un commit gigante,
+  // che su iOS = jetsam. Se la crescita fallisce si procede comunque:
+  // l'alloc incrementale si fermerà da solo al tetto.
   /** @param {number} chunks */
   _preGrow(chunks) {
     const heap = this.app.heap;
@@ -300,6 +310,9 @@ export class StressTest {
         let h = Math.imul(cx, 0x9E3779B1) ^ Math.imul(cy, 0x85EBCA77) ^ Math.imul(job.li + 1, 0xC2B2AE3D);
         h = Math.imul(h ^ (h >>> 15), 0x2C1B3C6D); h ^= h >>> 13;
         if (((h >>> 0) % 1024) < job.cov1024) {
+          // crescita rotante: mantiene sempre ~GROW_STEP chunk di headroom
+          // nel heap senza mai un commit gigante (no-op se c'è già spazio)
+          if (job.filled % GROW_STEP === 0) this._preGrow(GROW_STEP);
           const c = fl.store.getOrCreate(cx, cy); // può lanciare: tetto wasm
           c.data.set(fl.tpl);
           c.touched = true;
@@ -318,7 +331,10 @@ export class StressTest {
     const done = job.li * PER_LAYER + job.ci;
     this._barEl.style.width = (done / job.total * 100).toFixed(1) + '%';
     this._statusEl.textContent = `Riempio… ${job.filled} chunk · ${fmtBytes(job.filled * CHUNK_BYTES)}`;
-    this._chan.port2.postMessage(0);
+    // su iOS una pausa vera tra le fette: il commit di memoria rallenta a un
+    // ritmo che il sistema assorbe invece di uccidere la tab per il picco
+    if (PACE_MS) setTimeout(() => this._chan.port2.postMessage(0), PACE_MS);
+    else this._chan.port2.postMessage(0);
   }
 
   /** @param {string|null} problem null = completato */
@@ -341,13 +357,11 @@ export class StressTest {
     } else {
       this._statusEl.textContent = `Fatto: ${job.filled} chunk · ${fmtBytes(bytes)} in ${secs}s`;
     }
-    // Con WebGL l'inquadratura totale è coperta dai proxy dei board (un quad
-    // per board, build a budget): si può sempre. Sul fallback Canvas2D resta
-    // il path per-chunk: sopra la soglia di VRAM stimata si lascia il click.
-    if (this.app.renderer.kind !== 'Canvas2D' || bytes * 1.33 < AUTO_FIT_VRAM) {
-      this._fitAll();
-    } else {
-      this._statusEl.textContent += ' — «Inquadra tutto» per il vero stress (renderer 2D: può soffrire)';
+    // Niente auto-zoom-out: su Safari l'inquadratura totale subito dopo il
+    // riempimento (16x16) crasha. Si resta sul primo canvas; lo zoom-out lo
+    // decide l'utente con «Inquadra tutto» o a mano.
+    if (!problem) {
+      this._statusEl.textContent += ' — «Inquadra tutto» per lo zoom-out';
     }
   }
 
