@@ -254,7 +254,9 @@ export class LayersUI {
         copy.store.markDirty(dst);
       }
     } else {
-      copy = makeTextLayer(src.name + ' copia', { ...src.item }, { ...src.style });
+      // structuredClone: la gabbia distort è annidata, lo spread la
+      // condividerebbe fra originale e copia
+      copy = makeTextLayer(src.name + ' copia', { ...src.item }, structuredClone(src.style));
     }
     copy.visible = src.visible;
     copy.opacity = src.opacity;

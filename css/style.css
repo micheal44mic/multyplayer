@@ -108,6 +108,40 @@ html, body {
   z-index: 5;
 }
 
+/* gabbia della distorsione testo: root trasparente ai pointer, solo i
+   pallini catturano (un drag non fa mai partire un tratto) */
+#distortgizmo {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 6;
+  display: none;
+  pointer-events: none;
+}
+#distortgizmo .dg-edge {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 4;
+  opacity: 0.75;
+}
+#distortgizmo .dg-spoke {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1;
+  opacity: 0.45;
+}
+#distortgizmo circle {
+  pointer-events: auto;
+  touch-action: none;
+  cursor: grab;
+  stroke-width: 1.5;
+}
+#distortgizmo circle:active { cursor: grabbing; }
+#distortgizmo .dg-anchor { fill: #fff; stroke: var(--accent); }
+#distortgizmo .dg-handle { fill: var(--accent); stroke: #fff; }
+
 /* ---------- popup preset pennello ---------- */
 /* ancorato sotto il bottone Pennello (posizione calcolata da presets_ui.js) */
 #presetspopup {
@@ -761,6 +795,26 @@ html, body {
   outline: none;
   border-color: var(--ui-fg);
 }
+
+/* riga della distorsione: guida + reset della gabbia */
+.p-row .p-hint {
+  display: block;
+  font-size: 11px;
+  color: var(--ui-dim);
+  margin-bottom: 8px;
+}
+.tp-reset {
+  width: 100%;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid var(--ui-line);
+  background: var(--ui-bg-solid);
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.tp-reset:hover { border-color: var(--ui-fg); }
 
 .tp-colorrow {
   display: flex;

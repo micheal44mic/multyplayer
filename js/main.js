@@ -599,6 +599,9 @@ export class App {
       bottom: this.renderer, bottomCanvas: this.canvas,
       proxies,
     });
+    // gabbia della distorsione testo: segue camera e modifiche (uscita a
+    // confronto di stringa quando non c'è niente da fare)
+    this.ui.textUI.gizmo.sync(this.camera);
     // VRAM limitata: eviction delle texture fuori schermo (riupload on-demand).
     // I chunk dei piani 2D hanno tex nulla: il loop li salta da solo.
     const tEv = performance.now();

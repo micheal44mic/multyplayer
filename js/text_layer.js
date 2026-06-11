@@ -83,7 +83,50 @@ export function shadowCss(hex, a = 0.65) {
  * @property {number} shadowAngle direzione ombra in gradi (0 = destra, 90 = giù)
  * @property {number} shadowOpacity alpha dell'ombra 0..1 (morbida e blocco 3D)
  * @property {string} shadowColor
+ * @property {'none'|'arc'|'circle'|'wave'|'distort'} warp trasformazione del tracciato
+ * @property {number} warpBend arco: curvatura totale in gradi (>0 verso l'alto)
+ * @property {number} warpRadius cerchio: raggio in px mondo (0 = auto, cerchio pieno)
+ * @property {number} warpAmp onda: ampiezza in px mondo
+ * @property {number} warpFreq onda: numero di onde sull'intero testo
+ * @property {Distort} [distort] gabbia della distorsione (creata al primo uso)
+ * @property {number} [distortVer] timbro monotono: cambia a ogni modifica della gabbia
  */
+
+/**
+ * Gabbia di distorsione stile envelope: coordinate NORMALIZZATE alla bbox del
+ * testo non deformato (u: 0..1 da sinistra, v: 0..1 dall'alto) — cambiando
+ * testo/corpo/font la forma si conserva. Bordi alto e basso = due cubiche per
+ * lato passanti per il punto centrale; i lati verticali restano dritti.
+ * Ancore: 4 angoli + 2 centri (tc/bc). Maniglie come OFFSET dall'ancora:
+ * gli angoli ne hanno UNA (verso il centro), i centri DUE (htcl/htcr, hbcl/hbcr).
+ * @typedef {Object} Distort
+ * @property {{x:number,y:number}} tl @property {{x:number,y:number}} tc @property {{x:number,y:number}} tr
+ * @property {{x:number,y:number}} bl @property {{x:number,y:number}} bc @property {{x:number,y:number}} br
+ * @property {{x:number,y:number}} htl @property {{x:number,y:number}} htcl @property {{x:number,y:number}} htcr @property {{x:number,y:number}} htr
+ * @property {{x:number,y:number}} hbl @property {{x:number,y:number}} hbcl @property {{x:number,y:number}} hbcr @property {{x:number,y:number}} hbr
+ */
+
+/** Gabbia identità. Maniglie a 1/6 ESATTO: controlli equispaziati sulla
+ * corda = cubica a parametrizzazione lineare, quindi scala locale 1 ovunque
+ * (a 0.17 i glifi oscillerebbero di un ~0.5% di scala). */
+/** @returns {Distort} */
+export function defaultDistort() {
+  const H = 1 / 6;
+  return {
+    tl: { x: 0, y: 0 }, tc: { x: 0.5, y: 0 }, tr: { x: 1, y: 0 },
+    bl: { x: 0, y: 1 }, bc: { x: 0.5, y: 1 }, br: { x: 1, y: 1 },
+    htl: { x: H, y: 0 }, htcl: { x: -H, y: 0 }, htcr: { x: H, y: 0 }, htr: { x: -H, y: 0 },
+    hbl: { x: H, y: 0 }, hbcl: { x: -H, y: 0 }, hbcr: { x: H, y: 0 }, hbr: { x: -H, y: 0 },
+  };
+}
+
+// Timbro globale per le chiavi di cache: distinto anche fra livelli diversi.
+let _distortStamp = 0;
+
+/** Da chiamare a ogni modifica della gabbia (gizmo, reset). @param {TextStyle} st */
+export function bumpDistort(st) {
+  st.distortVer = ++_distortStamp;
+}
 
 /**
  * @typedef {Object} TextItem
@@ -101,6 +144,9 @@ export function defaultTextStyle() {
     stroke: 0, strokeColor: '#ffffff',
     block: false, shadowBlur: 0, shadowDist: 0, shadowAngle: 45,
     shadowOpacity: 0.65, shadowColor: '#000000',
+    // raggio/ampiezza a 0 = "da proporzionare al testo": li inizializza il
+    // pannello al primo uso della forma, poi restano editabili
+    warp: 'none', warpBend: 90, warpRadius: 0, warpAmp: 0, warpFreq: 2,
   };
 }
 
@@ -129,6 +175,180 @@ export function textBaselineY(it, st) {
   const asc = m.actualBoundingBoxAscent || it.size * 0.75;
   const des = m.actualBoundingBoxDescent || it.size * 0.25;
   return it.y + (asc - des) * 0.5;
+}
+
+/** Larghezza misurata del testo in px mondo (fallback per-carattere se il font non è pronto). */
+/** @param {TextItem} it @param {TextStyle} st */
+export function textWidth(it, st) {
+  measurer.font = textFont(it, st);
+  return Math.max(measurer.measureText(it.text).width, it.text.length * it.size * 0.8);
+}
+
+// ---- trasformazioni del tracciato (arco / cerchio / onda) -----------------
+// Un layout per-glifo condiviso da TUTTE le rese: SVG (tspan x/y/rotate),
+// effetti canvas ed export disegnano gli stessi numeri, quindi combaciano al
+// pixel. Ogni glifo è ancorato alla SUA origine (baseline a sinistra): è il
+// pivot di rotazione sia di `rotate` negli SVG sia di translate+rotate nei
+// canvas. Il centro dell'avanzamento del glifo giace sulla curva, col glifo
+// ruotato lungo la tangente. Le spaziature non si disegnano ma avanzano.
+
+/**
+ * @typedef {Object} WarpGlyph
+ * @property {string} ch
+ * @property {number} x origine (baseline sinistra) in px mondo
+ * @property {number} y
+ * @property {number} a rotazione in radianti
+ * @property {number} w avanzamento del glifo in px mondo
+ */
+
+// Bbox mondo del testo NON deformato: il riferimento della gabbia distort
+// (i punti normalizzati u/v vivono qui). vBase = quota della baseline (0..1).
+/** @param {TextItem} it @param {TextStyle} st */
+export function distortBox(it, st) {
+  measurer.font = textFont(it, st);
+  const m = measurer.measureText(it.text || 'M');
+  const asc = m.actualBoundingBoxAscent || it.size * 0.75;
+  const desc = m.actualBoundingBoxDescent || it.size * 0.25;
+  const w = textWidth(it, st);
+  const baseY = textBaselineY(it, st);
+  return { x: it.x - w / 2, y: baseY - asc, w, h: asc + desc, vBase: asc / (asc + desc) };
+}
+
+// Punto + derivata di una cubica di Bézier (coordinate normalizzate gabbia).
+/**
+ * @param {{x:number,y:number}} p0 @param {{x:number,y:number}} p1
+ * @param {{x:number,y:number}} p2 @param {{x:number,y:number}} p3
+ * @param {number} t @param {{x:number,y:number,dx:number,dy:number}} out
+ */
+function evalCubic(p0, p1, p2, p3, t, out) {
+  const mt = 1 - t;
+  const a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, e = t * t * t;
+  const da = 3 * mt * mt, db = 6 * mt * t, dc = 3 * t * t;
+  out.x = a * p0.x + b * p1.x + c * p2.x + e * p3.x;
+  out.y = a * p0.y + b * p1.y + c * p2.y + e * p3.y;
+  out.dx = da * (p1.x - p0.x) + db * (p2.x - p1.x) + dc * (p3.x - p2.x);
+  out.dy = da * (p1.y - p0.y) + db * (p2.y - p1.y) + dc * (p3.y - p2.y);
+  return out;
+}
+
+const _ec1 = { x: 0, y: 0 }, _ec2 = { x: 0, y: 0 }; // controlli riusati
+/** @param {{x:number,y:number}} p @param {{x:number,y:number}} h @param {{x:number,y:number}} out */
+function _addH(p, h, out) { out.x = p.x + h.x; out.y = p.y + h.y; return out; }
+
+// Bordo della gabbia (alto o basso): due cubiche a..c e c..b, u in 0..1.
+// La derivata torna rispetto a u (fattore 2 del cambio di parametro).
+// Fuori da [0,1] estende LINEARMENTE dal punto estremo lungo la tangente:
+// è la zona dei margini sorgente (bordo del testo), mai i glifi stessi.
+/**
+ * @param {Distort} d @param {boolean} top @param {number} u
+ * @param {{x:number,y:number,dx:number,dy:number}} out
+ */
+function evalEdge(d, top, u, out) {
+  const a = top ? d.tl : d.bl, c = top ? d.tc : d.bc, b = top ? d.tr : d.br;
+  const ha = top ? d.htl : d.hbl, hcl = top ? d.htcl : d.hbcl;
+  const hcr = top ? d.htcr : d.hbcr, hb = top ? d.htr : d.hbr;
+  const uc = Math.max(0, Math.min(1, u));
+  if (uc <= 0.5) evalCubic(a, _addH(a, ha, _ec1), _addH(c, hcl, _ec2), c, uc * 2, out);
+  else evalCubic(c, _addH(c, hcr, _ec1), _addH(b, hb, _ec2), b, uc * 2 - 1, out);
+  out.dx *= 2;
+  out.dy *= 2;
+  if (u !== uc) {
+    out.x += out.dx * (u - uc);
+    out.y += out.dy * (u - uc);
+  }
+  return out;
+}
+
+// Memo a una voce: il layout serve a sync SVG, blockBox e renderEffectInto
+// nello stesso giro; la chiave include lo stato del font (le metriche col
+// fallback differiscono).
+let _wlKey = '';
+/** @type {WarpGlyph[]|null} */
+let _wlVal = null;
+
+/** @param {TextItem} it @param {TextStyle} st @returns {WarpGlyph[]|null} null = testo dritto */
+export function warpLayout(it, st) {
+  const mode = st.warp ?? 'none';
+  if (mode === 'none' || !it.text) return null;
+  const ready = document.fonts.check(`${st.weight} 16px "${st.font}"`) ? 1 : 0;
+  const key = `${it.text}|${it.x}|${it.y}|${it.size}|${st.font}|${st.weight}|${mode}|` +
+    `${st.warpBend ?? 0}|${st.warpRadius ?? 0}|${st.warpAmp ?? 0}|${st.warpFreq ?? 0}|` +
+    `V${st.distortVer ?? 0}|F${ready}`;
+  if (key === _wlKey) return _wlVal;
+  // la distort NON è per-glifo: deforma il blocco intero come raster a
+  // strisce (vedi _renderDistortInto) — qui non produce layout
+  if (mode === 'distort') { _wlKey = key; return (_wlVal = null); }
+  const chars = [...it.text];
+  measurer.font = textFont(it, st);
+  const adv = chars.map((c) => measurer.measureText(c).width);
+  const total = adv.reduce((a, b) => a + b, 0);
+  let R = 0;
+  if (total <= 0) {
+    _wlKey = key;
+    return (_wlVal = null);
+  }
+  if (mode === 'arc') {
+    const rad = (st.warpBend ?? 0) * Math.PI / 180;
+    if (Math.abs(rad) < 0.01) { _wlKey = key; return (_wlVal = null); }
+    R = total / rad;
+  } else if (mode === 'circle') {
+    // mai sotto il giro completo: i glifi non si accavallano oltre i 360°
+    R = Math.max(st.warpRadius || 0, total / (2 * Math.PI));
+  }
+  const baseY = textBaselineY(it, st);
+  const amp = st.warpAmp || 0;
+  const omega = 2 * Math.PI * Math.max(0.1, st.warpFreq ?? 2) / total;
+  /** @type {WarpGlyph[]} */
+  const out = [];
+  let s = -total / 2; // ascissa curvilinea, 0 al centro del testo
+  for (let i = 0; i < chars.length; i++) {
+    const w = adv[i];
+    const sm = s + w / 2;
+    s += w;
+    if (chars[i].trim() === '') continue;
+    let px, py, a;
+    if (mode === 'wave') {
+      px = it.x + sm;
+      py = baseY + amp * Math.sin(omega * sm);
+      a = Math.atan(amp * omega * Math.cos(omega * sm));
+    } else {
+      // arco e cerchio: curva per (it.x, baseY) con centro a distanza R sotto;
+      // R negativo (arco in giù) torna dalle stesse formule
+      const phi = sm / R;
+      px = it.x + R * Math.sin(phi);
+      py = baseY + R * (1 - Math.cos(phi));
+      a = phi;
+    }
+    out.push({ ch: chars[i], x: px - Math.cos(a) * w / 2, y: py - Math.sin(a) * w / 2, a, w });
+  }
+  _wlKey = key;
+  return (_wlVal = out.length ? out : null);
+}
+
+// Una passata di testo (bordo O fill) su un contesto 2D già configurato
+// (font, baseline, stili): dritta in una chiamata, deformata glifo per
+// glifo. ox/oy traslano in px mondo (corsa dell'estrusione, origine export).
+/**
+ * @param {CanvasRenderingContext2D} ctx @param {TextItem} it
+ * @param {WarpGlyph[]|null} layout @param {number} baseY
+ * @param {boolean} stroke @param {number} [ox] @param {number} [oy]
+ */
+export function drawTextPass(ctx, it, layout, baseY, stroke, ox = 0, oy = 0) {
+  if (!layout) {
+    ctx.textAlign = 'center';
+    if (stroke) ctx.strokeText(it.text, it.x + ox, baseY + oy);
+    else ctx.fillText(it.text, it.x + ox, baseY + oy);
+    return;
+  }
+  ctx.textAlign = 'left';
+  for (const g of layout) {
+    ctx.save();
+    ctx.translate(g.x + ox, g.y + oy);
+    ctx.rotate(g.a);
+    if (stroke) ctx.strokeText(g.ch, 0, 0);
+    else ctx.fillText(g.ch, 0, 0);
+    ctx.restore();
+  }
 }
 
 // EFFETTI (estrusione 3D e ombra morbida) — rasterizzati su un canvas HTML
@@ -164,11 +384,16 @@ export function createTextSvg(layer) {
   // scala il piano già dipinto col compositor invece di ridipingerlo)
   svg.style.transformOrigin = '0 0';
   const defs = document.createElementNS(SVG_NS, 'defs');
+  // la sorgente è un <g>: font e baseline si ereditano sia dal <text> unico
+  // (dritto/arco/cerchio/onda) sia dai <text> per-glifo della distort (che
+  // hanno transform con scala, impossibile su un tspan)
+  const g = document.createElementNS(SVG_NS, 'g');
+  g.setAttribute('id', 'tsrc' + layer.id); // id unico nel documento
+  g.setAttribute('dominant-baseline', 'alphabetic');
   const t = document.createElementNS(SVG_NS, 'text');
-  t.setAttribute('id', 'tsrc' + layer.id); // id unico nel documento
   t.setAttribute('text-anchor', 'middle');
-  t.setAttribute('dominant-baseline', 'alphabetic');
-  defs.appendChild(t);
+  g.appendChild(t);
+  defs.appendChild(g);
   const main = document.createElementNS(SVG_NS, 'use');
   main.setAttribute('href', '#tsrc' + layer.id);
   // il bordo è sotto il fill (paint-order): stroke centrato largo il doppio,
@@ -186,6 +411,7 @@ export function createTextSvg(layer) {
   cnv.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;' +
     'transform-origin:0 0;will-change:transform;display:none;';
   layer.svg = svg;
+  layer.srcEl = g;
   layer.textEl = t;
   layer.blockCanvas = cnv;
   layer.mainEl = main;
@@ -201,20 +427,271 @@ const measurer = document.createElement('canvas').getContext('2d');
 // pronto: il fallback per-carattere tiene il box abbondante.
 /** @param {TextItem} it @param {TextStyle} st */
 function blockBox(it, st) {
-  measurer.font = textFont(it, st);
-  const tw = Math.max(measurer.measureText(it.text).width, it.text.length * it.size * 0.8);
-  const hw = tw / 2 + st.stroke + it.size * 0.15;
-  const hh = it.size * 0.9 + st.stroke;
   const pad = st.shadowBlur * 1.5 + 2;
   // la corsa dell'effetto estende il box solo dal lato verso cui punta
   const { ux, uy } = shadowDir(st);
   const ddx = ux * st.shadowDist, ddy = uy * st.shadowDist;
+  const distort = st.warp === 'distort' ? st.distort : null;
+  const layout = distort ? null : warpLayout(it, st);
+  let x0, y0, x1, y1;
+  if (distort) {
+    // estremi della gabbia campionando i bordi (33 punti per lato, oltre i
+    // margini sorgente in u e v: il warp mappa anche la corona del bordo)
+    const b = distortBox(it, st);
+    const m = _distortMargin(it, st);
+    const vT = -m / b.h, vB = 1 + m / b.h;
+    const uL = -m / b.w, uR = 1 + m / b.w;
+    const eT = { x: 0, y: 0, dx: 0, dy: 0 }, eB = { x: 0, y: 0, dx: 0, dy: 0 };
+    x0 = Infinity; y0 = Infinity; x1 = -Infinity; y1 = -Infinity;
+    for (let i = 0; i <= 32; i++) {
+      const u = uL + (uR - uL) * i / 32;
+      evalEdge(distort, true, u, eT);
+      evalEdge(distort, false, u, eB);
+      for (const v of [vT, vB]) {
+        const px = b.x + (eT.x + (eB.x - eT.x) * v) * b.w;
+        const py = b.y + (eT.y + (eB.y - eT.y) * v) * b.h;
+        x0 = Math.min(x0, px); x1 = Math.max(x1, px);
+        y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+      }
+    }
+    // slack per gli estremi delle cubiche fra un campione e l'altro
+    const sl = (x1 - x0 + y1 - y0) * 0.02 + 2;
+    x0 -= sl; y0 -= sl; x1 += sl; y1 += sl;
+  } else if (layout) {
+    // estremi delle origini e dei fine-avanzamento dei glifi, con un margine
+    // uniforme che copre ascendenti/discendenti a qualunque rotazione
+    const m = it.size * 1.05 + st.stroke;
+    x0 = Infinity; y0 = Infinity; x1 = -Infinity; y1 = -Infinity;
+    for (const g of layout) {
+      const ex = g.x + Math.cos(g.a) * g.w, ey = g.y + Math.sin(g.a) * g.w;
+      x0 = Math.min(x0, g.x, ex); x1 = Math.max(x1, g.x, ex);
+      y0 = Math.min(y0, g.y, ey); y1 = Math.max(y1, g.y, ey);
+    }
+    x0 -= m; y0 -= m; x1 += m; y1 += m;
+  } else {
+    const hw = textWidth(it, st) / 2 + st.stroke + it.size * 0.15;
+    const hh = it.size * 0.9 + st.stroke;
+    x0 = it.x - hw; x1 = it.x + hw;
+    y0 = it.y - hh; y1 = it.y + hh;
+  }
   return {
-    x: it.x - hw - pad + Math.min(0, ddx),
-    y: it.y - hh - pad + Math.min(0, ddy),
-    w: hw * 2 + Math.abs(ddx) + pad * 2,
-    h: hh * 2 + Math.abs(ddy) + pad * 2,
+    x: x0 - pad + Math.min(0, ddx),
+    y: y0 - pad + Math.min(0, ddy),
+    w: (x1 - x0) + Math.abs(ddx) + pad * 2,
+    h: (y1 - y0) + Math.abs(ddy) + pad * 2,
   };
+}
+
+// ---- distort: warp raster a strisce -----------------------------------
+// La distort deforma il TESTO INTERO come un pezzo unico (stile Kittl):
+// niente glifi che scivolano uno sull'altro. Il testo dritto (bordo+fill)
+// si rasterizza una volta, poi si piega attraverso la gabbia a strisce
+// verticali triangolate; l'effetto (estrusione/ombra) è la stessa sagoma
+// deformata, copiata lungo la direzione. La faccia quindi NON è più SVG:
+// vive nella stessa bitmap dell'effetto (nitidezza gestita dalle
+// rigenerazioni a zoom assestato, come già per gli effetti).
+
+// Corona attorno alla bbox cotta nella sorgente: bordo + sbavature glifo.
+/** @param {TextItem} it @param {TextStyle} st */
+function _distortMargin(it, st) {
+  return st.stroke + it.size * 0.08 + 2;
+}
+
+// Triangolo con texture: mappa il triangolo sorgente (px immagine) su quello
+// di destinazione (coordinate del ctx, già in mondo). La mappatura affine è
+// esatta sui vertici; il clip è gonfiato di `ex` dal baricentro per coprire
+// le cuciture dell'antialias (la trasformazione resta quella esatta).
+/**
+ * @param {CanvasRenderingContext2D} ctx @param {HTMLCanvasElement} img
+ * @param {number} x0 @param {number} y0 @param {number} x1 @param {number} y1
+ * @param {number} x2 @param {number} y2
+ * @param {number} u0 @param {number} v0 @param {number} u1 @param {number} v1
+ * @param {number} u2 @param {number} v2 @param {number} ex
+ */
+function _drawTri(ctx, img, x0, y0, x1, y1, x2, y2, u0, v0, u1, v1, u2, v2, ex) {
+  const det = u0 * (v1 - v2) + u1 * (v2 - v0) + u2 * (v0 - v1);
+  if (!det) return;
+  const a = (x0 * (v1 - v2) + x1 * (v2 - v0) + x2 * (v0 - v1)) / det;
+  const b = (y0 * (v1 - v2) + y1 * (v2 - v0) + y2 * (v0 - v1)) / det;
+  const c = (x0 * (u2 - u1) + x1 * (u0 - u2) + x2 * (u1 - u0)) / det;
+  const d = (y0 * (u2 - u1) + y1 * (u0 - u2) + y2 * (u1 - u0)) / det;
+  const e = x0 - a * u0 - c * v0;
+  const f = y0 - b * u0 - d * v0;
+  const cx = (x0 + x1 + x2) / 3, cy = (y0 + y1 + y2) / 3;
+  ctx.save();
+  ctx.beginPath();
+  let dx = x0 - cx, dy = y0 - cy, l = Math.hypot(dx, dy) || 1;
+  ctx.moveTo(x0 + dx / l * ex, y0 + dy / l * ex);
+  dx = x1 - cx; dy = y1 - cy; l = Math.hypot(dx, dy) || 1;
+  ctx.lineTo(x1 + dx / l * ex, y1 + dy / l * ex);
+  dx = x2 - cx; dy = y2 - cy; l = Math.hypot(dx, dy) || 1;
+  ctx.lineTo(x2 + dx / l * ex, y2 + dy / l * ex);
+  ctx.closePath();
+  ctx.clip();
+  ctx.transform(a, b, c, d, e, f);
+  ctx.drawImage(img, 0, 0);
+  ctx.restore();
+}
+
+const _wsT = { x: 0, y: 0, dx: 0, dy: 0 }, _wsB = { x: 0, y: 0, dx: 0, dy: 0 };
+
+// Disegna `src` (testo dritto + corona di margine m) deformato dalla gabbia,
+// su un ctx già in coordinate mondo. Le colonne fra strisce adiacenti sono
+// IDENTICHE (calcolate una volta e riusate): i lati combaciano, zero crepe.
+/**
+ * @param {CanvasRenderingContext2D} ctx @param {HTMLCanvasElement} src
+ * @param {Distort} d @param {ReturnType<typeof distortBox>} b
+ * @param {number} m @param {number} r @param {number} N
+ */
+function _warpStrips(ctx, src, d, b, m, r, N) {
+  const sw = src.width, sh = src.height;
+  const vT = -m / b.h, vB = 1 + m / b.h;
+  const uL = -m / b.w, uR = 1 + m / b.w;
+  const ex = 0.6 / r; // clip gonfiato ~0.6 px device
+  /** @param {number} u @param {{tx:number,ty:number,bx:number,by:number}} out */
+  const col = (u, out) => {
+    evalEdge(d, true, u, _wsT);
+    evalEdge(d, false, u, _wsB);
+    out.tx = b.x + (_wsT.x + (_wsB.x - _wsT.x) * vT) * b.w;
+    out.ty = b.y + (_wsT.y + (_wsB.y - _wsT.y) * vT) * b.h;
+    out.bx = b.x + (_wsT.x + (_wsB.x - _wsT.x) * vB) * b.w;
+    out.by = b.y + (_wsT.y + (_wsB.y - _wsT.y) * vB) * b.h;
+  };
+  const L = { tx: 0, ty: 0, bx: 0, by: 0 }, R = { tx: 0, ty: 0, bx: 0, by: 0 };
+  col(uL, L);
+  for (let i = 0; i < N; i++) {
+    col(uL + (uR - uL) * (i + 1) / N, R);
+    const sx0 = sw * i / N, sx1 = sw * (i + 1) / N;
+    _drawTri(ctx, src, L.tx, L.ty, R.tx, R.ty, L.bx, L.by, sx0, 0, sx1, 0, sx0, sh, ex);
+    _drawTri(ctx, src, R.tx, R.ty, R.bx, R.by, L.bx, L.by, sx1, 0, sx1, sh, sx0, sh, ex);
+    L.tx = R.tx; L.ty = R.ty; L.bx = R.bx; L.by = R.by;
+  }
+}
+
+// Canvas di servizio della distort, riusati fra le rigenerazioni.
+/** @type {HTMLCanvasElement|null} */ let _srcFace = null;
+/** @type {HTMLCanvasElement|null} */ let _srcSil = null;
+/** @type {HTMLCanvasElement|null} */ let _warpA = null;
+
+// Effetto + FACCIA della distort, tutto nel canvas dato. L'alpha dell'ombra
+// è cotta con un destination-in prima di posare la faccia (che resta piena);
+// l'estrusione è per raddoppio (k drawImage coprono 2^k offset, niente
+// scurimenti perché l'unione si fonde opaca prima dell'alpha).
+/**
+ * @param {HTMLCanvasElement} cnv @param {HTMLCanvasElement} scratch
+ * @param {TextItem} it @param {TextStyle} st @param {number} r
+ * @param {ReturnType<typeof blockBox>} box @param {number} stepDev
+ */
+function _renderDistortInto(cnv, scratch, it, st, r, box, stepDev) {
+  const d = st.distort;
+  const b = distortBox(it, st);
+  const m = _distortMargin(it, st);
+  // sorgente dritta: bordo sotto il fill, come l'SVG
+  const sw = Math.max(1, Math.round((b.w + 2 * m) * r));
+  const sh = Math.max(1, Math.round((b.h + 2 * m) * r));
+  if (!_srcFace) _srcFace = document.createElement('canvas');
+  if (_srcFace.width !== sw || _srcFace.height !== sh) { _srcFace.width = sw; _srcFace.height = sh; }
+  const fctx = _srcFace.getContext('2d');
+  fctx.setTransform(1, 0, 0, 1, 0, 0);
+  fctx.clearRect(0, 0, sw, sh);
+  fctx.setTransform(r, 0, 0, r, -(b.x - m) * r, -(b.y - m) * r);
+  fctx.font = textFont(it, st);
+  fctx.textAlign = 'center';
+  fctx.textBaseline = 'alphabetic';
+  fctx.lineJoin = 'round';
+  const by = textBaselineY(it, st);
+  if (st.stroke > 0) {
+    fctx.strokeStyle = st.strokeColor;
+    fctx.lineWidth = st.stroke * 2;
+    fctx.strokeText(it.text, it.x, by);
+  }
+  fctx.fillStyle = it.fill;
+  fctx.fillText(it.text, it.x, by);
+
+  const cw = Math.max(1, Math.round(box.w * r));
+  const ch = Math.max(1, Math.round(box.h * r));
+  if (cnv.width !== cw || cnv.height !== ch) { cnv.width = cw; cnv.height = ch; }
+  const ctx = cnv.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.shadowColor = 'rgba(0,0,0,0)';
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, cw, ch);
+
+  const preview = stepDev > FULL_STEP + 0.01;
+  const N = preview
+    ? Math.max(16, Math.min(96, Math.round(cw / 8)))
+    : Math.max(24, Math.min(256, Math.round(cw / 3)));
+
+  const effOn = st.block ? st.shadowDist > 0 : (st.shadowBlur > 0 || st.shadowDist > 0);
+  if (effOn) {
+    // sagoma color ombra = faccia ricolorata (stessa copertura, bordo incluso)
+    if (!_srcSil) _srcSil = document.createElement('canvas');
+    if (_srcSil.width !== sw || _srcSil.height !== sh) { _srcSil.width = sw; _srcSil.height = sh; }
+    const sctx = _srcSil.getContext('2d');
+    sctx.setTransform(1, 0, 0, 1, 0, 0);
+    sctx.globalCompositeOperation = 'source-over';
+    sctx.clearRect(0, 0, sw, sh);
+    sctx.drawImage(_srcFace, 0, 0);
+    sctx.globalCompositeOperation = 'source-in';
+    sctx.fillStyle = st.shadowColor;
+    sctx.fillRect(0, 0, sw, sh);
+    sctx.globalCompositeOperation = 'source-over';
+    // sagoma deformata, allineata a box come cnv
+    if (!_warpA) _warpA = document.createElement('canvas');
+    if (_warpA.width !== cw || _warpA.height !== ch) { _warpA.width = cw; _warpA.height = ch; }
+    const wctx = _warpA.getContext('2d');
+    wctx.setTransform(1, 0, 0, 1, 0, 0);
+    wctx.clearRect(0, 0, cw, ch);
+    wctx.setTransform(r, 0, 0, r, -box.x * r, -box.y * r);
+    _warpStrips(wctx, _srcSil, d, b, m, r, N);
+
+    const { ux, uy } = shadowDir(st);
+    const blur = st.shadowBlur > 0;
+    const union = blur ? scratch : cnv;
+    if (union !== cnv && (union.width !== cw || union.height !== ch)) {
+      union.width = cw; union.height = ch;
+    }
+    const uctx = union.getContext('2d');
+    uctx.setTransform(1, 0, 0, 1, 0, 0);
+    uctx.shadowColor = 'rgba(0,0,0,0)';
+    if (union !== cnv) uctx.clearRect(0, 0, cw, ch);
+    if (st.block) {
+      // copia 0 inclusa: sta sotto la faccia, e il raddoppio parte da lì
+      uctx.drawImage(_warpA, 0, 0);
+      const span = st.shadowDist * r;
+      const steps = Math.max(1, Math.ceil(span / stepDev));
+      const k = Math.ceil(Math.log2(steps + 1));
+      const s = span / ((1 << k) - 1);
+      for (let i = 0; i < k; i++) {
+        const off = s * (1 << i);
+        uctx.drawImage(union, ux * off, uy * off);
+      }
+    } else {
+      uctx.drawImage(_warpA, ux * st.shadowDist * r, uy * st.shadowDist * r);
+    }
+    if (blur) {
+      // il blur è l'ombra di un drawImage (ctx.filter manca su alcuni Safari)
+      ctx.shadowColor = st.shadowColor;
+      ctx.shadowBlur = st.shadowBlur * r;
+      ctx.shadowOffsetX = cw + ch;
+      ctx.drawImage(union, -(cw + ch), 0);
+      ctx.shadowColor = 'rgba(0,0,0,0)';
+      ctx.shadowBlur = 0;
+      ctx.shadowOffsetX = 0;
+    }
+    // alpha dell'ombra cotta ORA: la faccia posata dopo resta piena
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.globalAlpha = st.shadowOpacity ?? 0.65;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+  }
+  ctx.setTransform(r, 0, 0, r, -box.x * r, -box.y * r);
+  _warpStrips(ctx, _srcFace, d, b, m, r, N);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  return N;
 }
 
 // Disegna l'effetto nel canvas dato a `r` px bitmap per px mondo.
@@ -230,6 +707,9 @@ function blockBox(it, st) {
  * @param {ReturnType<typeof blockBox>} box @param {number} stepDev
  */
 function renderEffectInto(cnv, scratch, it, st, r, box, stepDev) {
+  if (st.warp === 'distort' && st.distort) {
+    return _renderDistortInto(cnv, scratch, it, st, r, box, stepDev);
+  }
   const cw = Math.max(1, Math.round(box.w * r));
   const ch = Math.max(1, Math.round(box.h * r));
   const blur = st.shadowBlur > 0;
@@ -244,7 +724,6 @@ function renderEffectInto(cnv, scratch, it, st, r, box, stepDev) {
   ctx.scale(r, r);
   ctx.translate(-box.x, -box.y);
   ctx.font = textFont(it, st);
-  ctx.textAlign = 'center';
   ctx.textBaseline = 'alphabetic';
   ctx.lineJoin = 'round';
   ctx.fillStyle = st.shadowColor;
@@ -258,12 +737,13 @@ function renderEffectInto(cnv, scratch, it, st, r, box, stepDev) {
   // SVG e Canvas usano entrambi la baseline alfabetica di textBaselineY();
   // non correggerla con getBBox(): sugli SVG <text> descrive una scatola
   // font/logica, non il contorno visivo dei pixel.
-  const bx = it.x, by = textBaselineY(it, st);
+  const by = textBaselineY(it, st);
+  const layout = warpLayout(it, st);
   // Si parte da 1: i=0 è la faccia frontale, già coperta dal testo SVG.
   // Disegnarla anche nella bitmap crea un alone/offset apparente sopra il fill.
   for (let i = 1; i <= n; i++) {
-    if (st.stroke > 0) ctx.strokeText(it.text, bx + sx * i, by + sy * i);
-    ctx.fillText(it.text, bx + sx * i, by + sy * i);
+    if (st.stroke > 0) drawTextPass(ctx, it, layout, by, true, sx * i, sy * i);
+    drawTextPass(ctx, it, layout, by, false, sx * i, sy * i);
   }
   if (blur) {
     if (cnv.width !== cw || cnv.height !== ch) { cnv.width = cw; cnv.height = ch; }
@@ -295,16 +775,47 @@ export function renderBlockCanvas(it, st, r, box = blockBox(it, st)) {
 /** @param {Layer} layer */
 export function syncTextSvg(layer) {
   const it = layer.item, t = layer.textEl, st = layer.style;
-  const main = layer.mainEl;
+  const main = layer.mainEl, src = layer.srcEl;
   if (!t) return;
   layer.svg.style.display = layer.visible && layer.opacity > 0 ? 'block' : 'none';
   layer.svg.style.opacity = String(layer.opacity);
-  t.textContent = it.text;
-  t.setAttribute('x', String(it.x));
-  t.setAttribute('y', String(textBaselineY(it, st)));
-  t.setAttribute('font-size', String(it.size));
-  t.setAttribute('font-family', `"${st.font}", sans-serif`);
-  t.setAttribute('font-weight', String(st.weight));
+  const layout = warpLayout(it, st);
+  const distortOn = st.warp === 'distort' && !!st.distort;
+  if (distortOn) {
+    // distort: la faccia è DENTRO la bitmap dell'effetto (il testo intero si
+    // deforma come un pezzo unico, l'SVG non sa piegare i glifi) — il piano
+    // vettoriale resta vuoto
+    if (t.parentNode) t.remove();
+  } else if (layout) {
+    // un tspan per glifo: x/y assoluti (origine = baseline sinistra, ancora
+    // 'start') e rotate attorno a quell'origine — lo stesso pivot dei path
+    // canvas, quindi faccia SVG ed effetti combaciano al pixel
+    if (t.parentNode !== src) src.replaceChildren(t);
+    t.setAttribute('text-anchor', 'start');
+    t.textContent = '';
+    for (const g of layout) {
+      const ts = document.createElementNS(SVG_NS, 'tspan');
+      ts.setAttribute('x', String(g.x));
+      ts.setAttribute('y', String(g.y));
+      ts.setAttribute('rotate', String(g.a * 180 / Math.PI));
+      ts.textContent = g.ch;
+      t.appendChild(ts);
+    }
+  } else {
+    if (t.parentNode !== src) src.replaceChildren(t);
+    t.setAttribute('text-anchor', 'middle');
+    t.textContent = it.text;
+    t.setAttribute('x', String(it.x));
+    t.setAttribute('y', String(textBaselineY(it, st)));
+  }
+  // layout calcolato col font di fallback: si rifà quando atterra il vero
+  if ((layout || distortOn) && !document.fonts.check(`${st.weight} 16px "${st.font}"`)) {
+    ensureFont(st.font, st.weight).then(() => { layer.styleDirty = true; });
+  }
+  // font sul <g>: lo ereditano il <text> unico e i glifi della distort
+  src.setAttribute('font-size', String(it.size));
+  src.setAttribute('font-family', `"${st.font}", sans-serif`);
+  src.setAttribute('font-weight', String(st.weight));
   main.setAttribute('fill', it.fill);
   if (st.stroke > 0) {
     main.setAttribute('stroke', st.strokeColor);
@@ -316,8 +827,11 @@ export function syncTextSvg(layer) {
   // alpha dell'effetto sull'ELEMENTO: cambia live senza rigenerare la
   // bitmap; include l'opacità del livello (il canvas è fratello dell'svg,
   // non figlio). Il display lo governa refreshBlockBitmap/freeBlockBitmap.
-  layer.blockCanvas.style.opacity =
-    String(layer.opacity * (st.shadowOpacity ?? 0.65));
+  // Con la distort il canvas porta ANCHE la faccia: l'alpha dell'ombra è
+  // cotta dentro, sull'elemento resta solo l'opacità del livello.
+  layer.blockCanvas.style.opacity = distortOn
+    ? String(layer.opacity)
+    : String(layer.opacity * (st.shadowOpacity ?? 0.65));
 }
 
 // Profilo device, deciso una volta al load: sul touch (mobile/tablet) le
@@ -428,14 +942,21 @@ function _fallbackCpu(layer, camera) {
 /** @param {Layer} layer @param {Camera} camera @param {boolean} camChanged */
 export function refreshBlockBitmap(layer, camera, camChanged) {
   const st = layer.style, it = layer.item;
-  const on = (st.block ? st.shadowDist > 0 : st.shadowBlur > 0 || st.shadowDist > 0) &&
+  // con la distort la bitmap porta anche la FACCIA: serve pure senza effetti
+  const distortOn = st.warp === 'distort' && !!st.distort;
+  const on = (distortOn ||
+    (st.block ? st.shadowDist > 0 : st.shadowBlur > 0 || st.shadowDist > 0)) &&
     layer.visible && layer.opacity > 0 && it.text.length > 0;
   if (!on) {
     if (layer.blockKey) freeBlockBitmap(layer);
     return;
   }
   layer.blockStable = camChanged ? 0 : (layer.blockStable || 0) + 1;
-  if (_gpuOn) {
+  // col warp attivo la SDF (che cuoce la stringa DRITTA in texture) andrebbe
+  // rigenerata a ogni tacca degli slider di forma: si resta sul path CPU,
+  // che ha già anteprime throttlate e promozione a gesto fermo
+  const warped = (st.warp ?? 'none') !== 'none';
+  if (_gpuOn && !warped) {
     const fx = _fxInst();
     if (fx && fx.ok) return _refreshGpu(fx, layer, camera);
   }
@@ -445,7 +966,10 @@ export function refreshBlockBitmap(layer, camera, camChanged) {
   const fontReady = document.fonts.check(`${st.weight} 16px "${st.font}"`) ? 1 : 0;
   const key = `${st.block ? 'B' : 'S'}|${it.text}|${it.size}|${st.font}|${st.weight}|` +
     `${st.stroke}|${st.shadowColor}|${st.shadowBlur}|${st.shadowDist}|` +
-    `${st.shadowAngle ?? 45}|F${fontReady}`;
+    `${st.shadowAngle ?? 45}|F${fontReady}|W${st.warp ?? 'none'},${st.warpBend ?? 0},` +
+    `${st.warpRadius ?? 0},${st.warpAmp ?? 0},${st.warpFreq ?? 0},V${st.distortVer ?? 0}` +
+    // la distort cuoce nella bitmap anche faccia e alpha dell'ombra
+    (distortOn ? `|X${it.fill},${st.strokeColor},${st.shadowOpacity ?? 0.65}` : '');
   const now = performance.now();
   if (layer.blockKey !== key) {
     // stile/testo cambiati: anteprima subito ma con un tetto di frequenza,

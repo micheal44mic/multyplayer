@@ -24,7 +24,8 @@ export const MAX_LAYERS = 16;
  * @property {TextStyle} [style]
  * @property {boolean} [styleDirty] testo: attributi SVG da risincronizzare
  * @property {SVGSVGElement} [svg] testo: piano SVG (creato/posseduto da planes)
- * @property {SVGTextElement} [textEl] sorgente in <defs> (geometria + contenuto)
+ * @property {SVGGElement} [srcEl] sorgente in <defs> (gruppo: font ereditati)
+ * @property {SVGTextElement} [textEl] testo unico dentro srcEl (modalità non-distort)
  * @property {HTMLCanvasElement} [blockCanvas] bitmap dell'effetto (estrusione 3D/ombra), fratello sotto l'svg
  * @property {SVGUseElement} [mainEl] testo visibile (fill/bordo)
  * @property {string} [blockKey] contenuto renderizzato nella bitmap ('' = nessuna)

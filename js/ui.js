@@ -10,7 +10,7 @@ import { textureFromFile, defaultGrainTexture } from './texture.js';
 import { TextUI } from './text_ui.js';
 import { LayersUI } from './layers_ui.js';
 import { PresetsUI } from './presets_ui.js';
-import { shadowCss, renderBlockCanvas, textBaselineY } from './text_layer.js';
+import { shadowCss, renderBlockCanvas, textBaselineY, warpLayout, drawTextPass } from './text_layer.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Tool} Tool */
@@ -721,13 +721,24 @@ export function exportPng(app) {
     } else {
       // stessa resa dell'SVG: bordo sotto il fill, ombra sulla sagoma
       const it = layer.item, st = layer.style;
+      if (st.warp === 'distort' && st.distort) {
+        // la bitmap della distort contiene già faccia + effetto (alpha
+        // dell'ombra cotta): un solo drawImage con l'opacità del livello
+        const blk = renderBlockCanvas(it, st, 1);
+        ctx.drawImage(blk.canvas, blk.box.x - x0, blk.box.y - y0);
+        continue;
+      }
       ctx.font = `${st.weight} ${it.size}px "${st.font}", sans-serif`;
-      ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
       ctx.lineJoin = 'round';
-      const tx = it.x - x0, ty = textBaselineY(it, st) - y0;
+      const layout = warpLayout(it, st);
+      const by = textBaselineY(it, st);
       const block3d = st.block && st.shadowDist > 0;
-      if (block3d) {
+      // anche l'ombra morbida del testo deformato passa dalla bitmap: glifo
+      // per glifo le ombre di ctx.shadow* si sovrapporrebbero scurendosi
+      const bitmapFx = block3d ||
+        (layout && (st.shadowBlur > 0 || st.shadowDist > 0));
+      if (bitmapFx) {
         // stesso renderer della bitmap live, alla risoluzione del documento;
         // alpha dell'ombra in un colpo solo (l'overlap non scurisce)
         const blk = renderBlockCanvas(it, st, 1);
@@ -745,13 +756,13 @@ export function exportPng(app) {
       if (st.stroke > 0) {
         ctx.strokeStyle = st.strokeColor;
         ctx.lineWidth = st.stroke * 2;
-        ctx.strokeText(it.text, tx, ty);
+        drawTextPass(ctx, it, layout, by, true, -x0, -y0);
         ctx.shadowColor = 'rgba(0,0,0,0)';
         ctx.fillStyle = it.fill;
-        ctx.fillText(it.text, tx, ty);
+        drawTextPass(ctx, it, layout, by, false, -x0, -y0);
       } else {
         ctx.fillStyle = it.fill;
-        ctx.fillText(it.text, tx, ty);
+        drawTextPass(ctx, it, layout, by, false, -x0, -y0);
         ctx.shadowColor = 'rgba(0,0,0,0)';
       }
       ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;

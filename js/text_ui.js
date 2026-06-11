@@ -2,8 +2,9 @@
 // testo SELEZIONATO vedendo il risultato live. Il bottone Testo in toolbar
 // crea ogni volta un NUOVO livello testo sopra quello attivo.
 
-import { TEXT_FONTS, ensureFont, defaultTextStyle, makeTextItem } from './text_layer.js';
+import { TEXT_FONTS, ensureFont, defaultTextStyle, makeTextItem, textWidth, defaultDistort, bumpDistort } from './text_layer.js';
 import { makeTextLayer } from './layers.js';
+import { DistortGizmo } from './distort_ui.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./layers.js').Layer} Layer */
@@ -13,6 +14,7 @@ export class TextUI {
   constructor(app) {
     this.app = app;
     this.panel = document.getElementById('textpanel');
+    this.gizmo = new DistortGizmo(app); // gabbia distort sul canvas, sync per frame
     this._fontsKicked = false;
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 }; // visibleRect riusato
     /** @type {(() => void)[]} */
@@ -146,6 +148,80 @@ export class TextUI {
     });
     this._sync.push(() => { sel.value = readStyle((st) => st.font, 'Orbitron'); });
     body.appendChild(sel);
+
+    body.appendChild(this._section('Trasformazione'));
+    const wsel = document.createElement('select');
+    wsel.className = 'tp-select';
+    for (const [v, name] of [['none', 'Nessuna'], ['arc', 'Arco'],
+      ['circle', 'Cerchio'], ['wave', 'Onda'], ['distort', 'Distorsione']]) {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = name;
+      wsel.appendChild(o);
+    }
+    wsel.addEventListener('change', () => {
+      const l = this.layer;
+      if (!l) return;
+      withStyle((st) => {
+        st.warp = /** @type {import('./text_layer.js').TextStyle['warp']} */ (wsel.value);
+        // primo uso della forma: parametri proporzionati al testo corrente
+        // (0 = mai toccati), da lì in poi comanda lo slider
+        if (st.warp === 'circle' && !st.warpRadius) {
+          st.warpRadius = Math.max(20, Math.round(textWidth(l.item, st) / (2 * Math.PI)));
+        }
+        if (st.warp === 'wave' && !st.warpAmp) {
+          st.warpAmp = Math.max(1, Math.round(l.item.size * 0.25));
+        }
+        if (st.warp === 'distort' && !st.distort) {
+          st.distort = defaultDistort();
+          bumpDistort(st);
+        }
+      });
+      for (const f of this._sync) f(); // nuovi default + visibilità delle righe
+    });
+    this._sync.push(() => { wsel.value = readStyle((st) => st.warp ?? 'none', 'none'); });
+    body.appendChild(wsel);
+    const rowBend = this._slider('Curvatura', -360, 360, 1,
+      () => readStyle((st) => st.warpBend ?? 90, 90),
+      (v) => withStyle((st) => { st.warpBend = v; }),
+      (v) => Math.round(v) + '°');
+    const rowRadius = this._slider('Raggio', 20, 8000, 1,
+      () => readStyle((st) => st.warpRadius || 200, 200),
+      (v) => withStyle((st) => { st.warpRadius = v; }),
+      (v) => Math.round(v) + ' px', true);
+    const rowAmp = this._slider('Ampiezza', 1, 1000, 1,
+      () => readStyle((st) => st.warpAmp || 20, 20),
+      (v) => withStyle((st) => { st.warpAmp = v; }),
+      (v) => Math.round(v) + ' px', true);
+    const rowFreq = this._slider('Onde', 0.5, 6, 0.25,
+      () => readStyle((st) => st.warpFreq ?? 2, 2),
+      (v) => withStyle((st) => { st.warpFreq = v; }),
+      (v) => String(Math.round(v * 4) / 4));
+    // distorsione: si edita sul canvas (gabbia con ancore e maniglie),
+    // qui restano solo la guida e il reset
+    const rowDistort = document.createElement('div');
+    rowDistort.className = 'p-row';
+    const dHint = document.createElement('div');
+    dHint.className = 'p-hint';
+    dHint.textContent = 'Trascina sul canvas: angoli, punti centrali e maniglie di curvatura.';
+    const dReset = document.createElement('button');
+    dReset.className = 'tp-reset';
+    dReset.type = 'button';
+    dReset.textContent = 'Reimposta gabbia';
+    dReset.addEventListener('click', () => withStyle((st) => {
+      st.distort = defaultDistort();
+      bumpDistort(st);
+    }));
+    rowDistort.append(dHint, dReset);
+    body.append(rowBend, rowRadius, rowAmp, rowFreq, rowDistort);
+    this._sync.push(() => {
+      const w = readStyle((st) => st.warp ?? 'none', 'none');
+      rowBend.style.display = w === 'arc' ? '' : 'none';
+      rowRadius.style.display = w === 'circle' ? '' : 'none';
+      rowAmp.style.display = w === 'wave' ? '' : 'none';
+      rowFreq.style.display = w === 'wave' ? '' : 'none';
+      rowDistort.style.display = w === 'distort' ? '' : 'none';
+    });
 
     body.appendChild(this._section('Bordo'));
     body.appendChild(this._slider('Spessore', 0, 24, 0.5,
