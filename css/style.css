@@ -26,11 +26,12 @@ html, body {
   -webkit-touch-callout: none; /* niente lente/callout iOS al long-press */
 }
 
-/* container dei piani: riceve TUTTO l'input; i piani figli sono inerti */
+/* container dei piani: riceve TUTTO l'input; i piani figli sono inerti.
+   Lo sfondo è il piano di lavoro (scrivania): i canvas bianchi ci galleggiano sopra. */
 #planes {
   position: fixed;
   inset: 0;
-  background: #ffffff;
+  background: #e4e6ec;
   touch-action: none;
   cursor: crosshair;
 }
@@ -52,6 +53,32 @@ html, body {
   opacity: 0.16;
 }
 
+/* piano dei canvas: rettangoli bianchi sotto i piani di disegno; dimensioni
+   già in px schermo (niente scale: bordo a spessore costante a ogni zoom) */
+#boards { overflow: hidden; }
+#boards .board {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(22, 26, 44, 0.12), 0 8px 28px rgba(22, 26, 44, 0.14);
+}
+#boards .board.active {
+  box-shadow: 0 0 0 2px var(--accent), 0 8px 28px rgba(22, 26, 44, 0.14);
+}
+#boards .board-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  font-size: 12px;
+  line-height: 1;
+  color: #7a7f90;
+  white-space: nowrap;
+}
+#boards .board-label.active { color: var(--accent); }
+
 #cursor {
   position: fixed;
   pointer-events: none;
@@ -61,6 +88,59 @@ html, body {
   transform: translate(-50%, -50%);
   display: none;
   z-index: 5;
+}
+
+/* ---------- popup preset pennello ---------- */
+/* ancorato sotto il bottone Pennello (posizione calcolata da presets_ui.js) */
+#presetspopup {
+  position: fixed;
+  width: min(336px, calc(100vw - 16px));
+  max-height: calc(100vh - 90px - env(safe-area-inset-bottom));
+  overflow-y: auto;
+  padding: 10px;
+  background: var(--ui-bg);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--ui-line);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+  z-index: 24;
+  display: none;
+}
+#presetspopup.open { display: block; }
+
+.bp-head {
+  font-weight: 600;
+  font-size: 13px;
+  padding: 2px 4px 8px;
+}
+.bp-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.bp-card {
+  display: block;
+  width: 100%;
+  padding: 6px 6px 5px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--ui-line);
+  border-radius: 10px;
+  color: var(--ui-fg);
+  font: inherit;
+  cursor: pointer;
+  text-align: center;
+}
+.bp-card:hover { border-color: var(--ui-dim); }
+.bp-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.bp-thumb {
+  display: block;
+  width: 100%;
+  height: 38px;
+  border-radius: 6px;
+}
+.bp-name {
+  margin-top: 5px;
+  font-size: 12px;
 }
 
 /* ---------- toolbar ---------- */

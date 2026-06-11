@@ -121,6 +121,7 @@ export class StampCache {
     this.bytes = 0; // i formati giganti hanno maschere da MB: bound anche in byte
     this.heap = heap;
     this.generated = 0; // contatore per HUD
+    this.genMs = 0;     // tempo cumulativo in generateStamp (il profiler legge i delta)
   }
 
   // Ritorna {size, half, mask, r} con mask Uint8Array(size*size).
@@ -145,7 +146,9 @@ export class StampCache {
     const h = clamp(hB / 12, 0, 1);
     const ro = clamp(roB / 8, 0.05, 1);
     const a = aB * (TWO_PI / 32);
+    const t0 = performance.now();
     s = generateStamp(r, h, ro, a, this.heap);
+    this.genMs += performance.now() - t0;
     this.generated++;
 
     this.map.set(key, s);

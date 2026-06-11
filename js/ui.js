@@ -9,6 +9,7 @@ import { BrushPreview } from './brush_preview.js';
 import { textureFromFile, defaultGrainTexture } from './texture.js';
 import { TextUI } from './text_ui.js';
 import { LayersUI } from './layers_ui.js';
+import { PresetsUI } from './presets_ui.js';
 import { shadowCss, renderBlockCanvas, textBaselineY } from './text_layer.js';
 
 /** @typedef {import('./main.js').App} App */
@@ -170,6 +171,7 @@ export class UI {
     this._texRefresh = null;
     this.layersUI = new LayersUI(app);
     this.textUI = new TextUI(app);
+    this.presetsUI = new PresetsUI(this);
     this._buildStudio();
     this._bindToolbar();
     this._bindKeys();
@@ -505,6 +507,7 @@ export class UI {
     this.studio.classList.toggle('open', open);
     this.backdrop.hidden = !open;
     if (open) {
+      this.presetsUI.open(false);
       this._updateBadge();
       this.preview.render();
     }
@@ -525,10 +528,15 @@ export class UI {
   _bindToolbar() {
     const app = this.app;
     /** @type {Record<string, Tool>} */
-    const tools = { 'tool-brush': 'brush', 'tool-eraser': 'eraser', 'tool-pan': 'pan' };
+    const tools = { 'tool-eraser': 'eraser', 'tool-pan': 'pan' };
     for (const [id, tool] of Object.entries(tools)) {
       document.getElementById(id).addEventListener('click', () => this.setTool(tool));
     }
+    // Pennello: primo tocco seleziona lo strumento, il secondo apre i preset.
+    document.getElementById('tool-brush').addEventListener('click', () => {
+      if (brush.tool === 'brush') this.presetsUI.toggle();
+      else this.setTool('brush');
+    });
 
     const colorInput = /** @type {HTMLInputElement} */ (document.getElementById('color'));
     colorInput.addEventListener('input', () => {
@@ -542,8 +550,9 @@ export class UI {
     document.getElementById('btn-clear').addEventListener('click', () => {
       if (confirm('Cancellare tutto il disegno?')) app.clearAll();
     });
-    document.getElementById('btn-export').addEventListener('click', () => exportPng(app.layerMgr));
-    document.getElementById('btn-resetview').addEventListener('click', () => app.camera.reset());
+    document.getElementById('btn-export').addEventListener('click', () => exportPng(app));
+    document.getElementById('btn-resetview').addEventListener('click', () => app.fitActiveBoard());
+    document.getElementById('btn-addboard').addEventListener('click', () => app.addBoard());
     this.zoomOutBtn.addEventListener('click', () => this._zoomBy(0.8));
     this.zoomInBtn.addEventListener('click', () => this._zoomBy(1.25));
     document.getElementById('btn-hud').addEventListener('click', () => app.hud.toggle());
@@ -565,6 +574,15 @@ export class UI {
       document.getElementById(id).classList.toggle('active', t === tool);
     }
     this.app.planesEl.classList.toggle('panning', tool === 'pan');
+    if (tool !== 'brush') this.presetsUI.open(false);
+  }
+
+  // Il pennello è cambiato da fuori (preset applicato): riallinea studio,
+  // badge e anteprima.
+  notifyBrushChanged() {
+    this.syncSliders();
+    this._refreshDeps();
+    this._settingChanged();
   }
 
   /** @param {string} hex */
@@ -595,15 +613,19 @@ export class UI {
       const k = e.key.toLowerCase();
       if ((e.ctrlKey || e.metaKey) && k === 'z' && !e.shiftKey) { e.preventDefault(); app.undo(); }
       else if ((e.ctrlKey || e.metaKey) && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); app.redo(); }
-      else if (k === 'b') this.setTool('brush');
+      else if (k === 'b') {
+        // come il bottone: già pennello -> apre/chiude i preset
+        if (brush.tool === 'brush') this.presetsUI.toggle();
+        else this.setTool('brush');
+      }
       else if (k === 'e') this.setTool('eraser');
       else if (k === 'h') this.setTool('pan');
       else if (k === 'p') this.toggleStudio();
       else if (k === 't') this.textUI.placeAtView();
       else if (k === 'l') this.layersUI.toggle();
-      else if (k === 'escape') { this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); }
+      else if (k === 'escape') { this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); this.presetsUI.open(false); }
       else if (k === '`' || k === '\\') app.hud.toggle();
-      else if (k === '0') app.camera.reset();
+      else if (k === '0') app.fitActiveBoard();
       else if (k === '[') { brush.size = stepSize(brush.size, -1); this.syncSliders(); this._settingChanged(); }
       else if (k === ']') { brush.size = stepSize(brush.size, 1); this.syncSliders(); this._settingChanged(); }
       else if (k === '+' || k === '=') app.camera.zoomAt(app.camera.w / 2, app.camera.h / 2, 1.25);
@@ -640,51 +662,28 @@ export class UI {
   }
 }
 
-// Export PNG: tutti i livelli visibili compositati in ordine su bianco —
-// raster con la loro opacità, testo ridisegnato come vettore (bordo+ombra)
-// alla risoluzione del documento. Bbox = chunk non vuoti ∪ ingombro testi.
-/** @param {import('./layers.js').LayerManager} mgr */
-export function exportPng(mgr) {
-  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  let any = false;
-  const measurer = document.createElement('canvas').getContext('2d');
+// Export PNG del canvas ATTIVO, alla sua risoluzione esatta (es. 2048×2048):
+// i suoi livelli visibili compositati in ordine su bianco — raster con la
+// loro opacità, testo ridisegnato come vettore (bordo+ombra).
+/** @param {import('./main.js').App} app */
+export function exportPng(app) {
+  const board = app.boards.active;
+  const mgr = board.mgr;
+  const x0 = board.x, y0 = board.y, w = board.w, h = board.h;
 
+  let any = false;
   for (const layer of mgr.layers) {
     if (!layer.visible || layer.opacity <= 0) continue;
     if (layer.kind === 'raster') {
       for (const c of layer.store.map.values()) {
-        // un chunk può esistere ma essere tutto trasparente (gomma/undo)
-        let empty = true;
-        const d = c.data;
-        for (let o = 3; o < d.length; o += 4) if (d[o] !== 0) { empty = false; break; }
-        if (empty) continue;
-        any = true;
-        if (c.cx * CHUNK < x0) x0 = c.cx * CHUNK;
-        if (c.cy * CHUNK < y0) y0 = c.cy * CHUNK;
-        if ((c.cx + 1) * CHUNK > x1) x1 = (c.cx + 1) * CHUNK;
-        if ((c.cy + 1) * CHUNK > y1) y1 = (c.cy + 1) * CHUNK;
+        if (c.touched) { any = true; break; }
       }
     } else {
-      const it = layer.item, st = layer.style;
-      measurer.font = `${st.weight} ${it.size}px "${st.font}", sans-serif`;
-      const m = measurer.measureText(it.text);
-      const hw = (m.width / 2) + st.stroke + st.shadowBlur + st.shadowDist + 4;
-      const hh = (it.size * 0.75) + st.stroke + st.shadowBlur + st.shadowDist + 4;
       any = true;
-      if (it.x - hw < x0) x0 = it.x - hw;
-      if (it.y - hh < y0) y0 = it.y - hh;
-      if (it.x + hw > x1) x1 = it.x + hw;
-      if (it.y + hh > y1) y1 = it.y + hh;
     }
+    if (any) break;
   }
   if (!any) { alert('Niente da esportare: il canvas è vuoto.'); return; }
-
-  x0 = Math.floor(x0); y0 = Math.floor(y0);
-  const w = Math.ceil(x1) - x0, h = Math.ceil(y1) - y0;
-  if (w > 16384 || h > 16384) {
-    alert(`Disegno troppo esteso per un singolo PNG (${w}×${h}). Limite 16384px per lato.`);
-    return;
-  }
 
   const cnv = document.createElement('canvas');
   cnv.width = w; cnv.height = h;
@@ -763,7 +762,7 @@ export function exportPng(mgr) {
   cnv.toBlob((blob) => {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'fable-paint.png';
+    a.download = `${board.name.replace(/[\\/:*?"<>|]/g, '_')}.png`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }, 'image/png');

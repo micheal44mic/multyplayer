@@ -7,6 +7,7 @@
 // diagnosi remota.
 
 import { brush } from './brush.js';
+import { strokeProfiler } from './stroke_profiler.js';
 
 const HISTORY = 120;
 const SLOW_MS = 18; // frame oltre questa soglia contano come lag
@@ -237,6 +238,12 @@ export class Hud {
         const rest = ft - (this._rInput[k] + this._rRaster[k] + this._rCommit[k] + this._rUpload[k] + this._rDraw[k]);
         L.push(`  ${ft.toFixed(1).padStart(7)} | ${this._rInput[k].toFixed(1)} ${this._rRaster[k].toFixed(1)}(${this._rTex[k].toFixed(1)}) ${this._rCommit[k].toFixed(1)} ${this._rUpload[k].toFixed(1)} ${this._rDraw[k].toFixed(1)} | ${rest.toFixed(1)} | ${this._rQueue[k]}`);
       }
+    }
+
+    // l'ultimo tratto profilato (lo stesso report stampato in console)
+    if (strokeProfiler.lastReport) {
+      L.push('');
+      L.push(strokeProfiler.lastReport);
     }
 
     const text = L.join('\n');

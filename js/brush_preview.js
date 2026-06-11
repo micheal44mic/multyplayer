@@ -41,7 +41,10 @@ export class BrushPreview {
     this._raf = requestAnimationFrame(() => { this._raf = 0; this.render(); });
   }
 
-  render() {
+  // cfg: di default il pennello vivo; il popup dei preset passa la ricetta
+  // del preset per disegnare la sua anteprima senza toccare il pennello.
+  /** @param {import('./brush.js').Brush} [cfg] */
+  render(cfg = brush) {
     const cssW = this.canvas.clientWidth, cssH = this.canvas.clientHeight;
     if (!cssW || !cssH) return; // studio non ancora in layout
     const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -50,7 +53,7 @@ export class BrushPreview {
     if (this.canvas.height !== H) this.canvas.height = H;
 
     // --- 1. tratto di prova nella pipeline reale -------------------------
-    const sizePx = Math.min(brush.size * dpr, H * 0.66);
+    const sizePx = Math.min(cfg.size * dpr, H * 0.66);
     const pad = 4 * dpr + sizePx * 0.5;
     const x0 = pad, x1 = Math.max(x0 + 1, W - pad);
     const cy = H * 0.5;
@@ -80,7 +83,7 @@ export class BrushPreview {
 
     this.queue.clear();
     const engine = this.engine;
-    engine.begin(px(0), py(0), 1, 0, { ...brush, size: sizePx, tool: 'brush' }, SEED, 1);
+    engine.begin(px(0), py(0), 1, 0, { ...cfg, size: sizePx, tool: 'brush' }, SEED, 1);
     this.raster.beginStroke(engine.snap);
     for (let i = 1; i <= POINTS; i++) {
       engine.move(px(i / POINTS), py(i / POINTS), 1, times[i]);

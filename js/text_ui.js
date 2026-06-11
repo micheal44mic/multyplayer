@@ -14,6 +14,7 @@ export class TextUI {
     this.app = app;
     this.panel = document.getElementById('textpanel');
     this._fontsKicked = false;
+    this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 }; // visibleRect riusato
     /** @type {(() => void)[]} */
     this._sync = [];
     this._build();
@@ -27,19 +28,24 @@ export class TextUI {
     return l && l.kind === 'text' ? l : null;
   }
 
-  // Bottone Testo: nuovo livello testo centrato nella vista corrente,
-  // proporzionale allo schermo (M1M4.COM ≈ 5.7 em) ma mai oltre 70px
-  // APPARENTI: il corpo è in px mondo, il tetto si applica in px schermo
-  // così a qualunque zoom il testo nasce leggibile e mai gigante.
+  // Bottone Testo: nuovo livello testo centrato nel CANVAS attivo (quello
+  // dove si è disegnato/toccato l'ultima volta), con corpo proporzionale al
+  // canvas (M1M4.COM ≈ 5.7 em sull'80% della larghezza): a qualunque zoom il
+  // testo nasce della stessa taglia relativa al suo canvas. Se il centro del
+  // canvas è fuori vista, la camera lo inquadra: il testo appena creato si
+  // vede sempre.
   placeAtView() {
     const app = this.app;
     if (!app.layerMgr.canAdd) { alert('Massimo numero di livelli raggiunto.'); return; }
-    const cam = app.camera;
+    const board = app.boards.active;
+    const cx = board.x + board.w / 2, cy = board.y + board.h / 2;
     const fill = /** @type {HTMLInputElement} */ (document.getElementById('color')).value;
-    const size = Math.max(8, Math.min(70, cam.w * 0.8 / 5.7)) / cam.zoom;
-    const item = makeTextItem(cam.x, cam.y, fill, size);
+    const size = Math.max(8, board.w * 0.8 / 5.7);
+    const item = makeTextItem(cx, cy, fill, size);
     const layer = makeTextLayer('Testo', item, defaultTextStyle());
     app.addLayer(layer);
+    const r = app.camera.visibleRect(this._rect);
+    if (cx < r.x0 || cx > r.x1 || cy < r.y0 || cy > r.y1) app.fitBoard(board);
     ensureFont(layer.style.font, layer.style.weight);
     this.open(true);
     // si può riscrivere subito: focus dopo il sync di open (che rimette

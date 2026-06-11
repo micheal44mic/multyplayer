@@ -42,17 +42,20 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * @property {number} [index] solo op 'attach'/'detach'
  * @property {number} [from] solo op 'move'
  * @property {number} [to]
+ * @property {number} [boardId] struct: canvas di appartenenza dell'operazione
  */
 
 /**
  * Chi applica davvero le operazioni: l'App. storeFor risolve il livello di
  * uno stroke (null = livello sparito, entry da scartare in silenzio).
+ * Gli id dei livelli sono globali a tutti i canvas; attach/move ricevono il
+ * canvas di destinazione (boardId), detach lo ritorna.
  * @typedef {Object} UndoHost
  * @property {(layerId: number) => ChunkStore|null} storeFor
  * @property {(c: Chunk) => void} disposeTex
- * @property {(layer: Layer, index: number) => void} attachLayer
- * @property {(layerId: number) => {layer: Layer, index: number}|null} detachLayer
- * @property {(from: number, to: number) => void} moveLayer
+ * @property {(layer: Layer, index: number, boardId: number) => void} attachLayer
+ * @property {(layerId: number) => {layer: Layer, index: number, boardId: number}|null} detachLayer
+ * @property {(from: number, to: number, boardId: number) => void} moveLayer
  */
 
 const MAX_ENTRIES = 64;
@@ -271,22 +274,22 @@ export class UndoManager {
       const d = host.detachLayer(e.layerId);
       if (!d) return null;
       return /** @type {UndoEntry} */ ({
-        kind: 'struct', op: 'detach', layer: d.layer, index: d.index,
+        kind: 'struct', op: 'detach', layer: d.layer, index: d.index, boardId: d.boardId,
         chunks: [], compressed: false, ready: Promise.resolve(),
         rawSize: d.layer.store ? d.layer.store.cpuBytes : 0,
       });
     }
     if (e.op === 'detach') {
-      host.attachLayer(e.layer, e.index);
+      host.attachLayer(e.layer, e.index, e.boardId);
       return /** @type {UndoEntry} */ ({
-        kind: 'struct', op: 'attach', layerId: e.layer.id, index: e.index,
+        kind: 'struct', op: 'attach', layerId: e.layer.id, index: e.index, boardId: e.boardId,
         chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
       });
     }
     if (e.op === 'move') {
-      host.moveLayer(e.to, e.from);
+      host.moveLayer(e.to, e.from, e.boardId);
       return /** @type {UndoEntry} */ ({
-        kind: 'struct', op: 'move', from: e.to, to: e.from,
+        kind: 'struct', op: 'move', from: e.to, to: e.from, boardId: e.boardId,
         chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
       });
     }

@@ -11,7 +11,7 @@ import { Canvas2DRenderer } from './renderer_2d.js';
 
 /** @typedef {import('./camera.js').Camera} Camera */
 /** @typedef {import('./layers.js').Layer} Layer */
-/** @typedef {import('./layers.js').LayerManager} LayerManager */
+/** @typedef {import('./boards.js').BoardManager} BoardManager */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
 /** @typedef {import('./renderer_gl.js').GLRenderer} GLRenderer */
 
@@ -22,10 +22,15 @@ import { Canvas2DRenderer } from './renderer_2d.js';
 const FREEZE_SETTLE_FRAMES = 6;
 
 export class Planes {
-  /** @param {HTMLElement} container @param {HTMLElement} gridEl */
-  constructor(container, gridEl) {
+  /** @param {HTMLElement} container @param {HTMLElement} gridEl @param {HTMLElement} boardsEl */
+  constructor(container, gridEl, boardsEl) {
     this.container = container;
     this.gridEl = gridEl;
+    // piano dei canvas: rettangoli bianchi (sfondo + bordo) sotto i disegni
+    this.boardsEl = boardsEl;
+    /** @type {Map<number, {root: HTMLDivElement, label: HTMLDivElement, w: number, h: number, name: string}>} */
+    this._boardEls = new Map();
+    this._bEpoch = 0;
     /** @type {Group[]} */
     this.groups = [];
     /** @type {Canvas2DRenderer[]} pool dei renderer dei gruppi superiori */
@@ -61,23 +66,28 @@ export class Planes {
 
   // Ricostruisce gruppi e ordine DOM. bottomCanvas = canvas del renderer
   // principale (può essere appena stato sostituito: toggle desync).
+  // I livelli di TUTTI i canvas entrano nella stessa pila di piani: i canvas
+  // non si sovrappongono nello spazio, quindi l'ordine tra canvas diversi è
+  // irrilevante e i run raster possono attraversare i confini (meno piani).
   /**
-   * @param {LayerManager} mgr
+   * @param {BoardManager} boards
    * @param {HTMLCanvasElement} bottomCanvas
    * @param {{disposeChunkTex: (c: import('./store.js').Chunk) => void}} bottomRenderer
    */
-  _rebuild(mgr, bottomCanvas, bottomRenderer) {
+  _rebuild(boards, bottomCanvas, bottomRenderer) {
     /** @type {Group[]} */
     const groups = [];
     /** @type {{type: 'raster', layers: Layer[]}|null} */
     let run = null;
-    for (const layer of mgr.layers) {
-      if (layer.kind === 'text') {
-        groups.push({ type: 'text', layer });
-        run = null;
-      } else {
-        if (!run) { run = { type: 'raster', layers: [] }; groups.push(run); }
-        run.layers.push(layer);
+    for (const board of boards.boards) {
+      for (const layer of board.mgr.layers) {
+        if (layer.kind === 'text') {
+          groups.push({ type: 'text', layer });
+          run = null;
+        } else {
+          if (!run) { run = { type: 'raster', layers: [] }; groups.push(run); }
+          run.layers.push(layer);
+        }
       }
     }
     this.groups = groups;
@@ -88,7 +98,7 @@ export class Planes {
     /** @type {Map<number, number>} */
     const where = new Map();
     /** @type {Element[]} */
-    const order = [this.gridEl];
+    const order = [this.gridEl, this.boardsEl];
     for (const g of groups) {
       if (g.type === 'text') {
         if (!g.layer.svg) createTextSvg(g.layer);
@@ -117,14 +127,14 @@ export class Planes {
     }
     // canvas WebGL sempre nel DOM anche senza livelli raster (testo-only):
     // il contesto resta vivo e il piano è pronto a riempirsi
-    if (!bottomDone) order.splice(1, 0, bottomCanvas);
+    if (!bottomDone) order.splice(2, 0, bottomCanvas);
 
     // migrazione: un raster che cambia piano ha texture/c2d stantii — si
     // dimenticano (la CPU è la verità, tutto rinasce on-demand alla vista)
     for (const [id, slot] of where) {
       const prev = this._where.get(id);
       if (prev !== undefined && prev !== slot && slot !== -2) {
-        const layer = mgr.byId(id);
+        const layer = boards.layerById(id);
         if (layer && layer.store) {
           layer.store.forEachChunkAll((c) => {
             bottomRenderer.disposeChunkTex(c);
@@ -164,7 +174,8 @@ export class Planes {
    * bottom = renderer principale dell'App (GL o fallback 2D).
    * @param {Object} o
    * @param {Camera} o.camera
-   * @param {LayerManager} o.mgr
+   * @param {BoardManager} o.boards
+   * @param {number} o.activeId livello attivo del canvas attivo
    * @param {ChunkStore} o.strokeStore
    * @param {number} o.liveOpacity
    * @param {boolean} o.eraserLive
@@ -173,10 +184,11 @@ export class Planes {
    * @returns {{uploadMs: number, drawMs: number}}
    */
   render(o) {
-    const { camera, mgr, strokeStore, bottom } = o;
-    if (this._epoch !== mgr.epoch) {
-      this._epoch = mgr.epoch;
-      this._rebuild(mgr, o.bottomCanvas, bottom);
+    const { camera, boards, strokeStore, bottom } = o;
+    const epoch = boards.combinedEpoch;
+    if (this._epoch !== epoch) {
+      this._epoch = epoch;
+      this._rebuild(boards, o.bottomCanvas, bottom);
     }
 
     const camChanged = camera.x !== this._cx || camera.y !== this._cy ||
@@ -191,8 +203,13 @@ export class Planes {
       const hw = camera.w * 0.5 / camera.zoom, hh = camera.h * 0.5 / camera.zoom;
       this._vb = `${camera.x - hw} ${camera.y - hh} ${hw * 2} ${hh * 2}`;
     }
+    // rettangoli dei canvas: seguono camera e struttura/selezione
+    if (camChanged || boards.epoch !== this._bEpoch) {
+      this._bEpoch = boards.epoch;
+      this._syncBoards(camera, boards);
+    }
 
-    const activeId = mgr.activeId;
+    const activeId = o.activeId;
     const t0 = performance.now();
 
     // upload dei chunk sporchi, ciascuno sul renderer del proprio piano
@@ -262,6 +279,52 @@ export class Planes {
 
   // Forza il ridisegno dei piani 2D al prossimo frame (undo, visibilità...).
   invalidate() { this._forceDraw = true; }
+
+  // Piano dei canvas: un div bianco per canvas (sfondo + bordo) e una
+  // etichetta, posizionati in px schermo. Niente scale(): larghezza/altezza
+  // in px già moltiplicati per lo zoom, così il bordo resta a spessore
+  // costante a qualunque ingrandimento.
+  /** @param {Camera} camera @param {BoardManager} boards */
+  _syncBoards(camera, boards) {
+    const z = camera.zoom;
+    const seen = new Set();
+    for (const b of boards.boards) {
+      seen.add(b.id);
+      let el = this._boardEls.get(b.id);
+      if (!el) {
+        const root = document.createElement('div');
+        root.className = 'board';
+        const label = document.createElement('div');
+        label.className = 'board-label';
+        this.boardsEl.append(root, label);
+        el = { root, label, w: 0, h: 0, name: '' };
+        this._boardEls.set(b.id, el);
+      }
+      const sx = (b.x - camera.x) * z + camera.w * 0.5;
+      const sy = (b.y - camera.y) * z + camera.h * 0.5;
+      const w = b.w * z, h = b.h * z;
+      if (el.w !== w || el.h !== h) {
+        el.w = w; el.h = h;
+        el.root.style.width = w + 'px';
+        el.root.style.height = h + 'px';
+      }
+      el.root.style.transform = `translate(${sx}px, ${sy}px)`;
+      el.label.style.transform = `translate(${sx}px, ${sy - 22}px)`;
+      const active = b.id === boards.activeId;
+      el.root.classList.toggle('active', active);
+      el.label.classList.toggle('active', active);
+      const name = `${b.name} · ${b.w}×${b.h}`;
+      if (el.name !== name) { el.name = name; el.label.textContent = name; }
+    }
+    // canvas spariti (clearAll): via anche i loro div
+    for (const [id, el] of this._boardEls) {
+      if (!seen.has(id)) {
+        el.root.remove();
+        el.label.remove();
+        this._boardEls.delete(id);
+      }
+    }
+  }
 
   // Gestisce il freeze dei piani testo durante lo zoom touch. Parte quando
   // CAMBIA lo zoom (il pan puro resta live: trasla soltanto), tiene fermo il

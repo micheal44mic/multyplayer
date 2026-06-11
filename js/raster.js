@@ -52,6 +52,13 @@ export class Rasterizer {
     // e in buildup riscriverlo lo accumulerebbe due volte. null = nessun clip.
     /** @type {Set<number>|null} */
     this.clip = null;
+    // Rettangolo mondo (inclusivo) del canvas di destinazione: ogni dab e
+    // capsula viene ritagliato qui PRIMA di iterare i chunk — il tratto non
+    // esce mai dal canvas e fuori non si creano chunk. null = nessun limite.
+    /** @type {{x0: number, y0: number, x1: number, y1: number}|null} */
+    this.clipRect = null;
+    // bbox ritagliato riusato (zero allocazioni per dab)
+    this._box = { x0: 0, y0: 0, x1: 0, y1: 0 };
     // stats per HUD
     this.lastPx = 0;
     this.lastDabs = 0;
@@ -101,6 +108,12 @@ export class Rasterizer {
     // e bake di maschere) nell'ultimo run
     this.lastTexMs = 0;
     this.lastTexDabs = 0;
+    // accumulatori cumulativi (mai azzerati): il profiler del tratto legge i
+    // delta per frame, così conta anche i run fuori dal frame loop (replay
+    // della punta al pen-up dentro gli handler di input)
+    this.texMsAcc = 0;
+    this.tileFillsAcc = 0;
+    this.bakesAcc = 0;
   }
 
   /** @param {number} n */
@@ -112,6 +125,23 @@ export class Rasterizer {
     this._rv0 = new Uint16Array(n);
     this._rv1 = new Uint16Array(n);
     this._rvf = new Uint8Array(n);
+  }
+
+  // Interseca il bbox di un dab/capsula col rettangolo del canvas attivo
+  // (clipRect). Riusa _box; null = tutto fuori, niente da disegnare.
+  /** @param {number} x0 @param {number} y0 @param {number} x1 @param {number} y1 */
+  _clampBox(x0, y0, x1, y1) {
+    const cr = this.clipRect;
+    if (cr) {
+      if (x0 < cr.x0) x0 = cr.x0;
+      if (y0 < cr.y0) y0 = cr.y0;
+      if (x1 > cr.x1) x1 = cr.x1;
+      if (y1 > cr.y1) y1 = cr.y1;
+      if (x0 > x1 || y0 > y1) return null;
+    }
+    const b = this._box;
+    b.x0 = x0; b.y0 = y0; b.x1 = x1; b.y1 = y1;
+    return b;
   }
 
   // Livello mip dal passo di campionamento (texel livello 0 per px documento).
@@ -163,9 +193,14 @@ export class Rasterizer {
     return lw;
   }
 
-  /** @param {Snap|null} snap */
-  beginStroke(snap) {
+  /**
+   * @param {Snap|null} snap
+   * @param {{x0: number, y0: number, x1: number, y1: number}|null} [clipRect]
+   *   bordi del canvas di destinazione (default: nessun limite)
+   */
+  beginStroke(snap, clipRect = null) {
     this.snap = snap;
+    this.clipRect = clipRect;
     this._lutA = -1;
     this._lutColorKey = -1;
     // Firma dei parametri texture: se cambia, tile e maschere baked cached
@@ -220,7 +255,10 @@ export class Rasterizer {
       }
     }
     this._tileFillPx += CHUNK * CHUNK;
-    this.lastTexMs += performance.now() - t0;
+    const dt = performance.now() - t0;
+    this.lastTexMs += dt;
+    this.texMsAcc += dt;
+    this.tileFillsAcc++;
     return t;
   }
 
@@ -300,7 +338,10 @@ export class Rasterizer {
       if (this.heap && old.ptr) this.heap.free(old.ptr, old.mask.length);
     }
     this._tileFillPx += n;
-    this.lastTexMs += performance.now() - t0;
+    const dt = performance.now() - t0;
+    this.lastTexMs += dt;
+    this.texMsAcc += dt;
+    this.bakesAcc++;
     return b;
   }
 
@@ -437,7 +478,9 @@ export class Rasterizer {
   _dabTexColor(mask, rgb, sSize, ix, iy, a255) {
     const buildup = this.snap.buildup;
     const store = this.store;
-    forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
+    const box = this._clampBox(ix, iy, ix + sSize - 1, iy + sSize - 1);
+    if (!box) return;
+    forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
       (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
         store.markDirty(chunk, lx0, ly0, lx1, ly1);
         const d = chunk.data;
@@ -483,6 +526,8 @@ export class Rasterizer {
     const iy = Math.round(y - stamp.half);
     const a255 = Math.min(255, (alpha * 255 + 0.5) | 0);
     if (a255 === 0) return;
+    // dab interamente fuori dal canvas: nessun lavoro (nemmeno bake/tile)
+    if (!this._clampBox(ix, iy, ix + sSize - 1, iy + sSize - 1)) return;
 
     // Texture: due vie, entrambe con gli stessi byte in uscita di prima.
     // - grana ancorata al canvas: il fattore (e i colori) arrivano dai tile
@@ -506,11 +551,13 @@ export class Rasterizer {
     }
     const buildup = snap.buildup;
     const store = this.store;
+    // _box è ancora quello del clamp in testa (il bake non lo tocca)
+    const box = this._box;
 
     if (this.heap) {
       const ex = this.heap.exports;
       const bu = buildup ? 1 : 0;
-      forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
+      forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
         (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
           store.markDirty(chunk, lx0, ly0, lx1, ly1);
           const wrote = ex.dab(chunk.ptr, lx0, ly0, lx1, ly1, maskPtr, sSize,
@@ -533,7 +580,7 @@ export class Rasterizer {
     const maLut = this._maLut;
     const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
 
-    forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
+    forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
       (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
         store.markDirty(chunk, lx0, ly0, lx1, ly1);
         const d = chunk.data;
@@ -603,11 +650,13 @@ export class Rasterizer {
     const useColor = snap.texColor;
     const buildup = snap.buildup;
     const store = this.store;
+    const box = this._clampBox(ix, iy, ix + sSize - 1, iy + sSize - 1);
+    if (!box) return;
 
     if (this.heap) {
       const ex = this.heap.exports;
       const bu = buildup ? 1 : 0;
-      forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
+      forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
         (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
           const t = this._tile(chunk, useColor); // può far crescere la memoria: i ptr restano validi
           store.markDirty(chunk, lx0, ly0, lx1, ly1);
@@ -632,7 +681,7 @@ export class Rasterizer {
     const maLut = this._maLut;
     const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
 
-    forEachChunkInRect(store, ix, iy, ix + sSize - 1, iy + sSize - 1, true,
+    forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
       (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
         const t = this._tile(chunk, useColor);
         const lum = t.lum, rgbx = useColor ? t.rgbx : null;
@@ -699,10 +748,11 @@ export class Rasterizer {
     const store = this.store;
 
     const maxR = Math.max(r0, r1) + 1;
-    const bx0 = Math.floor(Math.min(x0, x1) - maxR);
-    const by0 = Math.floor(Math.min(y0, y1) - maxR);
-    const bx1 = Math.ceil(Math.max(x0, x1) + maxR);
-    const by1 = Math.ceil(Math.max(y0, y1) + maxR);
+    const box = this._clampBox(
+      Math.floor(Math.min(x0, x1) - maxR), Math.floor(Math.min(y0, y1) - maxR),
+      Math.ceil(Math.max(x0, x1) + maxR), Math.ceil(Math.max(y0, y1) + maxR));
+    if (!box) return;
+    const bx0 = box.x0, by0 = box.y0, bx1 = box.x1, by1 = box.y1;
 
     if (this.heap) {
       const ex = this.heap.exports;
@@ -792,10 +842,11 @@ export class Rasterizer {
     this.lastTexDabs++; // l'HUD conta anche i segmenti texturizzati
 
     const maxR = Math.max(r0, r1) + 1;
-    const bx0 = Math.floor(Math.min(x0, x1) - maxR);
-    const by0 = Math.floor(Math.min(y0, y1) - maxR);
-    const bx1 = Math.ceil(Math.max(x0, x1) + maxR);
-    const by1 = Math.ceil(Math.max(y0, y1) + maxR);
+    const box = this._clampBox(
+      Math.floor(Math.min(x0, x1) - maxR), Math.floor(Math.min(y0, y1) - maxR),
+      Math.ceil(Math.max(x0, x1) + maxR), Math.ceil(Math.max(y0, y1) + maxR));
+    if (!box) return;
+    const bx0 = box.x0, by0 = box.y0, bx1 = box.x1, by1 = box.y1;
 
     if (this.heap) {
       const ex = this.heap.exports;

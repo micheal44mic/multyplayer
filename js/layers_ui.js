@@ -286,9 +286,11 @@ export class LayersUI {
       layer.thumbDirty = false;
       this._drawThumb(layer, cnv);
     }
-    // ripulisce le miniature dei livelli morti
+    // ripulisce le miniature dei livelli morti (su QUALUNQUE canvas: il
+    // pannello mostra solo il canvas attivo, ma le miniature degli altri
+    // restano vive per quando si torna lì)
     for (const [id] of this._thumbs) {
-      if (!this.app.layerMgr.byId(id)) this._thumbs.delete(id);
+      if (!this.app.boards.layerById(id)) this._thumbs.delete(id);
     }
   }
 
