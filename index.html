@@ -17,6 +17,13 @@
   </div>
   <div id="cursor" aria-hidden="true"></div>
 
+  <!-- overlay della selezione: FUORI da #planes (Planes._rebuild rimpiazza
+       i suoi figli e lo butterebbe via); tinta board-locale + formiche SVG -->
+  <div id="selection" aria-hidden="true" hidden>
+    <canvas id="sel-tint"></canvas>
+    <svg id="sel-svg"><path id="sel-path-w"/><path id="sel-path-b"/></svg>
+  </div>
+
   <header id="toolbar">
     <div class="tb-group" id="tools">
       <button id="tool-brush" class="tb-btn tool active" title="Pennello (B) — di nuovo per i preset">
@@ -25,12 +32,22 @@
       <button id="tool-eraser" class="tb-btn tool" title="Gomma (E)">
         <svg viewBox="0 0 24 24"><path d="M16.2 3.6 21 8.4c.8.8.8 2 0 2.8l-9.2 9.2H7.1l-4-4c-.8-.8-.8-2 0-2.8l10.3-10c.8-.8 2-.8 2.8 0zM5 14l5 5 2.5-2.5-5-5L5 14z"/></svg>
       </button>
+      <button id="tool-select" class="tb-btn tool" title="Selezione per colore (W) — click: seleziona i pixel simili; Canc: cancella; Ctrl+D/Esc: deseleziona">
+        <svg viewBox="0 0 24 24"><path d="M10.8 9.4 2.5 17.7l3.8 3.8 8.3-8.3-3.8-3.8zm0 2.8 1 1-6.5 6.5-1-1 6.5-6.5zM17.5 1.5l1.1 2.9 2.9 1.1-2.9 1.1-1.1 2.9-1.1-2.9-2.9-1.1 2.9-1.1 1.1-2.9zM22 11l.75 1.95L24.7 13.7l-1.95.75L22 16.4l-.75-1.95-1.95-.75 1.95-.75L22 11zM13.6 1.8l.6 1.6 1.6.6-1.6.6-.6 1.6-.6-1.6-1.6-.6 1.6-.6.6-1.6z"/></svg>
+      </button>
       <button id="tool-move" class="tb-btn tool" title="Sposta livello (V)">
         <svg viewBox="0 0 24 24"><path d="M12 1.5 15.2 4.7l-1.4 1.4L13 5.3V11h5.7l-.8-.8 1.4-1.4 3.2 3.2-3.2 3.2-1.4-1.4.8-.8H13v5.7l.8-.8 1.4 1.4L12 22.5l-3.2-3.2 1.4-1.4.8.8V13H5.3l.8.8-1.4 1.4L1.5 12l3.2-3.2 1.4 1.4-.8.8H11V5.3l-.8.8-1.4-1.4L12 1.5z"/></svg>
       </button>
       <button id="tool-pan" class="tb-btn tool" title="Mano / Pan (H, Spazio)">
         <svg viewBox="0 0 24 24"><path d="M11 4a1.5 1.5 0 0 1 3 0v6h1V5.5a1.5 1.5 0 0 1 3 0V13c0 4-2.5 8-7 8-3.5 0-5-2-6.7-5.6l-1.9-4.1c-.5-1 .3-2 1.4-1.9.6.1 1.2.5 1.5 1l1.7 2.6V6a1.5 1.5 0 0 1 3 0v4h1V4z"/></svg>
       </button>
+    </div>
+
+    <div class="tb-group" id="select-opts" hidden>
+      <span class="so-label">Tolleranza</span>
+      <input id="sel-tol" type="range" min="0" max="128" step="1" value="32" title="Tolleranza colore (per canale)">
+      <span id="sel-tol-val" class="p-val">32</span>
+      <button id="sel-clear" class="tb-btn" title="Deseleziona (Ctrl+D / Esc)">✕</button>
     </div>
 
     <div class="tb-group">
@@ -118,6 +135,9 @@
       <span>Livelli</span>
       <span class="ly-actions">
         <button id="ly-add" class="tb-btn" title="Nuovo livello">+</button>
+        <button id="ly-import" class="tb-btn" title="Importa immagine">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v14H4V5zm2 2v10h12V7H6zm2 8 2.6-3.2 2 2.4 1.4-1.8 3 3.6H8zm8-5a1.5 1.5 0 1 1-3 0 1.5 1.5 0 0 1 3 0z"/></svg>
+        </button>
         <button id="ly-dup" class="tb-btn" title="Duplica livello">⧉</button>
         <button id="ly-del" class="tb-btn" title="Elimina livello">🗑</button>
         <button id="ly-close" class="tb-btn" title="Chiudi">✕</button>

@@ -4,7 +4,7 @@
 
 import { clamp } from './util.js';
 
-/** @typedef {'brush'|'eraser'|'move'|'pan'} Tool */
+/** @typedef {'brush'|'eraser'|'select'|'move'|'pan'} Tool */
 
 /**
  * @typedef {Object} Brush

@@ -20,6 +20,12 @@ export class LayersUI {
     this.opacityRow = document.getElementById('ly-opacity');
     this.opacityInput = /** @type {HTMLInputElement} */ (document.getElementById('ly-opacity-range'));
     this.opacityVal = document.getElementById('ly-opacity-val');
+    this.importBtn = /** @type {HTMLButtonElement} */ (document.getElementById('ly-import'));
+    this.fileInput = document.createElement('input');
+    this.fileInput.type = 'file';
+    this.fileInput.accept = 'image/*';
+    this.fileInput.hidden = true;
+    this.panel.appendChild(this.fileInput);
     this._epoch = 0;
     /** @type {Map<number, HTMLCanvasElement>} layerId -> canvas miniatura */
     this._thumbs = new Map();
@@ -28,6 +34,12 @@ export class LayersUI {
 
     document.getElementById('ly-close').addEventListener('click', () => this.open(false));
     document.getElementById('ly-add').addEventListener('click', () => this._addRaster());
+    this.importBtn.addEventListener('click', () => this._pickImage());
+    this.fileInput.addEventListener('change', () => {
+      const f = this.fileInput.files && this.fileInput.files[0];
+      this.fileInput.value = '';
+      if (f) this.app.importImageLayer(f);
+    });
     document.getElementById('ly-dup').addEventListener('click', () => this._duplicate());
     document.getElementById('ly-del').addEventListener('click', () => this._delete());
     this.opacityInput.addEventListener('input', () => {
@@ -52,6 +64,11 @@ export class LayersUI {
   get isOpen() { return this.panel.classList.contains('open'); }
 
   toggle() { this.open(!this.isOpen); }
+
+  /** @param {boolean} v */
+  setImportBusy(v) {
+    this.importBtn.disabled = v;
+  }
 
   // Chiamata dal frame loop: ricostruisce la lista solo se la struttura è
   // cambiata da quando l'abbiamo vista l'ultima volta (epoch).
@@ -236,6 +253,14 @@ export class LayersUI {
     const app = this.app;
     if (!app.layerMgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return; }
     app.addLayer(makeRasterLayer('', app.heap));
+  }
+
+  _pickImage() {
+    const app = this.app;
+    if (app.imageImporting) return;
+    if (!app.layerMgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return; }
+    this.fileInput.value = '';
+    this.fileInput.click();
   }
 
   _duplicate() {

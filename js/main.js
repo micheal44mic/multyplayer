@@ -8,7 +8,7 @@
 
 import { Camera, ZOOM_MIN, ZOOM_MAX } from './camera.js';
 import { clamp } from './util.js';
-import { ChunkStore, chunkKey, translateStore, CHUNK, CHUNK_SHIFT } from './store.js';
+import { ChunkStore, chunkKey, translateStore, forEachChunkInRect, CHUNK, CHUNK_SHIFT } from './store.js';
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
@@ -18,7 +18,7 @@ import { InputManager } from './input.js';
 import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
-import { makeRasterLayer } from './layers.js';
+import { makeRasterLayer, MAX_LAYERS } from './layers.js';
 import { BoardManager, MAX_BOARDS } from './boards.js';
 import { drawTextDocument, freeBlockBitmap, setBlockDebug3d, setTextGpu } from './text_layer.js';
 import { Planes } from './planes.js';
@@ -27,10 +27,20 @@ import { BoardProxyCache } from './board_proxy.js';
 import { WasmHeap } from './wasm_core.js';
 import { strokeProfiler } from './stroke_profiler.js';
 import { initStress } from './stress.js';
+import { blitImageDataToStore, imageDataFromFile, imageLayerName } from './image_import.js';
+import { SelectionManager, SelectionOverlay } from './selection.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./stroke.js').Snap} Snap */
 /** @typedef {import('./layers.js').Layer} Layer */
+
+// Chunk senza alcun pixel scritto (premultiplied: parola u32 0 = vuoto).
+/** @param {Chunk} c */
+function chunkIsBlank(c) {
+  const u = new Uint32Array(c.data.buffer, c.data.byteOffset, c.data.length >> 2);
+  for (let i = 0; i < u.length; i++) if (u[i] !== 0) return false;
+  return true;
+}
 
 export class App {
   /** @param {WasmHeap|null} [heap] core SIMD; null = rasterizer JS */
@@ -108,9 +118,15 @@ export class App {
     this._strokeLayerId = 0;      // livello di destinazione del tratto in corso
     /** @type {{x0: number, y0: number, x1: number, y1: number}|null} */
     this._strokeClip = null;      // bordi del canvas del tratto in corso
+    // maschera di selezione del tratto in corso: fotografata al pen-down e
+    // valida per TUTTO il tratto (endPass compreso), anche se l'utente
+    // deseleziona a metà — un tratto mezzo mascherato sarebbe incoerente
+    /** @type {{mask: Uint8Array, x: number, y: number, w: number, h: number}|null} */
+    this._strokeSel = null;
     /** @type {{chunks: Chunk[], index: number, snap: Snap|null, store: ChunkStore, layerId: number}|null} */
     this.commitJob = null;        // commit incrementale spalmato sui frame
     this.COMMIT_CHUNKS_PER_FRAME = 24;
+    this._imageImporting = false;
 
     // l'input vive sul CONTAINER dei piani: sopravvive alla sostituzione del
     // canvas (toggle desync) e i piani figli sono pointer-events: none
@@ -141,6 +157,11 @@ export class App {
         this.cancelStroke();
       },
     });
+
+    // selezione per colore: modello (maschera per-board) + overlay DOM
+    // (tinta + formiche), fuori dai piani e trasparente all'input
+    this.selection = new SelectionManager();
+    this.selectionUI = new SelectionOverlay(this.selection);
 
     this.ui = new UI(this);
     // strumento Sposta/Trasforma: sessione con bbox, ✓/✗, anteprima a quad
@@ -243,16 +264,76 @@ export class App {
 
   // ---- livelli (operazioni annullabili) ----
 
-  // Inserisce sopra il livello attivo del canvas attivo e registra l'undo.
-  /** @param {Layer} layer */
-  addLayer(layer) {
-    if (!this.layerMgr.canAdd) return false;
-    const index = this.layerMgr.insert(layer);
+  // Inserisce sopra il livello attivo del canvas indicato e registra l'undo.
+  /** @param {Layer} layer @param {import('./boards.js').Board} [board] */
+  addLayer(layer, board = this.boards.active) {
+    if (!board || !board.mgr.canAdd) return false;
+    const index = board.mgr.insert(layer);
     if (layer.store) this._allStores.add(layer.store);
-    this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'attach', layerId: layer.id, index, boardId: this.boards.activeId }));
+    this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'attach', layerId: layer.id, index, boardId: board.id }));
     this.ui.layersUI.sync();
     this.ui.layersUI.scheduleThumbs();
     return true;
+  }
+
+  get imageImporting() { return this._imageImporting; }
+
+  /** @param {boolean} v */
+  _setImageImporting(v) {
+    this._imageImporting = v;
+    document.body.classList.toggle('importing', v);
+    if (this.ui && this.ui.layersUI) this.ui.layersUI.setImportBusy(v);
+  }
+
+  /**
+   * Importa un file immagine come nuovo livello raster nel canvas attivo
+   * catturato all'inizio dell'operazione.
+   * @param {File} file
+   * @returns {Promise<boolean>}
+   */
+  async importImageLayer(file) {
+    if (!file) return false;
+    if (this._imageImporting) { alert('Importazione immagine gia in corso.'); return false; }
+    const board = this.boards.active;
+    if (!board) return false;
+    if (!board.mgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return false; }
+
+    /** @type {Layer|null} */
+    let raster = null;
+    this._setImageImporting(true);
+    try {
+      const { imageData, drawW, drawH } = await imageDataFromFile(file, board.w, board.h);
+      if (!board.mgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return false; }
+
+      raster = makeRasterLayer(imageLayerName(file.name), this.heap);
+      // PRIMA del travaso: un alloc può far crescere la memoria wasm e onGrow
+      // rigenera le viste solo degli store registrati.
+      this._allStores.add(raster.store);
+      const dx = Math.round(board.x + (board.w - drawW) / 2);
+      const dy = Math.round(board.y + (board.h - drawH) / 2);
+      blitImageDataToStore(raster.store, imageData, dx, dy);
+
+      const ok = this.addLayer(raster, board);
+      if (!ok) {
+        raster.store.destroy((c) => this.renderer.disposeChunkTex(c));
+        this._allStores.delete(raster.store);
+        raster = null;
+        alert(`Massimo ${MAX_LAYERS} livelli.`);
+        return false;
+      }
+      raster = null;
+      return true;
+    } catch (err) {
+      if (raster && raster.store) {
+        raster.store.destroy((c) => this.renderer.disposeChunkTex(c));
+        this._allStores.delete(raster.store);
+      }
+      console.error(err);
+      alert(err instanceof Error ? err.message : 'Importazione immagine fallita.');
+      return false;
+    } finally {
+      this._setImageImporting(false);
+    }
   }
 
   /** @param {number} id */
@@ -306,42 +387,7 @@ export class App {
     // rigenera le viste solo degli store registrati
     this._allStores.add(raster.store);
 
-    // travaso nel ChunkStore: straight -> premultiplied, si creano solo i
-    // chunk con almeno un pixel coperto (il canvas è già il clip al board)
-    const src = img.data, W = board.w;
-    const bx1 = board.x + board.w - 1, by1 = board.y + board.h - 1;
-    for (let cy = board.y >> CHUNK_SHIFT; cy <= by1 >> CHUNK_SHIFT; cy++) {
-      for (let cx = board.x >> CHUNK_SHIFT; cx <= bx1 >> CHUNK_SHIFT; cx++) {
-        const wx0 = Math.max(cx * CHUNK, board.x), wx1 = Math.min(cx * CHUNK + CHUNK - 1, bx1);
-        const wy0 = Math.max(cy * CHUNK, board.y), wy1 = Math.min(cy * CHUNK + CHUNK - 1, by1);
-        let any = false;
-        for (let wy = wy0; wy <= wy1 && !any; wy++) {
-          let o = ((wy - board.y) * W + (wx0 - board.x)) * 4 + 3;
-          for (let wx = wx0; wx <= wx1; wx++, o += 4) {
-            if (src[o] !== 0) { any = true; break; }
-          }
-        }
-        if (!any) continue;
-        const chunk = raster.store.getOrCreate(cx, cy);
-        const d = chunk.data; // azzerata: i pixel ad alpha 0 restano 0
-        for (let wy = wy0; wy <= wy1; wy++) {
-          let so = ((wy - board.y) * W + (wx0 - board.x)) * 4;
-          let dofs = ((wy - cy * CHUNK) * CHUNK + (wx0 - cx * CHUNK)) * 4;
-          for (let wx = wx0; wx <= wx1; wx++, so += 4, dofs += 4) {
-            const a = src[so + 3];
-            if (a === 0) continue;
-            const k = a / 255; // Uint8ClampedArray arrotonda da sé
-            d[dofs] = src[so] * k;
-            d[dofs + 1] = src[so + 1] * k;
-            d[dofs + 2] = src[so + 2] * k;
-            d[dofs + 3] = a;
-          }
-        }
-        chunk.touched = true;
-        raster.store.markDirty(chunk,
-          wx0 - cx * CHUNK, wy0 - cy * CHUNK, wx1 - cx * CHUNK, wy1 - cy * CHUNK);
-      }
-    }
+    blitImageDataToStore(raster.store, img, board.x, board.y);
 
     // scambio in lista: il testo esce (vive nell'entry undo), il raster
     // entra alla stessa posizione e diventa attivo
@@ -353,6 +399,87 @@ export class App {
     this.ui.layersUI.sync();
     this.ui.layersUI.scheduleThumbs();
     return true;
+  }
+
+  // ---- selezione per colore ----
+
+  // Click del tool Selezione: campiona il colore del livello attivo nel
+  // punto e seleziona TUTTI i pixel simili del board (non contigui). Click
+  // su un pixel trasparente = deseleziona.
+  /** @param {import('./boards.js').Board} board @param {number} x @param {number} y */
+  selectAt(board, x, y) {
+    const layer = board.mgr.paintTarget;
+    if (!layer) return; // attivo non raster o nascosto: niente da campionare
+    this.selection.buildFromColor(layer.store, layer.id, board,
+      Math.floor(x), Math.floor(y));
+  }
+
+  // Lo slider tolleranza ricampiona l'ultima selezione dallo stesso punto
+  // e dallo stesso livello (se esistono ancora).
+  reselectTolerance() {
+    const sel = this.selection;
+    if (!sel.active || this.strokeLive || this.commitJob) return;
+    const board = this.boards.byId(sel.boardId);
+    const layer = board && board.mgr.byId(sel.pick.layerId);
+    if (!board || !layer || !layer.store) return;
+    sel.buildFromColor(layer.store, layer.id, board, sel.pick.wx, sel.pick.wy);
+  }
+
+  // Canc/Backspace: azzera i pixel selezionati del livello attivo del board
+  // della selezione. Annullabile col tile-diff degli stroke (stesso path).
+  /** @returns {boolean} true se qualcosa è stato cancellato */
+  deleteSelected() {
+    // stesse guardie di undo(): mai mutare chunk sotto un commit in volo
+    if (this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging) return false;
+    const sel = this.selection;
+    if (!sel.active) return false;
+    const board = this.boards.byId(sel.boardId);
+    if (!board) { sel.clear(); return false; }
+    const layer = board.mgr.paintTarget;
+    if (!layer) return false;
+    const store = layer.store, mask = sel.mask, mw = sel.bw;
+    const b = sel.bounds;
+    let changed = false;
+    this.undoMgr.captureBegin(layer.id);
+    forEachChunkInRect(store,
+      sel.bx + b.x0, sel.by + b.y0, sel.bx + b.x1, sel.by + b.y1, false,
+      (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+        const d32 = new Uint32Array(chunk.data.buffer, chunk.data.byteOffset, CHUNK * CHUNK);
+        const mox = ox - sel.bx, moy = oy - sel.by;
+        // prima passata: c'è almeno un pixel selezionato e non vuoto?
+        let any = false;
+        for (let ly = ly0; ly <= ly1 && !any; ly++) {
+          const mrow = (moy + ly) * mw + mox;
+          let o = (ly << CHUNK_SHIFT) + lx0;
+          for (let lx = lx0; lx <= lx1; lx++, o++) {
+            if (d32[o] !== 0 && mask[mrow + lx] !== 0) { any = true; break; }
+          }
+        }
+        if (!any) return;
+        // foto "prima" PER l'undo, poi azzeramento col rect sporco esatto
+        this.undoMgr.captureChunk(chunk.key, chunk.cx, chunk.cy, chunk.data);
+        let dx0 = CHUNK, dy0 = CHUNK, dx1 = -1, dy1 = -1;
+        for (let ly = ly0; ly <= ly1; ly++) {
+          const mrow = (moy + ly) * mw + mox;
+          let o = (ly << CHUNK_SHIFT) + lx0;
+          for (let lx = lx0; lx <= lx1; lx++, o++) {
+            if (d32[o] === 0 || mask[mrow + lx] === 0) continue;
+            d32[o] = 0;
+            if (lx < dx0) dx0 = lx;
+            if (lx > dx1) dx1 = lx;
+            if (ly < dy0) dy0 = ly;
+            if (ly > dy1) dy1 = ly;
+          }
+        }
+        store.markDirty(chunk, dx0, dy0, dx1, dy1);
+        changed = true;
+      });
+    this.undoMgr.captureEnd(); // entry senza chunk: scartata da sé
+    if (changed) {
+      layer.thumbDirty = true;
+      this.ui.layersUI.scheduleThumbs();
+    }
+    return changed;
   }
 
   // Host delle operazioni di undo: risolve gli store e applica la struttura.
@@ -433,6 +560,9 @@ export class App {
     // appena selezionato e ancora in caricamento: il tratto partirebbe
     // alla cieca sotto il quad del proxy
     if (this.renderer instanceof GLRenderer && this.proxy.isLoading(board.id)) return;
+    // strumento Selezione: il click campiona il colore e costruisce la
+    // maschera, nessun tratto
+    if (brush.tool === 'select') return this.selectAt(board, x, y);
     // strumento Sposta/Trasforma: il drag sul canvas trasla la sessione
     if (brush.tool === 'move') return this.transform.dragStart(x, y);
     const target = board.mgr.paintTarget;
@@ -440,9 +570,15 @@ export class App {
     this._flushPendingStroke();
     this._strokeLayerId = target.id;
     this._strokeClip = { x0: board.x, y0: board.y, x1: board.x + board.w - 1, y1: board.y + board.h - 1 };
+    // selezione attiva SU QUESTO canvas: il tratto scrive solo dentro la
+    // maschera (su un altro canvas si disegna libero)
+    const sel = this.selection;
+    this._strokeSel = sel.active && sel.boardId === board.id
+      ? { mask: sel.mask, x: board.x, y: board.y, w: board.w, h: board.h }
+      : null;
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
     this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom);
-    this.raster.beginStroke(this.engine.snap, this._strokeClip);
+    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel);
     this.strokeLive = true;
     this.pendingCommit = false;
     strokeProfiler.begin(this._strokeProfInfo());
@@ -526,7 +662,7 @@ export class App {
     } else {
       this._dropStrokeBuffer();
     }
-    this.raster.beginStroke(this.engine.snap, this._strokeClip);
+    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel);
     this.raster.clip = clip;
     this.engine.replay();
     this.raster.run(this.queue, Infinity);
@@ -549,7 +685,9 @@ export class App {
     /** @type {Chunk[]} */
     const touched = [];
     for (const sc of this.strokeStore.map.values()) {
-      if (sc.touched) touched.push(sc);
+      // con la selezione un chunk toccato può essere stato interamente
+      // azzerato dalla maschera: committarlo creerebbe chunk vuoti nel doc
+      if (sc.touched && (this._strokeSel === null || !chunkIsBlank(sc))) touched.push(sc);
       else this.strokeStore.remove(sc.key, (c) => this.renderer.disposeChunkTex(c));
     }
     if (touched.length === 0) {
@@ -611,6 +749,7 @@ export class App {
   clearAll() {
     this.commitJob = null;
     this.cancelStroke();
+    this.selection.clear(); // il board della selezione sta per morire
     for (const b of this.boards.boards) {
       for (const l of b.mgr.layers) {
         if (l.store) {
@@ -727,6 +866,9 @@ export class App {
     // gabbia della distorsione testo: segue camera e modifiche (uscita a
     // confronto di stringa quando non c'è niente da fare)
     this.ui.textUI.gizmo.sync(this.camera);
+    // overlay della selezione: ricostruisce al cambio di maschera,
+    // riposiziona al cambio camera (no-op altrimenti)
+    this.selectionUI.sync(this.camera);
     // VRAM limitata: eviction delle texture fuori schermo (riupload on-demand).
     // I chunk dei piani 2D hanno tex nulla: il loop li salta da solo.
     const tEv = performance.now();

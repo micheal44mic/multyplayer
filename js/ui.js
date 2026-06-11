@@ -175,6 +175,7 @@ export class UI {
     this._buildStudio();
     this._bindToolbar();
     this._bindKeys();
+    this._bindImageImport();
   }
 
   // ---- Brush Studio ----
@@ -528,7 +529,7 @@ export class UI {
   _bindToolbar() {
     const app = this.app;
     /** @type {Record<string, Tool>} */
-    const tools = { 'tool-eraser': 'eraser', 'tool-move': 'move', 'tool-pan': 'pan' };
+    const tools = { 'tool-eraser': 'eraser', 'tool-select': 'select', 'tool-move': 'move', 'tool-pan': 'pan' };
     for (const [id, tool] of Object.entries(tools)) {
       document.getElementById(id).addEventListener('click', () => this.setTool(tool));
     }
@@ -537,6 +538,18 @@ export class UI {
       if (brush.tool === 'brush') this.presetsUI.toggle();
       else this.setTool('brush');
     });
+
+    // opzioni del tool Selezione: lo slider ricampiona la selezione viva
+    const tolRange = /** @type {HTMLInputElement} */ (document.getElementById('sel-tol'));
+    const tolVal = document.getElementById('sel-tol-val');
+    tolRange.value = String(app.selection.tolerance);
+    tolVal.textContent = tolRange.value;
+    tolRange.addEventListener('input', () => {
+      app.selection.tolerance = Number(tolRange.value);
+      tolVal.textContent = tolRange.value;
+      app.reselectTolerance();
+    });
+    document.getElementById('sel-clear').addEventListener('click', () => app.selection.clear());
 
     const colorInput = /** @type {HTMLInputElement} */ (document.getElementById('color'));
     colorInput.addEventListener('input', () => {
@@ -571,11 +584,12 @@ export class UI {
   setTool(tool) {
     brush.tool = tool;
     for (const [id, t] of [['tool-brush', 'brush'], ['tool-eraser', 'eraser'],
-      ['tool-move', 'move'], ['tool-pan', 'pan']]) {
+      ['tool-select', 'select'], ['tool-move', 'move'], ['tool-pan', 'pan']]) {
       document.getElementById(id).classList.toggle('active', t === tool);
     }
     this.app.planesEl.classList.toggle('panning', tool === 'pan');
     this.app.planesEl.classList.toggle('moving', tool === 'move');
+    document.getElementById('select-opts').hidden = tool !== 'select';
     if (tool !== 'brush') this.presetsUI.open(false);
   }
 
@@ -615,12 +629,14 @@ export class UI {
       const k = e.key.toLowerCase();
       if ((e.ctrlKey || e.metaKey) && k === 'z' && !e.shiftKey) { e.preventDefault(); app.undo(); }
       else if ((e.ctrlKey || e.metaKey) && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); app.redo(); }
+      else if ((e.ctrlKey || e.metaKey) && k === 'd') { e.preventDefault(); app.selection.clear(); }
       else if (k === 'b') {
         // come il bottone: già pennello -> apre/chiude i preset
         if (brush.tool === 'brush') this.presetsUI.toggle();
         else this.setTool('brush');
       }
       else if (k === 'e') this.setTool('eraser');
+      else if (k === 'w') this.setTool('select');
       else if (k === 'v') this.setTool('move');
       else if (k === 'h') this.setTool('pan');
       else if (k === 'p') this.toggleStudio();
@@ -629,7 +645,12 @@ export class UI {
       else if (k === 'enter') {
         if (app.transform.pending) { e.preventDefault(); app.transform.confirm(); }
       }
-      else if (k === 'escape') { app.transform.cancel(); this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); this.presetsUI.open(false); }
+      else if (k === 'escape') { app.selection.clear(); app.transform.cancel(); this.toggleStudio(false); this.textUI.open(false); this.layersUI.open(false); this.presetsUI.open(false); }
+      else if (k === 'delete' || k === 'backspace') {
+        // Canc cancella i pixel selezionati; preventDefault anche a vuoto
+        // (Backspace altrimenti naviga indietro su alcuni browser)
+        if (app.selection.active) { e.preventDefault(); app.deleteSelected(); }
+      }
       else if (k === '`' || k === '\\') app.hud.toggle();
       else if (k === '0') app.fitActiveBoard();
       else if (k === '[') { brush.size = stepSize(brush.size, -1); this.syncSliders(); this._settingChanged(); }
@@ -639,12 +660,62 @@ export class UI {
     });
   }
 
+  _bindImageImport() {
+    const app = this.app;
+    /** @param {DataTransfer|null} dt */
+    const hasFiles = (dt) => !!dt && Array.from(dt.types || []).includes('Files');
+    /** @param {FileList|File[]} files */
+    const firstImage = (files) => {
+      for (const f of Array.from(files)) {
+        if (!f.type || f.type.startsWith('image/')) return f;
+      }
+      return null;
+    };
+    /** @param {DataTransferItemList|null} items */
+    const firstImageItem = (items) => {
+      if (!items) return null;
+      for (const item of Array.from(items)) {
+        if (item.kind !== 'file') continue;
+        if (item.type && !item.type.startsWith('image/')) continue;
+        const f = item.getAsFile();
+        if (f) return f;
+      }
+      return null;
+    };
+
+    app.planesEl.addEventListener('dragover', (e) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    app.planesEl.addEventListener('drop', (e) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      const f = firstImage(e.dataTransfer.files);
+      if (f) app.importImageLayer(f);
+      else alert('Trascina un file immagine.');
+    });
+
+    window.addEventListener('paste', (e) => {
+      const t = e.target;
+      if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement ||
+        t instanceof HTMLSelectElement || (t instanceof HTMLElement && t.isContentEditable)) return;
+      const f = e.clipboardData &&
+        (firstImage(e.clipboardData.files) || firstImageItem(e.clipboardData.items));
+      if (!f) return;
+      e.preventDefault();
+      app.importImageLayer(f);
+    });
+  }
+
   // Anello cursore: dimensione pennello in px schermo
   /** @param {import('./input.js').InputManager} input @param {import('./camera.js').Camera} camera */
   updateCursor(input, camera) {
     const el = this.cursorEl;
     const h = input.hover;
-    const show = h.visible && brush.tool !== 'pan' && brush.tool !== 'move' && !input.gesture;
+    // select usa il crosshair CSS: il cerchio-pennello non c'entra
+    const show = h.visible && brush.tool !== 'pan' && brush.tool !== 'move' &&
+      brush.tool !== 'select' && !input.gesture;
     el.style.display = show ? 'block' : 'none';
     if (!show) return;
     const d = Math.max(4, brush.size * camera.zoom);

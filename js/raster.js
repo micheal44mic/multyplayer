@@ -57,6 +57,12 @@ export class Rasterizer {
     // esce mai dal canvas e fuori non si creano chunk. null = nessun limite.
     /** @type {{x0: number, y0: number, x1: number, y1: number}|null} */
     this.clipRect = null;
+    // Maschera di selezione (0/255 board-locale, x/y = origine mondo): a
+    // fine run i pixel scritti fuori maschera si azzerano nello stroke
+    // buffer. Post-processo sui dirty rect, MAI dentro dab/capsule: il path
+    // caldo (JS e WASM) resta identico e il commit fonde pixel già giusti.
+    /** @type {{mask: Uint8Array, x: number, y: number, w: number, h: number}|null} */
+    this.selMask = null;
     // bbox ritagliato riusato (zero allocazioni per dab)
     this._box = { x0: 0, y0: 0, x1: 0, y1: 0 };
     // stats per HUD
@@ -197,10 +203,14 @@ export class Rasterizer {
    * @param {Snap|null} snap
    * @param {{x0: number, y0: number, x1: number, y1: number}|null} [clipRect]
    *   bordi del canvas di destinazione (default: nessun limite)
+   * @param {{mask: Uint8Array, x: number, y: number, w: number, h: number}|null} [selMask]
+   *   maschera di selezione attiva (default: nessuna — bench e stress
+   *   passano di qui e NON devono ereditare la selezione dell'utente)
    */
-  beginStroke(snap, clipRect = null) {
+  beginStroke(snap, clipRect = null, selMask = null) {
     this.snap = snap;
     this.clipRect = clipRect;
+    this.selMask = selMask;
     this._lutA = -1;
     this._lutColorKey = -1;
     // Firma dei parametri texture: se cambia, tile e maschere baked cached
@@ -413,8 +423,35 @@ export class Rasterizer {
       this._tileFillPx = 0;
       this.lastDabs++;
     }
+    // selezione attiva: il fuori-maschera scritto da questo run si azzera
+    // PRIMA che il renderer carichi i dirty e che il commit fonda i chunk
+    if (this.selMask !== null && this.lastDabs > 0) this._maskSelection();
     this.lastPx = used;
     return used;
+  }
+
+  // Azzera nello stroke buffer i pixel fuori dalla maschera di selezione.
+  // Itera i soli dirty rect accumulati (costo ∝ pixel scritti dall'ultimo
+  // upload); idempotente, quindi più run prima di un present sono innocui.
+  // Le viste u32 si creano DOPO ogni scrittura del run: un alloc/grow wasm
+  // nel frattempo ha già rigenerato chunk.data (onGrow).
+  _maskSelection() {
+    const m = this.selMask, mask = m.mask, mw = m.w, mh = m.h;
+    for (const c of this.store.dirty) {
+      if (c.dirX1 < c.dirX0 || c.dirY1 < c.dirY0) continue;
+      const ox = (c.cx << CHUNK_SHIFT) - m.x, oy = (c.cy << CHUNK_SHIFT) - m.y;
+      const d32 = new Uint32Array(c.data.buffer, c.data.byteOffset, CHUNK * CHUNK);
+      for (let ly = c.dirY0; ly <= c.dirY1; ly++) {
+        const my = oy + ly;
+        const inRow = my >= 0 && my < mh;
+        const mrow = my * mw + ox;
+        let o = (ly << CHUNK_SHIFT) + c.dirX0;
+        for (let lx = c.dirX0; lx <= c.dirX1; lx++, o++) {
+          const mx = ox + lx;
+          if (!inRow || mx < 0 || mx >= mw || mask[mrow + lx] === 0) d32[o] = 0;
+        }
+      }
+    }
   }
 
   // Modula la maschera dello stamp con la texture del pennello scrivendo in
