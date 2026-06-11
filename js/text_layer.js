@@ -614,6 +614,7 @@ function _warpStrips(ctx, src, d, frame, sbox, m, r, N) {
 /** @param {Distort} d */
 function _distortIsIdentity(d) {
   const eps = 1e-6;
+  /** @type {(p: {x:number,y:number}, x: number, y: number) => boolean} */
   const near = (p, x, y) => Math.abs(p.x - x) <= eps && Math.abs(p.y - y) <= eps;
   const H = 1 / 6;
   return near(d.tl, 0, 0) && near(d.tc, 0.5, 0) && near(d.tr, 1, 0) &&
@@ -991,6 +992,68 @@ export function renderBlockCanvas(it, st, r, box = blockBox(it, st)) {
   const cnv = document.createElement('canvas');
   renderEffectInto(cnv, document.createElement('canvas'), it, st, r, box, FULL_STEP);
   return { canvas: cnv, box };
+}
+
+// Disegna il livello testo COMPLETO (effetto + faccia, stessa resa dell'SVG)
+// nel contesto dato, a 1 px canvas = 1 px mondo, con origine mondo (x0,y0).
+// One-shot a qualità piena, ignora camera e cache live: è il renderer
+// dell'export PNG e della rasterizzazione del livello. `alpha` è l'opacità
+// del livello da cuocere nei pixel (l'export la cuoce, la rasterizzazione
+// no: resta proprietà del livello raster).
+/**
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {TextItem} it @param {TextStyle} st
+ * @param {number} x0 @param {number} y0 @param {number} [alpha]
+ */
+export function drawTextDocument(ctx, it, st, x0, y0, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  if (st.warp === 'distort' && st.distort) {
+    // la bitmap della distort contiene già faccia + effetto (alpha
+    // dell'ombra cotta): un solo drawImage
+    const blk = renderBlockCanvas(it, st, 1);
+    ctx.drawImage(blk.canvas, blk.box.x - x0, blk.box.y - y0);
+    ctx.globalAlpha = 1;
+    return;
+  }
+  ctx.font = textFont(it, st);
+  ctx.textBaseline = 'alphabetic';
+  ctx.lineJoin = 'round';
+  const layout = warpLayout(it, st);
+  const by = textBaselineY(it, st);
+  const block3d = st.block && st.shadowDist > 0;
+  // anche l'ombra morbida del testo deformato passa dalla bitmap: glifo
+  // per glifo le ombre di ctx.shadow* si sovrapporrebbero scurendosi
+  const bitmapFx = block3d ||
+    (layout && (st.shadowBlur > 0 || st.shadowDist > 0));
+  if (bitmapFx) {
+    // stesso renderer della bitmap live, alla risoluzione del documento;
+    // alpha dell'ombra in un colpo solo (l'overlap non scurisce)
+    const blk = renderBlockCanvas(it, st, 1);
+    ctx.save();
+    ctx.globalAlpha = alpha * (st.shadowOpacity ?? 0.65);
+    ctx.drawImage(blk.canvas, blk.box.x - x0, blk.box.y - y0);
+    ctx.restore();
+  } else if (st.shadowBlur > 0 || st.shadowDist > 0) {
+    const rad = (st.shadowAngle ?? 45) * Math.PI / 180;
+    ctx.shadowColor = shadowCss(st.shadowColor, st.shadowOpacity ?? 0.65);
+    ctx.shadowBlur = st.shadowBlur;
+    ctx.shadowOffsetX = Math.cos(rad) * st.shadowDist;
+    ctx.shadowOffsetY = Math.sin(rad) * st.shadowDist;
+  }
+  if (st.stroke > 0) {
+    ctx.strokeStyle = st.strokeColor;
+    ctx.lineWidth = st.stroke * 2;
+    drawTextPass(ctx, it, layout, by, true, -x0, -y0);
+    ctx.shadowColor = 'rgba(0,0,0,0)';
+    ctx.fillStyle = it.fill;
+    drawTextPass(ctx, it, layout, by, false, -x0, -y0);
+  } else {
+    ctx.fillStyle = it.fill;
+    drawTextPass(ctx, it, layout, by, false, -x0, -y0);
+    ctx.shadowColor = 'rgba(0,0,0,0)';
+  }
+  ctx.shadowBlur = 0; ctx.shadowOffsetX = 0; ctx.shadowOffsetY = 0;
+  ctx.globalAlpha = 1;
 }
 
 // Applica item + stile + visibilità/opacità del livello agli attributi SVG

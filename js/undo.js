@@ -29,16 +29,18 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * Entry di stroke (kind 'stroke') o di struttura (kind 'struct').
  * struct: op 'attach' (il livello è in lista; undo = staccarlo),
  * op 'detach' (l'entry POSSIEDE il livello; undo = reinserirlo a index),
- * op 'move' (sposta da from a to; undo = inverso).
+ * op 'move' (sposta da from a to; undo = inverso),
+ * op 'replace' (rasterizza testo: l'entry POSSIEDE il livello sostituito,
+ * layerId è quello vivo in lista; undo = scambiarli di nuovo).
  * @typedef {Object} UndoEntry
  * @property {'stroke'|'struct'} kind
  * @property {UndoChunk[]} chunks
  * @property {number} rawSize
  * @property {boolean} compressed
  * @property {Promise<any>} ready
- * @property {number} [layerId] stroke: livello di destinazione
- * @property {'attach'|'detach'|'move'} [op]
- * @property {Layer} [layer] solo op 'detach'
+ * @property {number} [layerId] stroke: livello di destinazione; replace: livello vivo
+ * @property {'attach'|'detach'|'move'|'replace'} [op]
+ * @property {Layer} [layer] solo op 'detach'/'replace'
  * @property {number} [index] solo op 'attach'/'detach'
  * @property {number} [from] solo op 'move'
  * @property {number} [to]
@@ -156,7 +158,8 @@ export class UndoManager {
     e.chunks = [];
     e.compressed = false;
     e.ready = Promise.resolve();
-    e.rawSize = e.op === 'detach' && e.layer && e.layer.store ? e.layer.store.cpuBytes : 0;
+    e.rawSize = (e.op === 'detach' || e.op === 'replace') &&
+      e.layer && e.layer.store ? e.layer.store.cpuBytes : 0;
     this.undoStack.push(e);
     this.rawBytes += e.rawSize;
     this._dropRedo();
@@ -291,6 +294,18 @@ export class UndoManager {
       return /** @type {UndoEntry} */ ({
         kind: 'struct', op: 'move', from: e.to, to: e.from, boardId: e.boardId,
         chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
+    if (e.op === 'replace') {
+      // scambia il livello vivo con quello posseduto, alla posizione attuale
+      const d = host.detachLayer(e.layerId);
+      if (!d) return null;
+      host.attachLayer(e.layer, d.index, d.boardId);
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'replace', layer: d.layer, layerId: e.layer.id,
+        boardId: d.boardId, chunks: [], compressed: false,
+        ready: Promise.resolve(),
+        rawSize: d.layer.store ? d.layer.store.cpuBytes : 0,
       });
     }
     return null;

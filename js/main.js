@@ -8,7 +8,7 @@
 
 import { Camera, ZOOM_MIN, ZOOM_MAX } from './camera.js';
 import { clamp } from './util.js';
-import { ChunkStore, chunkKey, CHUNK_SHIFT } from './store.js';
+import { ChunkStore, chunkKey, CHUNK, CHUNK_SHIFT } from './store.js';
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
@@ -20,7 +20,7 @@ import { Hud } from './hud.js';
 import { UI } from './ui.js';
 import { makeRasterLayer } from './layers.js';
 import { BoardManager, MAX_BOARDS } from './boards.js';
-import { freeBlockBitmap, setBlockDebug3d, setTextGpu } from './text_layer.js';
+import { drawTextDocument, freeBlockBitmap, setBlockDebug3d, setTextGpu } from './text_layer.js';
 import { Planes } from './planes.js';
 import { BoardProxyCache } from './board_proxy.js';
 import { WasmHeap } from './wasm_core.js';
@@ -90,7 +90,7 @@ export class App {
       // un'entry esce per sempre dagli stack: se possiede un livello
       // eliminato, qui muore davvero (texture + slot wasm + pool)
       (e) => {
-        if (e.op === 'detach' && e.layer) {
+        if ((e.op === 'detach' || e.op === 'replace') && e.layer) {
           if (e.layer.store) {
             e.layer.store.destroy((c) => this.renderer.disposeChunkTex(c));
             this._allStores.delete(e.layer.store);
@@ -264,6 +264,82 @@ export class App {
     this.layerMgr.move(from, to);
     this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'move', from, to, boardId: this.boards.activeId }));
     this.ui.layersUI.sync();
+  }
+
+  // Rasterizza un livello testo: lo sostituisce in lista (stessa posizione,
+  // nome, visibilità e opacità) con un livello raster i cui pixel sono il
+  // testo renderizzato one-shot a qualità export — 1 px = 1 px documento,
+  // path CPU pieno, niente cache live né SDF — clippato al suo canvas.
+  // Annullabile: l'entry 'replace' possiede il livello testo e l'undo li
+  // riscambia (il testo torna editabile).
+  /** @param {number} id @returns {boolean} */
+  rasterizeTextLayer(id) {
+    const board = this.boards.boardOfLayer(id);
+    const layer = board && board.mgr.byId(id);
+    if (!layer || layer.kind !== 'text') return false;
+
+    // resa identica all'export PNG, ma su sfondo trasparente e senza cuocere
+    // l'opacità del livello (resta proprietà del livello raster)
+    const cnv = document.createElement('canvas');
+    cnv.width = board.w; cnv.height = board.h;
+    const ctx = cnv.getContext('2d', { willReadFrequently: true });
+    drawTextDocument(ctx, layer.item, layer.style, board.x, board.y, 1);
+    const img = ctx.getImageData(0, 0, board.w, board.h);
+
+    const raster = makeRasterLayer(layer.name, this.heap);
+    raster.visible = layer.visible;
+    raster.opacity = layer.opacity;
+    // PRIMA del travaso: un alloc può far crescere la memoria wasm e onGrow
+    // rigenera le viste solo degli store registrati
+    this._allStores.add(raster.store);
+
+    // travaso nel ChunkStore: straight -> premultiplied, si creano solo i
+    // chunk con almeno un pixel coperto (il canvas è già il clip al board)
+    const src = img.data, W = board.w;
+    const bx1 = board.x + board.w - 1, by1 = board.y + board.h - 1;
+    for (let cy = board.y >> CHUNK_SHIFT; cy <= by1 >> CHUNK_SHIFT; cy++) {
+      for (let cx = board.x >> CHUNK_SHIFT; cx <= bx1 >> CHUNK_SHIFT; cx++) {
+        const wx0 = Math.max(cx * CHUNK, board.x), wx1 = Math.min(cx * CHUNK + CHUNK - 1, bx1);
+        const wy0 = Math.max(cy * CHUNK, board.y), wy1 = Math.min(cy * CHUNK + CHUNK - 1, by1);
+        let any = false;
+        for (let wy = wy0; wy <= wy1 && !any; wy++) {
+          let o = ((wy - board.y) * W + (wx0 - board.x)) * 4 + 3;
+          for (let wx = wx0; wx <= wx1; wx++, o += 4) {
+            if (src[o] !== 0) { any = true; break; }
+          }
+        }
+        if (!any) continue;
+        const chunk = raster.store.getOrCreate(cx, cy);
+        const d = chunk.data; // azzerata: i pixel ad alpha 0 restano 0
+        for (let wy = wy0; wy <= wy1; wy++) {
+          let so = ((wy - board.y) * W + (wx0 - board.x)) * 4;
+          let dofs = ((wy - cy * CHUNK) * CHUNK + (wx0 - cx * CHUNK)) * 4;
+          for (let wx = wx0; wx <= wx1; wx++, so += 4, dofs += 4) {
+            const a = src[so + 3];
+            if (a === 0) continue;
+            const k = a / 255; // Uint8ClampedArray arrotonda da sé
+            d[dofs] = src[so] * k;
+            d[dofs + 1] = src[so + 1] * k;
+            d[dofs + 2] = src[so + 2] * k;
+            d[dofs + 3] = a;
+          }
+        }
+        chunk.touched = true;
+        raster.store.markDirty(chunk,
+          wx0 - cx * CHUNK, wy0 - cy * CHUNK, wx1 - cx * CHUNK, wy1 - cy * CHUNK);
+      }
+    }
+
+    // scambio in lista: il testo esce (vive nell'entry undo), il raster
+    // entra alla stessa posizione e diventa attivo
+    const d = board.mgr.detach(id);
+    board.mgr.insert(raster, d.index);
+    freeBlockBitmap(layer); // bitmap effetto/SDF: si rigenera se l'undo lo riporta
+    this.undoMgr.pushStruct(/** @type {any} */ (
+      { op: 'replace', layer, layerId: raster.id, boardId: board.id }));
+    this.ui.layersUI.sync();
+    this.ui.layersUI.scheduleThumbs();
+    return true;
   }
 
   // Host delle operazioni di undo: risolve gli store e applica la struttura.

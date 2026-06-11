@@ -269,6 +269,26 @@ export class TextUI {
     body.appendChild(this._color('Colore ombra',
       () => readStyle((st) => st.shadowColor, '#000000'),
       (v) => withStyle((st) => { st.shadowColor = v; })));
+
+    body.appendChild(this._section('Rasterizza'));
+    const rRow = document.createElement('div');
+    rRow.className = 'p-row';
+    const rHint = document.createElement('div');
+    rHint.className = 'p-hint';
+    rHint.textContent = 'Converte il testo in pixel alla risoluzione del ' +
+      'canvas (qualità export): diventa dipingibile ma non più modificabile ' +
+      'come testo. Annullabile con Undo.';
+    const rBtn = document.createElement('button');
+    rBtn.className = 'tp-reset';
+    rBtn.type = 'button';
+    rBtn.textContent = 'Rasterizza testo';
+    rBtn.addEventListener('click', () => {
+      const l = this.layer;
+      if (!l) return;
+      if (this.app.rasterizeTextLayer(l.id)) this.open(false);
+    });
+    rRow.append(rHint, rBtn);
+    body.appendChild(rRow);
   }
 
   /** @param {string} title */
