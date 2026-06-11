@@ -55,6 +55,7 @@ export class Planes {
     this._fzVb = '';
     this._fzT = '';
     this._fzStable = 0;
+    this._hadLoading = false; // board in warm-up nel frame precedente
   }
 
   /** @param {number} w @param {number} h @param {number} dpr */
@@ -181,6 +182,7 @@ export class Planes {
    * @param {boolean} o.eraserLive
    * @param {GLRenderer|Canvas2DRenderer} o.bottom
    * @param {HTMLCanvasElement} o.bottomCanvas
+   * @param {import('./board_proxy.js').ProxyFrame|null} [o.proxies] board coperti dal quad piatto (zoom-out)
    * @returns {{uploadMs: number, drawMs: number}}
    */
   render(o) {
@@ -203,16 +205,23 @@ export class Planes {
       const hw = camera.w * 0.5 / camera.zoom, hh = camera.h * 0.5 / camera.zoom;
       this._vb = `${camera.x - hw} ${camera.y - hh} ${hw * 2} ${hh * 2}`;
     }
-    // rettangoli dei canvas: seguono camera e struttura/selezione
-    if (camChanged || boards.epoch !== this._bEpoch) {
+    // rettangoli dei canvas: seguono camera e struttura/selezione; mentre
+    // un board si sta caricando (warm-up del proxy) si risincronizzano ogni
+    // frame per la percentuale sull'etichetta (e un frame oltre, per pulire)
+    const loading = o.proxies && o.proxies.loading.size > 0 ? o.proxies.loading : null;
+    if (camChanged || boards.epoch !== this._bEpoch || loading !== null || this._hadLoading) {
       this._bEpoch = boards.epoch;
-      this._syncBoards(camera, boards);
+      this._syncBoards(camera, boards, loading);
     }
+    this._hadLoading = loading !== null;
 
     const activeId = o.activeId;
     const t0 = performance.now();
 
-    // upload dei chunk sporchi, ciascuno sul renderer del proprio piano
+    // upload dei chunk sporchi, ciascuno sul renderer del proprio piano.
+    // I layer coperti da un proxy non si caricano: si segnano texDirty e
+    // rinasceranno on-demand quando il board tornerà al path per-chunk.
+    const skip = o.proxies ? o.proxies.skip : null;
     let bottomDone = false;
     let c2dIdx = 0;
     let uploaded = 0;
@@ -221,6 +230,11 @@ export class Planes {
       const r = bottomDone ? this._pool[c2dIdx++] : bottom;
       bottomDone = true;
       for (const l of g.layers) {
+        if (skip !== null && skip.has(l.id)) {
+          for (const c of l.store.dirty) c.texDirty = true;
+          l.store.dirty.clear();
+          continue;
+        }
         uploaded += r.uploadDirty(l.store);
         if (l.id === activeId) uploaded += r.uploadDirty(strokeStore);
       }
@@ -260,7 +274,8 @@ export class Planes {
       const stroke = hasActive ? strokeStore : null;
       if (!bottomDone) {
         bottomDone = true;
-        bottom.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive);
+        bottom.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive,
+          o.proxies || null);
       } else {
         const r = this._pool[c2dIdx++];
         const liveHere = stroke && stroke.map.size > 0;
@@ -270,7 +285,7 @@ export class Planes {
       }
     }
     // niente gruppi raster: il bottom presenta comunque (pulisce il canvas)
-    if (!bottomDone) bottom.render(camera, [], activeId, null, 1, false);
+    if (!bottomDone) bottom.render(camera, [], activeId, null, 1, false, o.proxies || null);
     this._forceDraw = false;
     const t2 = performance.now();
 
@@ -283,9 +298,10 @@ export class Planes {
   // Piano dei canvas: un div bianco per canvas (sfondo + bordo) e una
   // etichetta, posizionati in px schermo. Niente scale(): larghezza/altezza
   // in px già moltiplicati per lo zoom, così il bordo resta a spessore
-  // costante a qualunque ingrandimento.
-  /** @param {Camera} camera @param {BoardManager} boards */
-  _syncBoards(camera, boards) {
+  // costante a qualunque ingrandimento. loading: boardId -> 0..1, mostra
+  // barra e percentuale finché il board non ha ricaricato le texture.
+  /** @param {Camera} camera @param {BoardManager} boards @param {Map<number, number>|null} [loading] */
+  _syncBoards(camera, boards, loading = null) {
     const z = camera.zoom;
     const seen = new Set();
     for (const b of boards.boards) {
@@ -313,7 +329,11 @@ export class Planes {
       const active = b.id === boards.activeId;
       el.root.classList.toggle('active', active);
       el.label.classList.toggle('active', active);
-      const name = `${b.name} · ${b.w}×${b.h}`;
+      const pct = loading !== null ? loading.get(b.id) : undefined;
+      el.root.classList.toggle('loading', pct !== undefined);
+      const name = pct !== undefined
+        ? `${b.name} · carico ${Math.round(pct * 100)}%`
+        : `${b.name} · ${b.w}×${b.h}`;
       if (el.name !== name) { el.name = name; el.label.textContent = name; }
     }
     // canvas spariti (clearAll): via anche i loro div

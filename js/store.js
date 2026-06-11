@@ -47,6 +47,9 @@ export class ChunkStore {
     this.map = new Map();    // key:int -> chunk
     /** @type {Set<Chunk>} */
     this.dirty = new Set();  // chunk refs con pixel CPU cambiati (da caricare in GPU)
+    // versione del CONTENUTO: cresce a ogni scrittura/rimozione di pixel.
+    // Le cache di presentazione (proxy dei board) la usano per invalidarsi.
+    this.ver = 0;
     /** @type {Chunk[]} */
     this._pool = [];         // chunk rilasciati, riusabili (data azzerata, texture intatta)
   }
@@ -100,6 +103,7 @@ export class ChunkStore {
    * @param {number} [lx0] @param {number} [ly0] @param {number} [lx1] @param {number} [ly1]
    */
   markDirty(chunk, lx0 = 0, ly0 = 0, lx1 = CHUNK - 1, ly1 = CHUNK - 1) {
+    this.ver++;
     this.dirty.add(chunk);
     if (lx0 < chunk.dirX0) chunk.dirX0 = lx0;
     if (ly0 < chunk.dirY0) chunk.dirY0 = ly0;
@@ -112,6 +116,7 @@ export class ChunkStore {
   // altrimenti è un leak GPU. disposeAll = true libera tutte le texture.
   /** @param {(c: Chunk) => void} disposeTex @param {boolean} [disposeAll] */
   releaseAll(disposeTex, disposeAll = false) {
+    if (this.map.size > 0) this.ver++;
     for (const c of this.map.values()) {
       this._release(c, disposeTex, disposeAll);
     }
@@ -138,6 +143,7 @@ export class ChunkStore {
   remove(key, disposeTex, disposeAll = false) {
     const c = this.map.get(key);
     if (!c) return;
+    this.ver++;
     this.map.delete(key);
     this.dirty.delete(c);
     this._release(c, disposeTex, disposeAll);

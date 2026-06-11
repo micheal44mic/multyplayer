@@ -68,6 +68,24 @@ html, body {
 #boards .board.active {
   box-shadow: 0 0 0 2px var(--accent), 0 8px 28px rgba(22, 26, 44, 0.14);
 }
+/* warm-up del canvas (le texture si ricaricano dal proxy dello zoom-out):
+   barra indeterminata sul bordo alto, l'etichetta mostra la percentuale */
+#boards .board.loading { overflow: hidden; }
+#boards .board.loading::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 3px;
+  width: 35%;
+  background: var(--accent);
+  border-radius: 2px;
+  animation: board-loading 0.9s linear infinite;
+}
+@keyframes board-loading {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(300%); }
+}
 #boards .board-label {
   position: absolute;
   left: 0;

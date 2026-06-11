@@ -17,14 +17,17 @@ import { CHUNK } from './store.js';
 // lavoro di dettaglio); fino a qui l'ingrandimento è ammorbidito (LINEAR).
 const MAG_NEAREST_ZOOM = 3.8;
 
+// uSize: lato del quad in px mondo (CHUNK per i tile; dimensioni del board
+// per i quad proxy dello zoom-out).
 const VS_CHUNK = `
 attribute vec2 aPos;
 uniform mat3 uMat;
 uniform vec2 uOrigin;
+uniform vec2 uSize;
 varying vec2 vUv;
 void main() {
   vUv = aPos;
-  vec3 p = uMat * vec3(uOrigin + aPos * ${CHUNK}.0, 1.0);
+  vec3 p = uMat * vec3(uOrigin + aPos * uSize, 1.0);
   gl_Position = vec4(p.xy, 0.0, 1.0);
 }`;
 
@@ -129,15 +132,20 @@ export class GLRenderer {
 
   _init() {
     const gl = this.gl;
+    // generazione del contesto: le risorse esterne (proxy dei board) la
+    // confrontano per dimenticare ciò che apparteneva a un contesto morto
+    this.ctxGen = (this.ctxGen || 0) + 1;
     this.progChunk = link(gl, VS_CHUNK, FS_CHUNK);
     this.progErase = link(gl, VS_CHUNK, FS_ERASE);
 
     this.uMat = gl.getUniformLocation(this.progChunk, 'uMat');
     this.uOrigin = gl.getUniformLocation(this.progChunk, 'uOrigin');
+    this.uSize = gl.getUniformLocation(this.progChunk, 'uSize');
     this.uAlpha = gl.getUniformLocation(this.progChunk, 'uAlpha');
     this.uTex = gl.getUniformLocation(this.progChunk, 'uTex');
     this.eMat = gl.getUniformLocation(this.progErase, 'uMat');
     this.eOrigin = gl.getUniformLocation(this.progErase, 'uOrigin');
+    this.eSize = gl.getUniformLocation(this.progErase, 'uSize');
     this.eAlpha = gl.getUniformLocation(this.progErase, 'uAlpha');
     this.eLayerA = gl.getUniformLocation(this.progErase, 'uLayerA');
     this.eTex = gl.getUniformLocation(this.progErase, 'uTex');
@@ -292,6 +300,7 @@ export class GLRenderer {
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
     gl.uniformMatrix3fv(this.uMat, false, camera.matrix());
+    gl.uniform2f(this.uSize, CHUNK, CHUNK);
     gl.uniform1i(this.uTex, 0);
     gl.activeTexture(gl.TEXTURE0);
   }
@@ -300,10 +309,14 @@ export class GLRenderer {
    * Disegna i livelli raster del gruppo dal basso verso l'alto, con
    * l'opacità del livello. Lo stroke live entra subito sopra il livello
    * attivo; con la gomma il livello attivo è attenuato dalla maschera.
+   * I layer nel set proxies.skip non si disegnano: al loro posto ci sono i
+   * quad piatti dei board (proxies.quads), uno per board — lo zoom-out non
+   * paga più un draw e una texture per ogni chunk.
    * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
    * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
+   * @param {import('./board_proxy.js').ProxyFrame|null} [proxies]
    */
-  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive) {
+  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive, proxies = null) {
     if (this.contextLost) return;
     const gl = this.gl;
     this.uploadsThisFrame = 0;
@@ -322,8 +335,22 @@ export class GLRenderer {
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     this._bindChunkProg(camera);
 
+    // quad dei board proxati (i board non si sovrappongono: ordine libero)
+    if (proxies && proxies.quads.length > 0) {
+      gl.uniform1f(this.uAlpha, 1);
+      for (const q of proxies.quads) {
+        gl.uniform2f(this.uSize, q.w, q.h);
+        gl.uniform2f(this.uOrigin, q.x, q.y);
+        gl.bindTexture(gl.TEXTURE_2D, q.tex);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      }
+      gl.uniform2f(this.uSize, CHUNK, CHUNK);
+    }
+    const skip = proxies ? proxies.skip : null;
+
     for (const layer of layers) {
       if (layer.kind !== 'raster' || !layer.visible || layer.opacity <= 0) continue;
+      if (skip !== null && skip.has(layer.id)) continue;
       const live = layer.id === activeId && strokeStore && strokeStore.map.size > 0;
       if (live && eraserLive) {
         this._drawErase(camera, layer, strokeStore, strokeOpacity, cx0, cy0, cx1, cy1);
@@ -354,6 +381,7 @@ export class GLRenderer {
     gl.enableVertexAttribArray(aPosE);
     gl.vertexAttribPointer(aPosE, 2, gl.FLOAT, false, 0, 0);
     gl.uniformMatrix3fv(this.eMat, false, camera.matrix());
+    gl.uniform2f(this.eSize, CHUNK, CHUNK);
     gl.uniform1f(this.eAlpha, strokeOpacity);
     gl.uniform1f(this.eLayerA, layer.opacity);
     gl.uniform1i(this.eTex, 0);

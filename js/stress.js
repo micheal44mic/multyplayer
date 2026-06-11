@@ -305,7 +305,11 @@ export class StressTest {
           c.touched = true;
           job.filled++;
         }
-        if (job.ci >= PER_LAYER) { fl.layer.thumbDirty = true; job.li++; job.ci = 0; }
+        if (job.ci >= PER_LAYER) {
+          fl.layer.thumbDirty = true;
+          fl.store.ver++; // contenuto cambiato: i proxy dei board si invalidano
+          job.li++; job.ci = 0;
+        }
       }
     } catch (err) {
       this._finish(`Memoria esaurita dopo ${job.filled} chunk (${fmtBytes(job.filled * CHUNK_BYTES)}): ${err}`);
@@ -337,12 +341,13 @@ export class StressTest {
     } else {
       this._statusEl.textContent = `Fatto: ${job.filled} chunk · ${fmtBytes(bytes)} in ${secs}s`;
     }
-    // VRAM residente stimata a tutto visibile (+33% di mipmap): se è tanta,
-    // l'inquadratura totale resta una scelta del click, non un automatismo
-    if (bytes * 1.33 < AUTO_FIT_VRAM) {
+    // Con WebGL l'inquadratura totale è coperta dai proxy dei board (un quad
+    // per board, build a budget): si può sempre. Sul fallback Canvas2D resta
+    // il path per-chunk: sopra la soglia di VRAM stimata si lascia il click.
+    if (this.app.renderer.kind !== 'Canvas2D' || bytes * 1.33 < AUTO_FIT_VRAM) {
       this._fitAll();
     } else {
-      this._statusEl.textContent += ' — «Inquadra tutto» per il vero stress (può perdere il contesto GL)';
+      this._statusEl.textContent += ' — «Inquadra tutto» per il vero stress (renderer 2D: può soffrire)';
     }
   }
 
@@ -373,8 +378,11 @@ export function initStress(app) {
     toggle: () => st.toggle(),
     panel: st,
   };
-  const m = /^(\d{1,2})x(\d{1,2})(?:x(\d{1,3}))?$/.exec(
-    new URLSearchParams(location.search).get('stress') || '');
+  // ?stress=... oppure #stress=...: l'hash sopravvive ai server statici che
+  // normalizzano index.html -> / perdendo la query (es. `serve`)
+  const arg = new URLSearchParams(location.search).get('stress') ||
+    (/[#&]stress=([0-9x]+)/.exec(location.hash) || [])[1] || '';
+  const m = /^(\d{1,2})x(\d{1,2})(?:x(\d{1,3}))?$/.exec(arg);
   if (m) {
     st.show(true);
     st.start({ boards: +m[1], layers: +m[2], coverage: m[3] ? +m[3] / 100 : 1 });

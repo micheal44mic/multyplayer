@@ -22,6 +22,7 @@ import { makeRasterLayer } from './layers.js';
 import { BoardManager, MAX_BOARDS } from './boards.js';
 import { freeBlockBitmap, setBlockDebug3d, setTextGpu } from './text_layer.js';
 import { Planes } from './planes.js';
+import { BoardProxyCache } from './board_proxy.js';
 import { WasmHeap } from './wasm_core.js';
 import { strokeProfiler } from './stroke_profiler.js';
 import { initStress } from './stress.js';
@@ -80,6 +81,9 @@ export class App {
     renderer.trackStores(() => [...this._allStores]);
 
     this.planes = new Planes(this.planesEl, this.gridEl, this.boardsEl);
+    // zoom-out: i board non attivi diventano UN quad con texture piatta
+    // 1024² (build GPU a budget), invece di un draw+texture per chunk
+    this.proxy = new BoardProxyCache();
 
     this.undoMgr = new UndoManager(
       () => this.ui.updateUndoButtons(this.undoMgr),
@@ -304,10 +308,20 @@ export class App {
 
   /** @param {number} x @param {number} y @param {number} p @param {number} t */
   startStroke(x, y, p, t) {
-    // si disegna solo DENTRO un canvas: il punto di partenza decide quale
-    // (e lo rende attivo); sul piano di lavoro vuoto non parte niente
+    // si disegna solo DENTRO un canvas: il punto di partenza decide quale;
+    // sul piano di lavoro vuoto non parte niente
     const board = this.boards.hitTest(x, y);
     if (!board) return;
+    // primo click su un canvas NON attivo = solo selezione, niente tratto:
+    // il canvas si carica (proxy → texture, barra sull'etichetta) e si
+    // disegna dal tocco successivo
+    if (board.id !== this.boards.activeId) {
+      this.selectBoard(board.id);
+      return;
+    }
+    // appena selezionato e ancora in caricamento: il tratto partirebbe
+    // alla cieca sotto il quad del proxy
+    if (this.renderer instanceof GLRenderer && this.proxy.isLoading(board.id)) return;
     const target = board.mgr.paintTarget;
     if (!target) return; // attivo non dipingibile (testo/nascosto): ignora
     // chiudi del tutto l'eventuale tratto precedente: drena la sua coda
@@ -322,7 +336,6 @@ export class App {
       strokeProfiler.event('flush sincrono', performance.now() - tp);
       strokeProfiler.finish('chiuso dal tratto successivo');
     }
-    if (board.id !== this.boards.activeId) this.selectBoard(board.id);
     this._strokeLayerId = target.id;
     this._strokeClip = { x0: board.x, y0: board.y, x1: board.x + board.w - 1, y1: board.y + board.h - 1 };
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
@@ -573,11 +586,18 @@ export class App {
     const snap = this.raster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
+    // proxy dei board per lo zoom-out (solo WebGL): quad piatti al posto dei
+    // chunk per i board non attivi. Durante un tratto la build resta ferma.
+    const proxies = this.renderer instanceof GLRenderer && this.renderer.ok
+      ? this.proxy.update(this.renderer, this.boards, this.boards.activeId,
+        this.camera, !this.strokeLive)
+      : null;
     const pres = this.planes.render({
       camera: this.camera, boards: this.boards, activeId: this.layerMgr.activeId,
       strokeStore: this.strokeStore,
       liveOpacity, eraserLive: liveEraser,
       bottom: this.renderer, bottomCanvas: this.canvas,
+      proxies,
     });
     // VRAM limitata: eviction delle texture fuori schermo (riupload on-demand).
     // I chunk dei piani 2D hanno tex nulla: il loop li salta da solo.
@@ -616,7 +636,7 @@ export class App {
     stats.docChunks = docChunks;
     stats.strokeChunks = this.strokeStore.count;
     stats.cpuBytes = cpuBytes;
-    stats.gpuBytes = this.renderer.gpuBytes + this.planes.gpuBytes;
+    stats.gpuBytes = this.renderer.gpuBytes + this.planes.gpuBytes + this.proxy.gpuBytes;
     stats.undoCount = this.undoMgr.undoStack.length;
     stats.undoBytes = this.undoMgr.storedBytes;
     stats.stampCache = this.stampCache.map.size;

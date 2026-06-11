@@ -105,10 +105,12 @@ export class Canvas2DRenderer {
   /**
    * Disegna i livelli raster del gruppo dal basso verso l'alto (opacità per
    * livello, stroke live sopra il livello attivo, gomma via scratch).
+   * _proxies è ignorato: il fallback 2D resta sul path per-chunk.
    * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
    * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
+   * @param {import('./board_proxy.js').ProxyFrame|null} [_proxies]
    */
-  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive) {
+  render(camera, layers, activeId, strokeStore, strokeOpacity, eraserLive, _proxies = null) {
     const ctx = this.ctx;
     const dpr = camera.dpr;
     this.uploadsThisFrame = 0;
