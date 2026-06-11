@@ -90,6 +90,10 @@ export function shadowCss(hex, a = 0.65) {
  * @property {number} warpFreq onda: numero di onde sull'intero testo
  * @property {Distort} [distort] gabbia della distorsione (creata al primo uso)
  * @property {number} [distortVer] timbro monotono: cambia a ogni modifica della gabbia
+ * @property {{x:number,y:number,w:number,h:number,vBase:number}} [distortFrame]
+ *   frame CONGELATO della gabbia in unità di corpo, relativo a item.x/y:
+ *   cambiare testo o font non lo tocca (il contenuto si stira dentro),
+ *   spostare il testo lo trasla, cambiare corpo lo scala
  */
 
 /**
@@ -201,17 +205,51 @@ export function textWidth(it, st) {
  * @property {number} w avanzamento del glifo in px mondo
  */
 
-// Bbox mondo del testo NON deformato: il riferimento della gabbia distort
-// (i punti normalizzati u/v vivono qui). vBase = quota della baseline (0..1).
+// Bbox mondo dell'INCHIOSTRO del testo dritto (senza bordo/ombra): è il box
+// SORGENTE della distort, da cui si rasterizza la bitmap da piegare.
+// Orizzontale come il verticale: misure d'inchiostro reali, prese col
+// textAlign center del disegno (left/right relativi a it.x). textWidth non
+// va bene qui: è avanzamento, col pavimento per-carattere che gonfia il box
+// sui font stretti -> gabbia che non aderisce. vBase = quota baseline (0..1).
 /** @param {TextItem} it @param {TextStyle} st */
-export function distortBox(it, st) {
+function _distortInkBox(it, st) {
   measurer.font = textFont(it, st);
+  measurer.textAlign = 'center';
   const m = measurer.measureText(it.text || 'M');
+  measurer.textAlign = 'start';
   const asc = m.actualBoundingBoxAscent || it.size * 0.75;
   const desc = m.actualBoundingBoxDescent || it.size * 0.25;
-  const w = textWidth(it, st);
+  const half = textWidth(it, st) / 2;
+  const left = m.actualBoundingBoxLeft || half;
+  const right = m.actualBoundingBoxRight || half;
   const baseY = textBaselineY(it, st);
-  return { x: it.x - w / 2, y: baseY - asc, w, h: asc + desc, vBase: asc / (asc + desc) };
+  return {
+    x: it.x - left, y: baseY - asc,
+    w: left + right, h: asc + desc,
+    vBase: asc / (asc + desc),
+  };
+}
+
+// Frame mondo della GABBIA distort (i punti normalizzati u/v vivono qui).
+// È l'inchiostro del testo CONGELATO al primo uso, salvato in unità di corpo
+// relative a it.x/y: cambiando testo o font la gabbia NON si muove — il
+// contenuto nuovo si stira dentro, stile envelope ("Reimposta gabbia"
+// ricattura). Il box della bitmap effetto resta separato in blockBox().
+/** @param {TextItem} it @param {TextStyle} st */
+export function distortBox(it, st) {
+  const f = st.distortFrame;
+  if (f) {
+    return {
+      x: it.x + f.x * it.size, y: it.y + f.y * it.size,
+      w: f.w * it.size, h: f.h * it.size, vBase: f.vBase,
+    };
+  }
+  const live = _distortInkBox(it, st);
+  st.distortFrame = {
+    x: (live.x - it.x) / it.size, y: (live.y - it.y) / it.size,
+    w: live.w / it.size, h: live.h / it.size, vBase: live.vBase,
+  };
+  return live;
 }
 
 // Punto + derivata di una cubica di Bézier (coordinate normalizzate gabbia).
@@ -436,11 +474,13 @@ function blockBox(it, st) {
   let x0, y0, x1, y1;
   if (distort) {
     // estremi della gabbia campionando i bordi (33 punti per lato, oltre i
-    // margini sorgente in u e v: il warp mappa anche la corona del bordo)
-    const b = distortBox(it, st);
+    // margini sorgente in u e v: il warp mappa anche la corona del bordo).
+    // La corona è in unità del box SORGENTE, le posizioni sul frame congelato.
+    const frame = distortBox(it, st);
+    const sbox = _distortInkBox(it, st);
     const m = _distortMargin(it, st);
-    const vT = -m / b.h, vB = 1 + m / b.h;
-    const uL = -m / b.w, uR = 1 + m / b.w;
+    const vT = -m / sbox.h, vB = 1 + m / sbox.h;
+    const uL = -m / sbox.w, uR = 1 + m / sbox.w;
     const eT = { x: 0, y: 0, dx: 0, dy: 0 }, eB = { x: 0, y: 0, dx: 0, dy: 0 };
     x0 = Infinity; y0 = Infinity; x1 = -Infinity; y1 = -Infinity;
     for (let i = 0; i <= 32; i++) {
@@ -448,8 +488,8 @@ function blockBox(it, st) {
       evalEdge(distort, true, u, eT);
       evalEdge(distort, false, u, eB);
       for (const v of [vT, vB]) {
-        const px = b.x + (eT.x + (eB.x - eT.x) * v) * b.w;
-        const py = b.y + (eT.y + (eB.y - eT.y) * v) * b.h;
+        const px = frame.x + (eT.x + (eB.x - eT.x) * v) * frame.w;
+        const py = frame.y + (eT.y + (eB.y - eT.y) * v) * frame.h;
         x0 = Math.min(x0, px); x1 = Math.max(x1, px);
         y0 = Math.min(y0, py); y1 = Math.max(y1, py);
       }
@@ -538,24 +578,27 @@ const _wsT = { x: 0, y: 0, dx: 0, dy: 0 }, _wsB = { x: 0, y: 0, dx: 0, dy: 0 };
 // Disegna `src` (testo dritto + corona di margine m) deformato dalla gabbia,
 // su un ctx già in coordinate mondo. Le colonne fra strisce adiacenti sono
 // IDENTICHE (calcolate una volta e riusate): i lati combaciano, zero crepe.
+// sbox = box d'inchiostro della sorgente (la corona vive nelle sue unità);
+// frame = gabbia congelata su cui le posizioni si stirano.
 /**
  * @param {CanvasRenderingContext2D} ctx @param {HTMLCanvasElement} src
- * @param {Distort} d @param {ReturnType<typeof distortBox>} b
+ * @param {Distort} d @param {ReturnType<typeof distortBox>} frame
+ * @param {ReturnType<typeof _distortInkBox>} sbox
  * @param {number} m @param {number} r @param {number} N
  */
-function _warpStrips(ctx, src, d, b, m, r, N) {
+function _warpStrips(ctx, src, d, frame, sbox, m, r, N) {
   const sw = src.width, sh = src.height;
-  const vT = -m / b.h, vB = 1 + m / b.h;
-  const uL = -m / b.w, uR = 1 + m / b.w;
+  const vT = -m / sbox.h, vB = 1 + m / sbox.h;
+  const uL = -m / sbox.w, uR = 1 + m / sbox.w;
   const ex = 0.6 / r; // clip gonfiato ~0.6 px device
   /** @param {number} u @param {{tx:number,ty:number,bx:number,by:number}} out */
   const col = (u, out) => {
     evalEdge(d, true, u, _wsT);
     evalEdge(d, false, u, _wsB);
-    out.tx = b.x + (_wsT.x + (_wsB.x - _wsT.x) * vT) * b.w;
-    out.ty = b.y + (_wsT.y + (_wsB.y - _wsT.y) * vT) * b.h;
-    out.bx = b.x + (_wsT.x + (_wsB.x - _wsT.x) * vB) * b.w;
-    out.by = b.y + (_wsT.y + (_wsB.y - _wsT.y) * vB) * b.h;
+    out.tx = frame.x + (_wsT.x + (_wsB.x - _wsT.x) * vT) * frame.w;
+    out.ty = frame.y + (_wsT.y + (_wsB.y - _wsT.y) * vT) * frame.h;
+    out.bx = frame.x + (_wsT.x + (_wsB.x - _wsT.x) * vB) * frame.w;
+    out.by = frame.y + (_wsT.y + (_wsB.y - _wsT.y) * vB) * frame.h;
   };
   const L = { tx: 0, ty: 0, bx: 0, by: 0 }, R = { tx: 0, ty: 0, bx: 0, by: 0 };
   col(uL, L);
@@ -566,6 +609,183 @@ function _warpStrips(ctx, src, d, b, m, r, N) {
     _drawTri(ctx, src, R.tx, R.ty, R.bx, R.by, L.bx, L.by, sx1, 0, sx1, sh, sx0, sh, ex);
     L.tx = R.tx; L.ty = R.ty; L.bx = R.bx; L.by = R.by;
   }
+}
+
+/** @param {Distort} d */
+function _distortIsIdentity(d) {
+  const eps = 1e-6;
+  const near = (p, x, y) => Math.abs(p.x - x) <= eps && Math.abs(p.y - y) <= eps;
+  const H = 1 / 6;
+  return near(d.tl, 0, 0) && near(d.tc, 0.5, 0) && near(d.tr, 1, 0) &&
+    near(d.bl, 0, 1) && near(d.bc, 0.5, 1) && near(d.br, 1, 1) &&
+    near(d.htl, H, 0) && near(d.htcl, -H, 0) &&
+    near(d.htcr, H, 0) && near(d.htr, -H, 0) &&
+    near(d.hbl, H, 0) && near(d.hbcl, -H, 0) &&
+    near(d.hbcr, H, 0) && near(d.hbr, -H, 0);
+}
+
+/** @type {{canvas: HTMLCanvasElement, gl: WebGLRenderingContext, prog: WebGLProgram, buf: WebGLBuffer, tex: WebGLTexture, aPos: number, aUv: number, uTex: WebGLUniformLocation}|null|false} */
+let _warpGL = null;
+
+/** @param {WebGLRenderingContext} gl @param {number} type @param {string} src */
+function _glShader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+
+function _warpGlInst() {
+  if (_warpGL !== null) return _warpGL || null;
+  try {
+    const canvas = document.createElement('canvas');
+    const gl = /** @type {WebGLRenderingContext|null} */ (
+      canvas.getContext('webgl', {
+        alpha: true, antialias: false, depth: false, stencil: false,
+        preserveDrawingBuffer: true,
+      }) || canvas.getContext('experimental-webgl'));
+    if (!gl) return (_warpGL = false), null;
+    const vs = `
+attribute vec2 aPos;
+attribute vec2 aUv;
+varying vec2 vUv;
+void main() {
+  gl_Position = vec4(aPos, 0.0, 1.0);
+  vUv = aUv;
+}`;
+    const fs = `
+precision mediump float;
+uniform sampler2D uTex;
+varying vec2 vUv;
+void main() {
+  gl_FragColor = texture2D(uTex, vUv);
+}`;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, _glShader(gl, gl.VERTEX_SHADER, vs));
+    gl.attachShader(prog, _glShader(gl, gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    const buf = gl.createBuffer();
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    _warpGL = {
+      canvas, gl, prog, buf, tex,
+      aPos: gl.getAttribLocation(prog, 'aPos'),
+      aUv: gl.getAttribLocation(prog, 'aUv'),
+      uTex: gl.getUniformLocation(prog, 'uTex'),
+    };
+    return _warpGL;
+  } catch {
+    _warpGL = false;
+    return null;
+  }
+}
+
+/** @param {Distort} d @param {ReturnType<typeof distortBox>} frame @param {ReturnType<typeof _distortInkBox>} sbox @param {number} m @param {number} u @param {{tx:number,ty:number,bx:number,by:number}} out */
+function _distortColumn(d, frame, sbox, m, u, out) {
+  const vT = -m / sbox.h, vB = 1 + m / sbox.h;
+  evalEdge(d, true, u, _wsT);
+  evalEdge(d, false, u, _wsB);
+  out.tx = frame.x + (_wsT.x + (_wsB.x - _wsT.x) * vT) * frame.w;
+  out.ty = frame.y + (_wsT.y + (_wsB.y - _wsT.y) * vT) * frame.h;
+  out.bx = frame.x + (_wsT.x + (_wsB.x - _wsT.x) * vB) * frame.w;
+  out.by = frame.y + (_wsT.y + (_wsB.y - _wsT.y) * vB) * frame.h;
+}
+
+/**
+ * @param {HTMLCanvasElement} src @param {Distort} d
+ * @param {ReturnType<typeof distortBox>} frame
+ * @param {ReturnType<typeof _distortInkBox>} sbox @param {number} m
+ * @param {number} r @param {ReturnType<typeof blockBox>} box
+ * @param {number} cw @param {number} ch @param {number} N
+ * @returns {HTMLCanvasElement|null}
+ */
+function _warpMeshGL(src, d, frame, sbox, m, r, box, cw, ch, N) {
+  const inst = _warpGlInst();
+  if (!inst) return null;
+  const { canvas, gl, prog, buf, tex } = inst;
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width = cw; canvas.height = ch;
+  }
+  gl.viewport(0, 0, cw, ch);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(prog);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // niente flip: la mesh assegna v=0 al bordo ALTO (riga 0 della sorgente),
+  // stessa convenzione di _warpStrips
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+  gl.uniform1i(inst.uTex, 0);
+
+  const verts = new Float32Array(N * 6 * 4);
+  let o = 0;
+  /** @param {number} wx @param {number} wy @param {number} u @param {number} v */
+  const put = (wx, wy, u, v) => {
+    const x = (wx - box.x) * r;
+    const y = (wy - box.y) * r;
+    verts[o++] = x / cw * 2 - 1;
+    verts[o++] = 1 - y / ch * 2;
+    verts[o++] = u;
+    verts[o++] = v;
+  };
+  const uL = -m / sbox.w, uR = 1 + m / sbox.w;
+  const L = { tx: 0, ty: 0, bx: 0, by: 0 }, R = { tx: 0, ty: 0, bx: 0, by: 0 };
+  _distortColumn(d, frame, sbox, m, uL, L);
+  for (let i = 0; i < N; i++) {
+    const u0 = i / N, u1 = (i + 1) / N;
+    _distortColumn(d, frame, sbox, m, uL + (uR - uL) * u1, R);
+    put(L.tx, L.ty, u0, 0); put(R.tx, R.ty, u1, 0); put(L.bx, L.by, u0, 1);
+    put(R.tx, R.ty, u1, 0); put(R.bx, R.by, u1, 1); put(L.bx, L.by, u0, 1);
+    L.tx = R.tx; L.ty = R.ty; L.bx = R.bx; L.by = R.by;
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
+  gl.enableVertexAttribArray(inst.aPos);
+  gl.vertexAttribPointer(inst.aPos, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(inst.aUv);
+  gl.vertexAttribPointer(inst.aUv, 2, gl.FLOAT, false, 16, 8);
+  gl.drawArrays(gl.TRIANGLES, 0, N * 6);
+  gl.flush();
+  return canvas;
+}
+
+/**
+ * Disegna la sorgente deformata su un contesto 2D in coordinate pixel canvas.
+ * @param {CanvasRenderingContext2D} ctx @param {HTMLCanvasElement} src
+ * @param {Distort} d @param {ReturnType<typeof distortBox>} frame
+ * @param {ReturnType<typeof _distortInkBox>} sbox
+ * @param {number} m @param {number} r @param {ReturnType<typeof blockBox>} box
+ * @param {number} cw @param {number} ch @param {number} N
+ */
+function _drawWarpedBitmap(ctx, src, d, frame, sbox, m, r, box, cw, ch, N) {
+  if (_distortIsIdentity(d)) {
+    // gabbia identità: resta comunque lo stiramento inchiostro -> frame
+    const kx = frame.w / sbox.w, ky = frame.h / sbox.h;
+    ctx.drawImage(src,
+      Math.round((frame.x - m * kx - box.x) * r),
+      Math.round((frame.y - m * ky - box.y) * r),
+      Math.max(1, Math.round((frame.w + 2 * m * kx) * r)),
+      Math.max(1, Math.round((frame.h + 2 * m * ky) * r)));
+    return;
+  }
+  const glCanvas = _warpMeshGL(src, d, frame, sbox, m, r, box, cw, ch, N);
+  if (glCanvas) {
+    ctx.drawImage(glCanvas, 0, 0);
+    return;
+  }
+  ctx.save();
+  ctx.setTransform(r, 0, 0, r, -box.x * r, -box.y * r);
+  _warpStrips(ctx, src, d, frame, sbox, m, r, N);
+  ctx.restore();
 }
 
 // Canvas di servizio della distort, riusati fra le rigenerazioni.
@@ -584,17 +804,21 @@ function _warpStrips(ctx, src, d, b, m, r, N) {
  */
 function _renderDistortInto(cnv, scratch, it, st, r, box, stepDev) {
   const d = st.distort;
-  const b = distortBox(it, st);
+  const frame = distortBox(it, st);
+  const sbox = _distortInkBox(it, st);
   const m = _distortMargin(it, st);
-  // sorgente dritta: bordo sotto il fill, come l'SVG
-  const sw = Math.max(1, Math.round((b.w + 2 * m) * r));
-  const sh = Math.max(1, Math.round((b.h + 2 * m) * r));
+  // sorgente dritta: bordo sotto il fill, come l'SVG. Rasterizzata dal box
+  // d'inchiostro a densità compensata per lo stiramento verso il frame
+  // congelato (testo corto in gabbia larga = niente sfocatura da upscale)
+  const rx = r * frame.w / sbox.w, ry = r * frame.h / sbox.h;
+  const sw = Math.max(1, Math.round((sbox.w + 2 * m) * rx));
+  const sh = Math.max(1, Math.round((sbox.h + 2 * m) * ry));
   if (!_srcFace) _srcFace = document.createElement('canvas');
   if (_srcFace.width !== sw || _srcFace.height !== sh) { _srcFace.width = sw; _srcFace.height = sh; }
   const fctx = _srcFace.getContext('2d');
   fctx.setTransform(1, 0, 0, 1, 0, 0);
   fctx.clearRect(0, 0, sw, sh);
-  fctx.setTransform(r, 0, 0, r, -(b.x - m) * r, -(b.y - m) * r);
+  fctx.setTransform(rx, 0, 0, ry, -(sbox.x - m) * rx, -(sbox.y - m) * ry);
   fctx.font = textFont(it, st);
   fctx.textAlign = 'center';
   fctx.textBaseline = 'alphabetic';
@@ -619,9 +843,10 @@ function _renderDistortInto(cnv, scratch, it, st, r, box, stepDev) {
   ctx.clearRect(0, 0, cw, ch);
 
   const preview = stepDev > FULL_STEP + 0.01;
+  const meshGL = _warpGlInst() !== null;
   const N = preview
-    ? Math.max(16, Math.min(96, Math.round(cw / 8)))
-    : Math.max(24, Math.min(256, Math.round(cw / 3)));
+    ? Math.max(24, Math.min(meshGL ? 240 : 96, Math.round(cw / (meshGL ? 4 : 8))))
+    : Math.max(48, Math.min(meshGL ? 1024 : 256, Math.round(cw / (meshGL ? 1.5 : 3))));
 
   const effOn = st.block ? st.shadowDist > 0 : (st.shadowBlur > 0 || st.shadowDist > 0);
   if (effOn) {
@@ -643,8 +868,7 @@ function _renderDistortInto(cnv, scratch, it, st, r, box, stepDev) {
     const wctx = _warpA.getContext('2d');
     wctx.setTransform(1, 0, 0, 1, 0, 0);
     wctx.clearRect(0, 0, cw, ch);
-    wctx.setTransform(r, 0, 0, r, -box.x * r, -box.y * r);
-    _warpStrips(wctx, _srcSil, d, b, m, r, N);
+    _drawWarpedBitmap(wctx, _srcSil, d, frame, sbox, m, r, box, cw, ch, N);
 
     const { ux, uy } = shadowDir(st);
     const blur = st.shadowBlur > 0;
@@ -688,9 +912,8 @@ function _renderDistortInto(cnv, scratch, it, st, r, box, stepDev) {
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
   }
-  ctx.setTransform(r, 0, 0, r, -box.x * r, -box.y * r);
-  _warpStrips(ctx, _srcFace, d, b, m, r, N);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  _drawWarpedBitmap(ctx, _srcFace, d, frame, sbox, m, r, box, cw, ch, N);
   return N;
 }
 

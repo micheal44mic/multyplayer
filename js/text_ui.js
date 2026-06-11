@@ -2,7 +2,7 @@
 // testo SELEZIONATO vedendo il risultato live. Il bottone Testo in toolbar
 // crea ogni volta un NUOVO livello testo sopra quello attivo.
 
-import { TEXT_FONTS, ensureFont, defaultTextStyle, makeTextItem, textWidth, defaultDistort, bumpDistort } from './text_layer.js';
+import { TEXT_FONTS, ensureFont, defaultTextStyle, makeTextItem, textWidth, defaultDistort, distortBox, bumpDistort } from './text_layer.js';
 import { makeTextLayer } from './layers.js';
 import { DistortGizmo } from './distort_ui.js';
 
@@ -174,6 +174,8 @@ export class TextUI {
         }
         if (st.warp === 'distort' && !st.distort) {
           st.distort = defaultDistort();
+          st.distortFrame = undefined;
+          distortBox(l.item, st);
           bumpDistort(st);
         }
       });
@@ -208,10 +210,17 @@ export class TextUI {
     dReset.className = 'tp-reset';
     dReset.type = 'button';
     dReset.textContent = 'Reimposta gabbia';
-    dReset.addEventListener('click', () => withStyle((st) => {
-      st.distort = defaultDistort();
-      bumpDistort(st);
-    }));
+    dReset.addEventListener('click', () => {
+      const l = this.layer;
+      if (!l) return;
+      withStyle((st) => {
+        st.distort = defaultDistort();
+        // il frame congelato si ricattura sull'inchiostro del testo corrente
+        st.distortFrame = undefined;
+        distortBox(l.item, st);
+        bumpDistort(st);
+      });
+    });
     rowDistort.append(dHint, dReset);
     body.append(rowBend, rowRadius, rowAmp, rowFreq, rowDistort);
     this._sync.push(() => {
