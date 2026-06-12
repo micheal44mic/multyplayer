@@ -16,6 +16,34 @@ npx serve .          # oppure: python -m http.server 8000
 
 e apri `http://localhost:3000` (o la porta indicata).
 
+Per provare il multiplayer P2P locale usa il server incluso:
+
+```
+npm install
+npm run dev
+```
+
+Apri `http://localhost:8787`, premi **Host**, poi in un'altra finestra apri
+lo stesso URL, inserisci il codice stanza e premi **Entra**. Il disegno passa
+quando la toolbar mostra **Connesso** sul guest e `1/1` sull'host. Su altri
+dispositivi serve HTTPS: molti browser bloccano WebRTC su indirizzi LAN
+`http://192.168...`.
+
+## Pubblicazione GitHub Pages
+
+Per GitHub Pages usa **Settings → Pages → Deploy from a branch**:
+
+- Branch: `main`
+- Folder: `/ (root)`
+
+GitHub Pages pubblica la parte statica dell'app in HTTPS, ma non esegue il
+server WebSocket di signaling. Quando avrai un signaling online, inserisci il
+suo URL in `js/net/multiplayer_config.js` oppure apri la pagina con:
+
+```
+https://micheal44mic.github.io/multyplayer/?signal=wss://tuo-server/signaling
+```
+
 ## Comandi
 
 | Azione | Desktop | Mobile |

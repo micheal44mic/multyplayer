@@ -110,6 +110,50 @@ body.importing, body.importing #planes { cursor: wait; }
   z-index: 5;
 }
 
+#mp-cursors {
+  position: fixed;
+  inset: 0;
+  z-index: 18;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.mp-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 24px;
+  height: 24px;
+  color: #3b82f6;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.45));
+  will-change: transform;
+}
+
+.mp-cursor svg {
+  display: block;
+  width: 24px;
+  height: 24px;
+}
+
+.mp-cursor-name {
+  position: absolute;
+  left: 4px;
+  bottom: 23px;
+  transform: translateX(-50%);
+  max-width: 96px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--mp-color, currentColor);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.2;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.22);
+}
+
 /* overlay della selezione per colore: sopra i piani, sotto cursore e gizmo.
    La tinta è una bitmap board-locale scalata dal compositor (transform,
    come i .board); le formiche sono un path SVG in coordinate mondo col
@@ -388,6 +432,53 @@ body.importing, body.importing #planes { cursor: wait; }
   min-width: 48px;
   text-align: center;
   font-variant-numeric: tabular-nums;
+}
+
+.mp-group {
+  min-height: 38px;
+}
+
+.mp-status {
+  min-width: 72px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--ui-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.mp-code {
+  width: 72px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--ui-line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--ui-fg);
+  font: inherit;
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.mp-code:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.mp-code:disabled {
+  opacity: 0.35;
+}
+
+.mp-btn {
+  min-width: 48px;
+  font-size: 12px;
+}
+
+.mp-btn.danger:not(:disabled):hover {
+  background: rgba(255, 93, 93, 0.24);
 }
 
 /* ---------- brush studio (popup) ---------- */

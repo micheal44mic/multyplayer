@@ -569,8 +569,12 @@ export class UI {
     this.zoomOutBtn.addEventListener('click', () => this._zoomBy(0.8));
     this.zoomInBtn.addEventListener('click', () => this._zoomBy(1.25));
     document.getElementById('btn-hud').addEventListener('click', () => app.hud.toggle());
-    document.getElementById('btn-text').addEventListener('click', () => this.textUI.placeAtView());
-    document.getElementById('btn-layers').addEventListener('click', () => this.layersUI.toggle());
+    document.getElementById('btn-text').addEventListener('click', () => {
+      if (!app.blockMultiplayerUnsupported('Testo')) this.textUI.placeAtView();
+    });
+    document.getElementById('btn-layers').addEventListener('click', () => {
+      if (!app.blockMultiplayerUnsupported('Livelli')) this.layersUI.toggle();
+    });
     document.getElementById('btn-panel').addEventListener('click', () => this.toggleStudio());
   }
 
@@ -640,8 +644,12 @@ export class UI {
       else if (k === 'v') this.setTool('move');
       else if (k === 'h') this.setTool('pan');
       else if (k === 'p') this.toggleStudio();
-      else if (k === 't') this.textUI.placeAtView();
-      else if (k === 'l') this.layersUI.toggle();
+      else if (k === 't') {
+        if (!app.blockMultiplayerUnsupported('Testo')) this.textUI.placeAtView();
+      }
+      else if (k === 'l') {
+        if (!app.blockMultiplayerUnsupported('Livelli')) this.layersUI.toggle();
+      }
       else if (k === 'enter') {
         if (app.transform.pending) { e.preventDefault(); app.transform.confirm(); }
       }

@@ -38,6 +38,7 @@ export class TextUI {
   // vede sempre.
   placeAtView() {
     const app = this.app;
+    if (app.blockMultiplayerUnsupported('Testo')) return;
     if (!app.layerMgr.canAdd) { alert('Massimo numero di livelli raggiunto.'); return; }
     const board = app.boards.active;
     const cx = board.x + board.w / 2, cy = board.y + board.h / 2;

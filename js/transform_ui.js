@@ -335,6 +335,7 @@ export class TransformTool {
 
   // ---- conferma / annullo ----
   confirm() {
+    if (this.app.blockMultiplayerUnsupported('Sposta livello')) return;
     const s = this._session;
     if (!s) return;
     this._session = null;

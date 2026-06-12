@@ -18,9 +18,10 @@ let nextBoardId = 1;
  * @typedef {Board} BoardT
  */
 export class Board {
-  /** @param {string} name @param {number} x @param {number} y @param {number} w @param {number} h */
-  constructor(name, x, y, w, h) {
-    this.id = nextBoardId++;
+  /** @param {string} name @param {number} x @param {number} y @param {number} w @param {number} h @param {number} [id] */
+  constructor(name, x, y, w, h, id) {
+    this.id = id || nextBoardId++;
+    if (this.id >= nextBoardId) nextBoardId = this.id + 1;
     this.name = name;
     this.x = x; this.y = y;
     this.w = w; this.h = h;
@@ -52,6 +53,16 @@ export class BoardManager {
     let x = 0;
     for (const b of this.boards) x = Math.max(x, b.x + b.w + GAP);
     const board = new Board(name || `Canvas ${this.boards.length + 1}`, x, 0, w, h);
+    this.boards.push(board);
+    this.activeId = board.id;
+    this.bump();
+    return board;
+  }
+
+  /** @param {{id:number,name:string,x:number,y:number,w:number,h:number}} state */
+  addRestored(state) {
+    const board = new Board(state.name || `Canvas ${this.boards.length + 1}`,
+      state.x || 0, state.y || 0, state.w || BOARD_SIZE, state.h || BOARD_SIZE, state.id);
     this.boards.push(board);
     this.activeId = board.id;
     this.bump();

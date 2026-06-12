@@ -18,7 +18,7 @@ import { InputManager } from './input.js';
 import { UndoManager } from './undo.js';
 import { Hud } from './hud.js';
 import { UI } from './ui.js';
-import { makeRasterLayer, MAX_LAYERS } from './layers.js';
+import { makeRasterLayer, makeTextLayer, MAX_LAYERS } from './layers.js';
 import { BoardManager, MAX_BOARDS } from './boards.js';
 import { drawTextDocument, freeBlockBitmap, setBlockDebug3d, setTextGpu } from './text_layer.js';
 import { Planes } from './planes.js';
@@ -29,6 +29,8 @@ import { strokeProfiler } from './stroke_profiler.js';
 import { initStress } from './stress.js';
 import { blitImageDataToStore, imageDataFromFile, imageLayerName } from './image_import.js';
 import { SelectionManager, SelectionOverlay } from './selection.js';
+import { MultiplayerManager } from './net/multiplayer.js';
+import { base64ToBytes, brushFromWire, bytesToBase64, serializeBrush } from './net/protocol.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./stroke.js').Snap} Snap */
@@ -127,6 +129,10 @@ export class App {
     this.commitJob = null;        // commit incrementale spalmato sui frame
     this.COMMIT_CHUNKS_PER_FRAME = 24;
     this._imageImporting = false;
+    this._applyingRemoteOp = false;
+    /** @type {{type:'stroke', boardId:number, layerId:number, seed:number, speedScale:number, brush:any, points:{x:number,y:number,p:number,dt:number}[], t0:number}|null} */
+    this._netStroke = null;
+    this.multiplayer = new MultiplayerManager(this);
 
     // l'input vive sul CONTAINER dei piani: sopravvive alla sostituzione del
     // canvas (toggle desync) e i piani figli sono pointer-events: none
@@ -135,7 +141,10 @@ export class App {
       onStrokeStart: (x, y, p, t) => this.startStroke(x, y, p, t),
       onStrokePoint: (x, y, p, t) => {
         if (this.transform.dragging) return this.transform.dragMove(x, y);
-        if (this.strokeLive) this.engine.move(x, y, p, t);
+        if (this.strokeLive) {
+          this.engine.move(x, y, p, t);
+          this._recordNetStrokePoint(x, y, p, t);
+        }
       },
       onStrokeEnd: (x, y, p, t) => {
         if (this.transform.dragging) {
@@ -143,6 +152,7 @@ export class App {
           return this.transform.dragEnd();
         }
         if (!this.strokeLive) return;
+        this._recordNetStrokePoint(x, y, p, t);
         this.engine.end(x, y, p, t);
         strokeProfiler.penUp();
         if (this.engine.endPassNeeded) {
@@ -151,6 +161,7 @@ export class App {
           strokeProfiler.event('endPass replay punta', performance.now() - tp);
         }
         this.pendingCommit = true;
+        this._finishNetStroke();
       },
       onStrokeCancel: () => {
         if (this.transform.dragging) return this.transform.dragCancel();
@@ -164,6 +175,7 @@ export class App {
     this.selectionUI = new SelectionOverlay(this.selection);
 
     this.ui = new UI(this);
+    this.multiplayer.attachUi();
     // strumento Sposta/Trasforma: sessione con bbox, ✓/✗, anteprima a quad
     this.transform = new TransformTool(this);
 
@@ -223,6 +235,20 @@ export class App {
   // livelli, testo e azioni operano sempre sul canvas selezionato).
   get layerMgr() { return this.boards.active.mgr; }
 
+  /** @param {string} action */
+  blockMultiplayerUnsupported(action) {
+    if (!this.multiplayer || !this.multiplayer.connected || this._applyingRemoteOp) return false;
+    alert(`${action} non e ancora sincronizzato in multiplayer.`);
+    return true;
+  }
+
+  /** @param {string} action */
+  blockGuestCommand(action) {
+    if (!this.multiplayer || !this.multiplayer.isGuest || this._applyingRemoteOp) return false;
+    alert(`${action}: solo l host puo comandare la stanza.`);
+    return true;
+  }
+
   // ---- canvas (artboard) ----
 
   /** Inquadra un canvas: centrato, zoom per farlo stare nella vista. @param {import('./boards.js').Board} board */
@@ -240,6 +266,7 @@ export class App {
   // attivo e viene inquadrato. (Operazione di struttura non annullabile,
   // come il primo canvas alla partenza.)
   addBoard() {
+    if (this.blockMultiplayerUnsupported('Nuovi canvas')) return null;
     if (!this.boards.canAdd) { alert(`Massimo ${MAX_BOARDS} canvas.`); return null; }
     const board = this.boards.add();
     const first = makeRasterLayer('Livello 1', this.heap);
@@ -267,6 +294,7 @@ export class App {
   // Inserisce sopra il livello attivo del canvas indicato e registra l'undo.
   /** @param {Layer} layer @param {import('./boards.js').Board} [board] */
   addLayer(layer, board = this.boards.active) {
+    if (this.blockMultiplayerUnsupported('Livelli')) return false;
     if (!board || !board.mgr.canAdd) return false;
     const index = board.mgr.insert(layer);
     if (layer.store) this._allStores.add(layer.store);
@@ -293,6 +321,7 @@ export class App {
    */
   async importImageLayer(file) {
     if (!file) return false;
+    if (this.blockMultiplayerUnsupported('Importazione immagini')) return false;
     if (this._imageImporting) { alert('Importazione immagine gia in corso.'); return false; }
     const board = this.boards.active;
     if (!board) return false;
@@ -338,6 +367,7 @@ export class App {
 
   /** @param {number} id */
   deleteLayer(id) {
+    if (this.blockMultiplayerUnsupported('Livelli')) return;
     const d = this.layerMgr.detach(id);
     if (!d) return;
     // i pixel CPU restano (per l'undo); texture e canvas-chunk si liberano
@@ -354,6 +384,7 @@ export class App {
 
   /** @param {number} from @param {number} to */
   moveLayerUndoable(from, to) {
+    if (this.blockMultiplayerUnsupported('Livelli')) return;
     if (from === to) return;
     this.layerMgr.move(from, to);
     this.undoMgr.pushStruct(/** @type {any} */ ({ op: 'move', from, to, boardId: this.boards.activeId }));
@@ -368,6 +399,7 @@ export class App {
   // riscambia (il testo torna editabile).
   /** @param {number} id @returns {boolean} */
   rasterizeTextLayer(id) {
+    if (this.blockMultiplayerUnsupported('Testo')) return false;
     const board = this.boards.boardOfLayer(id);
     const layer = board && board.mgr.byId(id);
     if (!layer || layer.kind !== 'text') return false;
@@ -429,6 +461,7 @@ export class App {
   // della selezione. Annullabile col tile-diff degli stroke (stesso path).
   /** @returns {boolean} true se qualcosa è stato cancellato */
   deleteSelected() {
+    if (this.blockMultiplayerUnsupported('Cancellazione selezione')) return false;
     // stesse guardie di undo(): mai mutare chunk sotto un commit in volo
     if (this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging) return false;
     const sel = this.selection;
@@ -560,6 +593,10 @@ export class App {
     // appena selezionato e ancora in caricamento: il tratto partirebbe
     // alla cieca sotto il quad del proxy
     if (this.renderer instanceof GLRenderer && this.proxy.isLoading(board.id)) return;
+    if (this.multiplayer.connected && (brush.tool === 'select' || brush.tool === 'move')) {
+      this.blockMultiplayerUnsupported(brush.tool === 'select' ? 'Selezione' : 'Sposta livello');
+      return;
+    }
     // strumento Selezione: il click campiona il colore e costruisce la
     // maschera, nessun tratto
     if (brush.tool === 'select') return this.selectAt(board, x, y);
@@ -581,7 +618,53 @@ export class App {
     this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel);
     this.strokeLive = true;
     this.pendingCommit = false;
+    this._beginNetStroke(board.id, target.id, x, y, p, t);
     strokeProfiler.begin(this._strokeProfInfo());
+  }
+
+  /** @param {number} boardId @param {number} layerId @param {number} x @param {number} y @param {number} p @param {number} t */
+  _beginNetStroke(boardId, layerId, x, y, p, t) {
+    if (this._applyingRemoteOp || !this.multiplayer.connected || (brush.tool !== 'brush' && brush.tool !== 'eraser')) {
+      this._netStroke = null;
+      return;
+    }
+    this._netStroke = {
+      type: 'stroke',
+      boardId,
+      layerId,
+      seed: this.engine.snap ? this.engine.snap.seed : 0,
+      speedScale: this.camera.zoom,
+      brush: serializeBrush(brush),
+      points: [],
+      t0: t,
+    };
+    this._recordNetStrokePoint(x, y, p, t);
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _recordNetStrokePoint(x, y, p, t) {
+    const s = this._netStroke;
+    if (!s) return;
+    const pts = s.points;
+    const last = pts[pts.length - 1];
+    const dt = Math.max(0, t - s.t0);
+    if (last && last.x === x && last.y === y && last.p === p && last.dt === dt) return;
+    pts.push({ x, y, p, dt });
+  }
+
+  _finishNetStroke() {
+    const s = this._netStroke;
+    this._netStroke = null;
+    if (!s || s.points.length < 2) return;
+    this.multiplayer.publishLocalOp({
+      type: 'stroke',
+      boardId: s.boardId,
+      layerId: s.layerId,
+      seed: s.seed,
+      speedScale: s.speedScale,
+      brush: s.brush,
+      points: s.points,
+    });
   }
 
   // Riga di contesto per il report del profiler: pennello, texture col
@@ -618,6 +701,7 @@ export class App {
   }
 
   cancelStroke() {
+    this._netStroke = null;
     strokeProfiler.cancel();
     this.engine.cancel();
     this.queue.clear();
@@ -726,6 +810,7 @@ export class App {
   }
 
   async undo() {
+    if (this.blockMultiplayerUnsupported('Undo')) return;
     // trasformazione pendente: prima ✓ o ✗ (i bottoni sono lì apposta)
     if (this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging) return;
     await this.undoMgr.undo(this._undoHost());
@@ -737,6 +822,7 @@ export class App {
   }
 
   async redo() {
+    if (this.blockMultiplayerUnsupported('Redo')) return;
     if (this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging) return;
     await this.undoMgr.redo(this._undoHost());
     this.transform.rebind();
@@ -747,9 +833,25 @@ export class App {
 
   // Azzera il documento: spariscono TUTTI i canvas, si riparte da uno solo.
   clearAll() {
+    if (this.blockGuestCommand('Cancella tutto')) return;
+    const publish = this.multiplayer && this.multiplayer.connected && !this._applyingRemoteOp;
+    this._clearDocument();
+    const board = this.boards.add('Canvas 1');
+    const first = makeRasterLayer('Livello 1', this.heap);
+    board.mgr.insert(first);
+    this._allStores.add(first.store);
+    this.undoMgr.clear();
+    this.planes.invalidate();
+    this.ui.layersUI.sync(true);
+    this.ui.layersUI.scheduleThumbs();
+    if (publish) this.multiplayer.publishLocalOp({ type: 'clear' });
+  }
+
+  _clearDocument() {
     this.commitJob = null;
     this.cancelStroke();
     this.selection.clear(); // il board della selezione sta per morire
+    this.transform.cancel();
     for (const b of this.boards.boards) {
       for (const l of b.mgr.layers) {
         if (l.store) {
@@ -762,14 +864,156 @@ export class App {
       b.mgr.layers.length = 0;
     }
     this.boards.boards.length = 0;
-    const board = this.boards.add('Canvas 1');
-    const first = makeRasterLayer('Livello 1', this.heap);
-    board.mgr.insert(first);
-    this._allStores.add(first.store);
+    this.boards.bump();
+    this.undoMgr.clear();
+  }
+
+  serializeSnapshot() {
+    this._flushPendingStroke();
+    return {
+      version: 1,
+      activeBoardId: this.boards.activeId,
+      boards: this.boards.boards.map((board) => ({
+        id: board.id,
+        name: board.name,
+        x: board.x,
+        y: board.y,
+        w: board.w,
+        h: board.h,
+        activeLayerId: board.mgr.activeId,
+        layers: board.mgr.layers.map((layer) => {
+          const base = {
+            id: layer.id,
+            kind: layer.kind,
+            name: layer.name,
+            visible: layer.visible,
+            opacity: layer.opacity,
+          };
+          if (layer.kind === 'text') {
+            return { ...base, item: structuredClone(layer.item), style: structuredClone(layer.style) };
+          }
+          return {
+            ...base,
+            chunks: [...layer.store.map.values()]
+              .filter((chunk) => chunk.touched)
+              .map((chunk) => ({
+                cx: chunk.cx,
+                cy: chunk.cy,
+                touched: chunk.touched,
+                data: bytesToBase64(chunk.data),
+              })),
+          };
+        }),
+      })),
+    };
+  }
+
+  /** @param {any} snapshot */
+  restoreSnapshot(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.boards)) return false;
+    this._clearDocument();
+    for (const b of snapshot.boards) {
+      const board = this.boards.addRestored(b);
+      if (!Array.isArray(b.layers) || b.layers.length === 0) {
+        const first = makeRasterLayer('Livello 1', this.heap);
+        board.mgr.insert(first);
+        this._allStores.add(first.store);
+        continue;
+      }
+      for (const l of b.layers) {
+        let layer;
+        if (l.kind === 'text') {
+          layer = makeTextLayer(l.name || 'Testo', structuredClone(l.item || {}), structuredClone(l.style || {}), l.id);
+          layer.styleDirty = true;
+        } else {
+          layer = makeRasterLayer(l.name || '', this.heap, l.id);
+          if (Array.isArray(l.chunks)) {
+            for (const c of l.chunks) {
+              if (!Number.isFinite(c.cx) || !Number.isFinite(c.cy) || typeof c.data !== 'string') continue;
+              const bytes = base64ToBytes(c.data);
+              if (bytes.length !== CHUNK * CHUNK * 4) continue;
+              const chunk = layer.store.getOrCreate(c.cx, c.cy);
+              chunk.data.set(bytes);
+              chunk.touched = c.touched !== false;
+              layer.store.markDirty(chunk);
+            }
+          }
+          this._allStores.add(layer.store);
+        }
+        layer.visible = l.visible !== false;
+        layer.opacity = Number.isFinite(l.opacity) ? l.opacity : 1;
+        layer.thumbDirty = true;
+        board.mgr.insert(layer, board.mgr.layers.length);
+      }
+      if (Number.isFinite(b.activeLayerId)) board.mgr.activeId = b.activeLayerId;
+    }
+    if (Number.isFinite(snapshot.activeBoardId) && this.boards.byId(snapshot.activeBoardId)) {
+      this.boards.activeId = snapshot.activeBoardId;
+    }
+    if (this.boards.boards.length === 0) {
+      const board = this.boards.add('Canvas 1');
+      const first = makeRasterLayer('Livello 1', this.heap);
+      board.mgr.insert(first);
+      this._allStores.add(first.store);
+    }
     this.undoMgr.clear();
     this.planes.invalidate();
     this.ui.layersUI.sync(true);
     this.ui.layersUI.scheduleThumbs();
+    return true;
+  }
+
+  canApplyRemoteOps() {
+    return !this.strokeLive && !this.pendingCommit && !this.commitJob &&
+      !this.engine.active && !this.input.isDrawing && !this.transform.pending &&
+      !this.transform.dragging && !this._imageImporting;
+  }
+
+  /** @param {any} op */
+  applyRemoteOp(op) {
+    this._applyingRemoteOp = true;
+    try {
+      if (op.type === 'clear') {
+        this.clearAll();
+        return true;
+      }
+      if (op.type === 'stroke') return this.applyRemoteStroke(op);
+      return false;
+    } finally {
+      this._applyingRemoteOp = false;
+    }
+  }
+
+  /** @param {any} op */
+  applyRemoteStroke(op) {
+    const board = this.boards.byId(op.boardId);
+    const layer = board && board.mgr.byId(op.layerId);
+    const pts = Array.isArray(op.points) ? op.points : [];
+    if (!board || !layer || !layer.store || pts.length < 2) return false;
+
+    this._flushPendingStroke();
+    this._strokeLayerId = layer.id;
+    this._strokeClip = { x0: board.x, y0: board.y, x1: board.x + board.w - 1, y1: board.y + board.h - 1 };
+    this._strokeSel = null;
+    const b = brushFromWire(op.brush);
+    const baseT = performance.now();
+    const first = pts[0];
+    this.engine.begin(first.x, first.y, first.p, baseT, b, op.seed >>> 0, op.speedScale || 1);
+    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel);
+    this.strokeLive = true;
+    this.pendingCommit = false;
+
+    for (let i = 1; i < pts.length - 1; i++) {
+      const pt = pts[i];
+      this.engine.move(pt.x, pt.y, pt.p, baseT + (pt.dt || 0));
+    }
+    const last = pts[pts.length - 1];
+    this.engine.end(last.x, last.y, last.p, baseT + (last.dt || 0));
+    if (this.engine.endPassNeeded) this._endPass();
+    this.pendingCommit = true;
+    this._flushPendingStroke();
+    this.planes.invalidate();
+    return true;
   }
 
   // Cambia la modalità di presentazione. Gli attributi di un contesto WebGL
@@ -840,6 +1084,7 @@ export class App {
       this._beginCommit();
     }
     if (this.commitJob) this._runCommit(this.COMMIT_CHUNKS_PER_FRAME);
+    this.multiplayer.drainRemoteOps();
     const t2b = performance.now();
 
     // 4+5. upload dei tile sporchi e present, piano per piano
@@ -934,6 +1179,7 @@ export class App {
     this.ui.layersUI.sync();
     this.ui.updateCursor(this.input, this.camera);
     this.ui.updateZoomLabel(this.camera.zoom);
+    this.multiplayer.syncCursor(this.camera, this.input);
 
     this._lastFrameWall = performance.now();
     this._scheduleFrame();

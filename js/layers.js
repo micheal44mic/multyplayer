@@ -43,9 +43,10 @@ export const MAX_LAYERS = 16;
 
 let nextLayerId = 1;
 
-/** @param {string} name @param {import('./wasm_core.js').WasmHeap|null} heap @returns {Layer} */
-export function makeRasterLayer(name, heap) {
-  const id = nextLayerId++;
+/** @param {string} name @param {import('./wasm_core.js').WasmHeap|null} heap @param {number} [idOverride] @returns {Layer} */
+export function makeRasterLayer(name, heap, idOverride) {
+  const id = idOverride || nextLayerId++;
+  if (id >= nextLayerId) nextLayerId = id + 1;
   return {
     id, kind: 'raster', name: name || `Livello ${id}`,
     visible: true, opacity: 1,
@@ -54,9 +55,10 @@ export function makeRasterLayer(name, heap) {
   };
 }
 
-/** @param {string} name @param {TextItem} item @param {TextStyle} style @returns {Layer} */
-export function makeTextLayer(name, item, style) {
-  const id = nextLayerId++;
+/** @param {string} name @param {TextItem} item @param {TextStyle} style @param {number} [idOverride] @returns {Layer} */
+export function makeTextLayer(name, item, style, idOverride) {
+  const id = idOverride || nextLayerId++;
+  if (id >= nextLayerId) nextLayerId = id + 1;
   return {
     id, kind: 'text', name,
     visible: true, opacity: 1,
