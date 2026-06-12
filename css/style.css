@@ -439,8 +439,8 @@ body.importing, body.importing #planes { cursor: wait; }
 }
 
 .mp-status {
-  min-width: 72px;
-  max-width: 140px;
+  min-width: 88px;
+  max-width: 168px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

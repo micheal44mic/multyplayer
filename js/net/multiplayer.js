@@ -1,10 +1,19 @@
-import { SignalingClient } from './signaling_client.js';
-import { MP_PROTOCOL, getClientId, makeOpId, validDocOp } from './protocol.js';
-import { SIGNALING_URL } from './multiplayer_config.js';
+import { SignalingClient } from './signaling_client.js?v=mp-20260612-2';
+import { MP_PROTOCOL, getClientId, makeOpId, validDocOp } from './protocol.js?v=mp-20260612-2';
+import { SIGNALING_URL } from './multiplayer_config.js?v=mp-20260612-2';
 
 const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
+  {
+    urls: [
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun2.l.google.com:19302',
+      'stun:stun3.l.google.com:19302',
+      'stun:stun4.l.google.com:19302',
+    ],
+  },
 ];
+const P2P_CONNECT_TIMEOUT_MS = 12000;
 
 export class MultiplayerManager {
   /** @param {import('../main.js').App} app */
@@ -19,7 +28,7 @@ export class MultiplayerManager {
     this.outbox = [];
     this.remoteQueue = [];
     this.remoteCursors = new Map();
-    /** @type {Map<string, {pc: RTCPeerConnection, dc: RTCDataChannel|null}>} */
+    /** @type {Map<string, {pc: RTCPeerConnection, dc: RTCDataChannel|null, pendingCandidates: RTCIceCandidateInit[], connectTimer: number, problem: string}>} */
     this.peers = new Map();
     /** @type {SignalingClient|null} */
     this.signaling = null;
@@ -27,6 +36,7 @@ export class MultiplayerManager {
     this._closing = false;
     this._lastCursorSent = 0;
     this._cursorWorld = { x: 0, y: 0 };
+    this._connectionProblem = '';
     this.ui = {};
   }
 
@@ -146,6 +156,7 @@ export class MultiplayerManager {
     this.outbox.length = 0;
     this.remoteQueue.length = 0;
     this._clearRemoteCursors();
+    this._connectionProblem = '';
     this.mode = 'offline';
     this.roomId = '';
     this.hostId = '';
@@ -201,6 +212,7 @@ export class MultiplayerManager {
       return;
     }
     if (msg.type === 'peer-joined' && this.isHost) {
+      this._connectionProblem = '';
       this._hostCreatePeer(msg.peerId).catch((err) => this._fail(err));
       this._syncUi();
       return;
@@ -247,6 +259,7 @@ export class MultiplayerManager {
     const pc = entry.pc;
     if (data.description) {
       await pc.setRemoteDescription(data.description);
+      await this._flushPendingCandidates(entry);
       if (data.description.type === 'offer') {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
@@ -254,7 +267,11 @@ export class MultiplayerManager {
       }
     }
     if (data.candidate) {
-      try { await pc.addIceCandidate(data.candidate); } catch (err) { console.warn(err); }
+      if (pc.remoteDescription) {
+        try { await pc.addIceCandidate(data.candidate); } catch (err) { console.warn(err); }
+      } else {
+        entry.pendingCandidates.push(data.candidate);
+      }
     }
   }
 
@@ -264,12 +281,21 @@ export class MultiplayerManager {
       throw new Error('WebRTC non disponibile: apri l app da localhost o HTTPS.');
     }
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    const entry = { pc, dc: null };
+    const entry = { pc, dc: null, pendingCandidates: [], connectTimer: 0, problem: '' };
     this.peers.set(peerId, entry);
+    entry.connectTimer = window.setTimeout(() => this._markPeerTrouble(peerId), P2P_CONNECT_TIMEOUT_MS);
     pc.addEventListener('icecandidate', (event) => {
       if (event.candidate) this._relay(peerId, { candidate: event.candidate });
     });
+    pc.addEventListener('iceconnectionstatechange', () => {
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        this._clearPeerTrouble(peerId);
+      }
+      if (pc.iceConnectionState === 'failed') this._markPeerTrouble(peerId);
+      this._syncUi();
+    });
     pc.addEventListener('connectionstatechange', () => {
+      if (pc.connectionState === 'connected') this._clearPeerTrouble(peerId);
       const bad = pc.connectionState === 'failed' || pc.connectionState === 'disconnected' || pc.connectionState === 'closed';
       if (!bad) return;
       if (this.isGuest) {
@@ -288,6 +314,7 @@ export class MultiplayerManager {
     const entry = this.peers.get(peerId);
     if (entry) entry.dc = dc;
     dc.addEventListener('open', () => {
+      this._clearPeerTrouble(peerId);
       if (this.isHost) {
         this._sendToPeer(peerId, {
           type: 'hello',
@@ -316,6 +343,36 @@ export class MultiplayerManager {
       }
       this._syncUi();
     });
+  }
+
+  /** @param {{pc: RTCPeerConnection, pendingCandidates: RTCIceCandidateInit[]}} entry */
+  async _flushPendingCandidates(entry) {
+    if (!entry.pendingCandidates.length || !entry.pc.remoteDescription) return;
+    const pending = entry.pendingCandidates.splice(0);
+    for (const candidate of pending) {
+      try { await entry.pc.addIceCandidate(candidate); } catch (err) { console.warn(err); }
+    }
+  }
+
+  /** @param {string} peerId */
+  _markPeerTrouble(peerId) {
+    const entry = this.peers.get(peerId);
+    if (!entry || (entry.dc && entry.dc.readyState === 'open')) return;
+    entry.problem = 'Canale P2P non aperto. Prova stessa Wi-Fi; su 4G/5G o reti rigide puo servire un server TURN.';
+    this._connectionProblem = entry.problem;
+    this._syncUi();
+  }
+
+  /** @param {string} peerId */
+  _clearPeerTrouble(peerId) {
+    const entry = this.peers.get(peerId);
+    if (!entry) return;
+    if (entry.connectTimer) {
+      window.clearTimeout(entry.connectTimer);
+      entry.connectTimer = 0;
+    }
+    entry.problem = '';
+    this._connectionProblem = '';
   }
 
   /** @param {string} peerId @param {any} msg */
@@ -523,6 +580,7 @@ export class MultiplayerManager {
   _removePeer(peerId) {
     const entry = this.peers.get(peerId);
     if (!entry) return;
+    if (entry.connectTimer) window.clearTimeout(entry.connectTimer);
     try { entry.dc && entry.dc.close(); } catch { /* noop */ }
     try { entry.pc.close(); } catch { /* noop */ }
     this.peers.delete(peerId);
@@ -540,6 +598,7 @@ export class MultiplayerManager {
     const peers = this.peers.size;
     const open = this.openPeerCount;
     if (fallback) status.textContent = fallback;
+    else if (this._connectionProblem) status.textContent = 'P2P bloccato';
     else if (this.mode === 'host') status.textContent = `Host ${this.roomId}${peers ? ` · ${open}/${peers}` : ''}`;
     else if (this.mode === 'guest') status.textContent = open ? `Connesso ${this.roomId}` : `Collego ${this.roomId}`;
     else status.textContent = 'Offline';
@@ -551,10 +610,16 @@ export class MultiplayerManager {
   }
 
   _statusTitle() {
-    if (this.mode === 'host') return `Host ${this.roomId}. Canali aperti: ${this.openPeerCount}/${this.peers.size}.`;
+    if (this._connectionProblem) return this._connectionProblem;
+    const peerStates = [];
+    for (const [peerId, entry] of this.peers) {
+      peerStates.push(`${peerId}: pc=${entry.pc.connectionState}, ice=${entry.pc.iceConnectionState}, dc=${entry.dc ? entry.dc.readyState : 'none'}`);
+    }
+    const details = peerStates.length ? ` Dettagli: ${peerStates.join('; ')}.` : '';
+    if (this.mode === 'host') return `Host ${this.roomId}. Canali aperti: ${this.openPeerCount}/${this.peers.size}.${details}`;
     if (this.mode === 'guest') return this.openPeerCount > 0
       ? `Connesso all host della stanza ${this.roomId}.`
-      : `Entrato nel signaling della stanza ${this.roomId}, in attesa del canale WebRTC.`;
+      : `Entrato nel signaling della stanza ${this.roomId}, in attesa del canale WebRTC.${details}`;
     return 'Multiplayer offline.';
   }
 }

@@ -29,8 +29,8 @@ import { strokeProfiler } from './stroke_profiler.js';
 import { initStress } from './stress.js';
 import { blitImageDataToStore, imageDataFromFile, imageLayerName } from './image_import.js';
 import { SelectionManager, SelectionOverlay } from './selection.js';
-import { MultiplayerManager } from './net/multiplayer.js';
-import { base64ToBytes, brushFromWire, bytesToBase64, serializeBrush } from './net/protocol.js';
+import { MultiplayerManager } from './net/multiplayer.js?v=mp-20260612-2';
+import { base64ToBytes, brushFromWire, bytesToBase64, serializeBrush } from './net/protocol.js?v=mp-20260612-2';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./stroke.js').Snap} Snap */
