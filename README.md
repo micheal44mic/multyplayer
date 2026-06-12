@@ -44,6 +44,19 @@ suo URL in `js/net/multiplayer_config.js` oppure apri la pagina con:
 https://micheal44mic.github.io/multyplayer/?signal=wss://tuo-server/signaling
 ```
 
+## Signaling online
+
+Il server signaling e in `server/signaling.js`. Per pubblicarlo su un servizio
+Node come Render, usa questo repository e il file `render.yaml`. Quando il
+servizio e online, copia l'URL pubblico e configurane la versione WebSocket:
+
+```
+export const SIGNALING_URL = 'wss://multyplayer-signaling.onrender.com/signaling';
+```
+
+Senza questo URL, GitHub Pages puo aprire l'app ma non puo creare stanze
+multiplayer.
+
 ## Comandi
 
 | Azione | Desktop | Mobile |

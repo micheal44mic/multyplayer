@@ -1,4 +1,5 @@
 // GitHub Pages puo servire l'app statica in HTTPS, ma non puo eseguire il
-// server WebSocket di signaling. Quando il signaling sara online, metti qui:
-// export const SIGNALING_URL = 'wss://tuo-server.example.com/signaling';
+// server WebSocket di signaling. Dopo aver pubblicato server/signaling.js,
+// metti qui l'URL WebSocket pubblico, per esempio:
+// export const SIGNALING_URL = 'wss://multyplayer-signaling.onrender.com/signaling';
 export const SIGNALING_URL = '';

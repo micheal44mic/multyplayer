@@ -564,7 +564,14 @@ function defaultSignalingUrl() {
   const explicit = params.get('signal');
   if (explicit) return explicit;
   if (SIGNALING_URL) return SIGNALING_URL;
-  if (location.protocol === 'file:') return 'ws://localhost:8787/signaling';
+  const local = location.protocol === 'file:' ||
+    location.hostname === 'localhost' ||
+    location.hostname === '127.0.0.1' ||
+    location.hostname === '::1';
+  if (local) return 'ws://localhost:8787/signaling';
+  if (location.hostname.endsWith('github.io')) {
+    throw new Error('Signaling non configurato: GitHub Pages ospita solo l app. Pubblica server/signaling.js e imposta SIGNALING_URL.');
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${location.host}/signaling`;
 }
