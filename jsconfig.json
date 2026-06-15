@@ -1,0 +1,19 @@
+{
+  // Zero-build type checking: VS Code reads this file and checks .js files
+  // as they are (JSDoc = annotations). Verify from the terminal with:
+  //   npx tsc -p jsconfig.json
+  // No strictNullChecks: the code's pool/null patterns would require casts
+  // everywhere. noImplicitAny is the safety net for parameters.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "checkJs": true,
+    "strict": false,
+    "strictNullChecks": false,
+    "noImplicitAny": true,
+    "noEmit": true
+  },
+  "include": ["js"]
+}

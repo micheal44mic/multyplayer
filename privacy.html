@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1c1c1e">
+<title>Privacy - Fable Paint</title>
+<link rel="stylesheet" href="css/legal.css">
+</head>
+<body>
+<main>
+  <nav aria-label="Navigazione">
+    <a href="index.html">App</a>
+    <a href="terms.html">Termini</a>
+    <a href="support.html">Supporto</a>
+  </nav>
+
+  <h1>Privacy</h1>
+  <p class="meta">Ultimo aggiornamento: 15 giugno 2026.</p>
+
+  <section class="panel">
+    <p>Fable Paint e una web app di disegno. I progetti vengono salvati nel browser dell'utente tramite IndexedDB solo quando l'utente sceglie di salvarli. Non e previsto autosalvataggio.</p>
+  </section>
+
+  <h2>Dati salvati sul dispositivo</h2>
+  <p>L'app usa IndexedDB per i progetti e localStorage per preferenze come nome collaborazione, TURN opzionale, preferenze renderer e sblocchi locali. Questi dati restano nel browser finche l'utente non li cancella o non elimina i dati del sito.</p>
+
+  <h2>Servizi di terze parti</h2>
+  <ul>
+    <li>Google Fonts puo essere usato quando l'utente lavora con il testo.</li>
+    <li>PeerJS da unpkg e server STUN/TURN possono essere usati per la collaborazione WebRTC.</li>
+    <li>Gli annunci e gli annunci premiati possono essere mostrati o simulati quando configurati nell'app.</li>
+  </ul>
+
+  <h2>Telemetria</h2>
+  <p>La telemetria e disattivata finche non viene configurato un endpoint in <code>config.js</code>. Quando e attiva, invia eventi tecnici e di prodotto essenziali, come apertura app, primo tratto, salvataggi, esportazioni, errori runtime e apertura feedback. Non invia il contenuto dei disegni.</p>
+
+  <h2>Contatto</h2>
+  <p>Per richieste privacy o supporto, usa il canale feedback indicato nella pagina <a href="support.html">Supporto</a>.</p>
+</main>
+</body>
+</html>

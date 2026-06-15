@@ -1,0 +1,84 @@
+:root {
+  color-scheme: dark;
+  --bg: #131418;
+  --panel: rgba(255, 255, 255, 0.055);
+  --line: rgba(255, 255, 255, 0.1);
+  --fg: #f2f3f6;
+  --dim: #aeb1bd;
+  --accent: #4d7cfe;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  min-height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body {
+  padding: 28px;
+}
+
+main {
+  width: min(820px, 100%);
+  margin: 0 auto;
+}
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+a {
+  color: var(--fg);
+  text-decoration-color: rgba(77, 124, 254, 0.8);
+  text-underline-offset: 3px;
+}
+
+nav a {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  text-decoration: none;
+}
+
+h1 {
+  margin: 0 0 8px;
+  font-size: 34px;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+h2 {
+  margin: 28px 0 8px;
+  font-size: 18px;
+}
+
+p, li {
+  color: var(--dim);
+}
+
+ul {
+  padding-left: 22px;
+}
+
+.meta {
+  margin: 0 0 28px;
+  color: var(--dim);
+}
+
+.panel {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
