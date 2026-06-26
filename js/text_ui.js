@@ -1,0 +1,377 @@
+// Pannello Testo — laterale destro, non modale: edita lo stile del livello
+// testo SELEZIONATO vedendo il risultato live. Il bottone Testo in toolbar
+// crea ogni volta un NUOVO livello testo sopra quello attivo.
+
+import {
+  TEXT_FONTS, ensureFont, ensureTextOutlineFont, defaultTextStyle,
+  makeTextItem, textWidth, defaultDistort, distortBox, bumpDistort, touchText,
+} from './text_layer.js';
+import { makeTextLayer } from './layers.js';
+import { DistortGizmo } from './distort_ui.js';
+import { createRangeRow } from './panel_controls.js';
+
+/** @typedef {import('./main.js').App} App */
+/** @typedef {import('./layers.js').Layer} Layer */
+
+export class TextUI {
+  /** @param {App} app */
+  constructor(app) {
+    this.app = app;
+    this.panel = document.getElementById('textpanel');
+    this.gizmo = new DistortGizmo(app);
+    this._fontsKicked = false;
+    this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 }; // visibleRect riusato
+    /** @type {(() => void)[]} */
+    this._sync = [];
+    this._build();
+    document.getElementById('tp-close').addEventListener('click', () => this.open(false));
+  }
+
+  // Livello testo in editing: quello attivo, se è un testo.
+  /** @returns {Layer|null} */
+  get layer() {
+    const l = this.app.layerMgr.active;
+    return l && l.kind === 'text' ? l : null;
+  }
+
+  // Bottone Testo: nuovo livello testo centrato nel CANVAS attivo (quello
+  // dove si è disegnato/toccato l'ultima volta), con corpo proporzionale al
+  // canvas (M1M4.COM ≈ 5.7 em sull'80% della larghezza): a qualunque zoom il
+  // testo nasce della stessa taglia relativa al suo canvas. Se il centro del
+  // canvas è fuori vista, la camera lo inquadra: il testo appena creato si
+  // vede sempre.
+  placeAtView() {
+    const app = this.app;
+    if (!app.layerMgr.canAdd) { alert('Maximum number of layers reached.'); return; }
+    const board = app.boards.active;
+    const cx = board.x + board.w / 2, cy = board.y + board.h / 2;
+    const fill = /** @type {HTMLInputElement} */ (document.getElementById('color')).value;
+    const size = Math.max(8, board.w * 0.8 / 5.7);
+    const item = makeTextItem(cx, cy, fill, size);
+    const layer = makeTextLayer('Text', item, defaultTextStyle());
+    app.addLayer(layer);
+    const r = app.camera.visibleRect(this._rect);
+    if (cx < r.x0 || cx > r.x1 || cy < r.y0 || cy > r.y1) app.fitBoard(board);
+    ensureFont(layer.style.font, layer.style.weight);
+    this.open(true);
+    // si può riscrivere subito: focus dopo il sync di open (che rimette
+    // il testo del livello nel campo) e fuori dall'evento che ci ha chiamato
+    requestAnimationFrame(() => {
+      this._textInput.focus();
+      this._textInput.select();
+    });
+  }
+
+  /** @param {boolean} v */
+  open(v) {
+    if (v && !this.layer) return; // niente livello testo selezionato
+    this.panel.classList.toggle('open', v);
+    if (!v) return;
+    this.app.ui.layersUI.open(false); // un pannello alla volta sul lato destro
+    if (this.app.fxTools) for (const t of this.app.fxTools) t.openPanel(false);
+    for (const f of this._sync) f();
+    if (!this._fontsKicked) {
+      // pre-carica tutta la lista in background: il cambio font è istantaneo
+      this._fontsKicked = true;
+      for (const f of TEXT_FONTS) ensureFont(f.family, f.weight);
+    }
+    this._warmOutline();
+  }
+
+  // Lo stile è cambiato: SVG da risincronizzare + miniatura del pannello.
+  _dirty() {
+    const l = this.layer;
+    if (!l) return;
+    touchText(l);
+    l.thumbDirty = true;
+    this.app.ui.layersUI.scheduleThumbs();
+  }
+
+  _build() {
+    const body = document.getElementById('tp-body');
+    /** @type {(fn: (st: import('./text_layer.js').TextStyle) => void) => void} */
+    const withStyle = (fn) => {
+      const l = this.layer;
+      if (!l) return;
+      fn(l.style);
+      this._dirty();
+    };
+    /** @type {<T>(fn: (st: import('./text_layer.js').TextStyle) => T, fallback: T) => T} */
+    const readStyle = (fn, fallback) => {
+      const l = this.layer;
+      return l ? fn(l.style) : fallback;
+    };
+    /** @type {(fn: (it: import('./text_layer.js').TextItem) => void) => void} */
+    const withItem = (fn) => {
+      const l = this.layer;
+      if (!l) return;
+      fn(l.item);
+      this._dirty();
+    };
+    /** @type {<T>(fn: (it: import('./text_layer.js').TextItem) => T, fallback: T) => T} */
+    const readItem = (fn, fallback) => {
+      const l = this.layer;
+      return l ? fn(l.item) : fallback;
+    };
+
+    body.appendChild(this._section('Text'));
+    const txt = document.createElement('input');
+    txt.type = 'text';
+    txt.className = 'tp-text';
+    txt.placeholder = 'Type something...';
+    txt.autocomplete = 'off';
+    txt.spellcheck = false;
+    // ogni tasto = un setAttribute al frame dopo (via styleDirty): l'SVG è
+    // vettoriale, il browser ridipinge solo quel piano — nessun raster
+    txt.addEventListener('input', () => withItem((it) => { it.text = txt.value; }));
+    txt.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === 'Escape') txt.blur();
+    });
+    this._sync.push(() => { txt.value = readItem((it) => it.text, ''); });
+    body.appendChild(txt);
+    this._textInput = txt;
+
+    body.appendChild(this._slider('Size', 4, 2000, 1,
+      () => readItem((it) => it.size, 70),
+      (v) => withItem((it) => { it.size = v; }),
+      (v) => Math.round(v) + ' px', true));
+    body.appendChild(this._color('Text color',
+      () => readItem((it) => it.fill, '#1a1a1f'),
+      (v) => withItem((it) => { it.fill = v; })));
+
+    body.appendChild(this._section('Font'));
+    const sel = document.createElement('select');
+    sel.className = 'tp-select';
+    for (const f of TEXT_FONTS) {
+      const o = document.createElement('option');
+      o.value = f.family;
+      o.textContent = f.family;
+      o.style.fontFamily = `"${f.family}", sans-serif`;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', () => {
+      const def = TEXT_FONTS.find((f) => f.family === sel.value);
+      if (!def) return;
+      withStyle((st) => { st.font = def.family; st.weight = def.weight; });
+      ensureFont(def.family, def.weight);
+      this._warmOutline();
+    });
+    this._sync.push(() => { sel.value = readStyle((st) => st.font, 'Orbitron'); });
+    body.appendChild(sel);
+
+    body.appendChild(this._section('Transform'));
+    const wsel = document.createElement('select');
+    wsel.className = 'tp-select';
+    for (const [v, name] of [['none', 'None'], ['arc', 'Arc'],
+      ['circle', 'Circle'], ['wave', 'Wave'], ['distort', 'Distort']]) {
+      const o = document.createElement('option');
+      o.value = v;
+      o.textContent = name;
+      wsel.appendChild(o);
+    }
+    wsel.addEventListener('change', () => {
+      const l = this.layer;
+      if (!l) return;
+      withStyle((st) => {
+        st.warp = /** @type {import('./text_layer.js').TextStyle['warp']} */ (wsel.value);
+        // primo uso della forma: parametri proporzionati al testo corrente
+        // (0 = mai toccati), da lì in poi comanda lo slider
+        if (st.warp === 'circle' && !st.warpRadius) {
+          st.warpRadius = Math.max(20, Math.round(textWidth(l.item, st) / (2 * Math.PI)));
+        }
+        if (st.warp === 'wave' && !st.warpAmp) {
+          st.warpAmp = Math.max(1, Math.round(l.item.size * 0.25));
+        }
+        if (st.warp === 'distort' && !st.distort) {
+          st.distort = defaultDistort();
+          st.distortFrame = undefined;
+          distortBox(l.item, st);
+          bumpDistort(st);
+        }
+        if (st.warp === 'distort') this._warmOutline(l);
+      });
+      for (const f of this._sync) f(); // nuovi default + visibilità delle righe
+    });
+    this._sync.push(() => {
+      const w = readStyle((st) => st.warp ?? 'none', 'none');
+      wsel.value = ['arc', 'circle', 'wave', 'distort'].includes(w) ? w : 'none';
+    });
+    body.appendChild(wsel);
+    const rowBend = this._slider('Bend', -360, 360, 1,
+      () => readStyle((st) => st.warpBend ?? 90, 90),
+      (v) => withStyle((st) => { st.warpBend = v; }),
+      (v) => Math.round(v) + '°');
+    const rowRadius = this._slider('Radius', 20, 8000, 1,
+      () => readStyle((st) => st.warpRadius || 200, 200),
+      (v) => withStyle((st) => { st.warpRadius = v; }),
+      (v) => Math.round(v) + ' px', true);
+    const rowAmp = this._slider('Amplitude', 1, 1000, 1,
+      () => readStyle((st) => st.warpAmp || 20, 20),
+      (v) => withStyle((st) => { st.warpAmp = v; }),
+      (v) => Math.round(v) + ' px', true);
+    const rowFreq = this._slider('Waves', 0.5, 6, 0.25,
+      () => readStyle((st) => st.warpFreq ?? 2, 2),
+      (v) => withStyle((st) => { st.warpFreq = v; }),
+      (v) => String(Math.round(v * 4) / 4));
+    const rowDistort = document.createElement('div');
+    rowDistort.className = 'p-row';
+    const dHint = document.createElement('div');
+    dHint.className = 'p-hint';
+    dHint.textContent = 'Drag on the canvas: corners, center points, and curve handles.';
+    const dReset = document.createElement('button');
+    dReset.className = 'tp-reset';
+    dReset.type = 'button';
+    dReset.textContent = 'Reset Cage';
+    dReset.addEventListener('click', () => {
+      const l = this.layer;
+      if (!l) return;
+      withStyle((st) => {
+        st.distort = defaultDistort();
+        st.distortFrame = undefined;
+        distortBox(l.item, st);
+        bumpDistort(st);
+        this._warmOutline(l);
+      });
+    });
+    rowDistort.append(dHint, dReset);
+    body.append(rowBend, rowRadius, rowAmp, rowFreq, rowDistort);
+    this._sync.push(() => {
+      const w = readStyle((st) => st.warp ?? 'none', 'none');
+      rowBend.style.display = w === 'arc' ? '' : 'none';
+      rowRadius.style.display = w === 'circle' ? '' : 'none';
+      rowAmp.style.display = w === 'wave' ? '' : 'none';
+      rowFreq.style.display = w === 'wave' ? '' : 'none';
+      rowDistort.style.display = w === 'distort' ? '' : 'none';
+    });
+
+    body.appendChild(this._section('Stroke'));
+    body.appendChild(this._slider('Width', 0, 24, 0.5,
+      () => readStyle((st) => st.stroke, 0),
+      (v) => withStyle((st) => { st.stroke = v; }),
+      (v) => v.toFixed(1) + ' px'));
+    body.appendChild(this._color('Stroke color',
+      () => readStyle((st) => st.strokeColor, '#ffffff'),
+      (v) => withStyle((st) => { st.strokeColor = v; })));
+
+    body.appendChild(this._section('Shadow'));
+    body.appendChild(this._toggle('3D Block',
+      'solid extrusion instead of a soft shadow',
+      () => readStyle((st) => st.block, false),
+      (v) => withStyle((st) => {
+        st.block = v;
+        // acceso con distanza 0 non si vedrebbe: parte da un blocco visibile
+        if (v && st.shadowDist === 0) st.shadowDist = 12;
+      })));
+    body.appendChild(this._slider('Blur', 0, 80, 1,
+      () => readStyle((st) => st.shadowBlur, 0),
+      (v) => withStyle((st) => { st.shadowBlur = v; }),
+      (v) => v + ' px'));
+    body.appendChild(this._slider('Distance', 0, 80, 1,
+      () => readStyle((st) => st.shadowDist, 0),
+      (v) => withStyle((st) => { st.shadowDist = v; }),
+      (v) => v + ' px'));
+    body.appendChild(this._slider('Angle', 0, 360, 1,
+      () => readStyle((st) => st.shadowAngle ?? 45, 45),
+      (v) => withStyle((st) => { st.shadowAngle = v; }),
+      (v) => Math.round(v) + '°'));
+    body.appendChild(this._color('Shadow color',
+      () => readStyle((st) => st.shadowColor, '#000000'),
+      (v) => withStyle((st) => { st.shadowColor = v; })));
+
+    body.appendChild(this._section('Rasterize'));
+    const rRow = document.createElement('div');
+    rRow.className = 'p-row';
+    const rHint = document.createElement('div');
+    rHint.className = 'p-hint';
+    rHint.textContent = 'Converts text to pixels at canvas resolution ' +
+      '(export quality): it becomes paintable, but no longer editable as text. ' +
+      'Undo can revert it.';
+    const rBtn = document.createElement('button');
+    rBtn.className = 'tp-reset';
+    rBtn.type = 'button';
+    rBtn.textContent = 'Rasterize Text';
+    rBtn.addEventListener('click', () => {
+      const l = this.layer;
+      if (!l) return;
+      if (this.app.rasterizeTextLayer(l.id)) this.open(false);
+    });
+    rRow.append(rHint, rBtn);
+    body.appendChild(rRow);
+  }
+
+  /** @param {Layer|null} [layer] */
+  _warmOutline(layer = this.layer) {
+    if (!layer || layer.style.warp !== 'distort') return;
+    ensureTextOutlineFont(layer.style.font, layer.style.weight)
+      .then((font) => { if (font) touchText(layer); });
+  }
+
+  /** @param {string} title */
+  _section(title) {
+    const h = document.createElement('div');
+    h.className = 'p-section';
+    h.textContent = title;
+    return h;
+  }
+
+  /**
+   * log: lo slider lavora in scala logaritmica (range enormi tipo il corpo
+   * del font), il valore del modello resta in unità vere.
+   * @param {string} label @param {number} min @param {number} max @param {number} step
+   * @param {() => number} get @param {(v: number) => void} set @param {(v: number) => string} fmt
+   * @param {boolean} [log]
+   */
+  _slider(label, min, max, step, get, set, fmt, log) {
+    const control = createRangeRow({
+      label, min, max, step, get, set, fmt, log,
+      syncLogClamp: true,
+    });
+    this._sync.push(control.sync);
+    return control.row;
+  }
+
+  /**
+   * @param {string} label @param {string} hint
+   * @param {() => boolean} get @param {(v: boolean) => void} set
+   */
+  _toggle(label, hint, get, set) {
+    const lab = document.createElement('label');
+    lab.className = 'p-toggle';
+    const span = document.createElement('span');
+    span.textContent = label;
+    const h = document.createElement('span');
+    h.className = 'p-hint';
+    h.textContent = hint;
+    span.appendChild(h);
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = get();
+    input.addEventListener('change', () => {
+      set(input.checked);
+      // il set può toccare altri valori (es. la distanza): riallinea il pannello
+      for (const f of this._sync) f();
+    });
+    this._sync.push(() => { input.checked = get(); });
+    const knob = document.createElement('span');
+    knob.className = 'knob';
+    lab.append(span, input, knob);
+    return lab;
+  }
+
+  /**
+   * @param {string} label @param {() => string} get @param {(v: string) => void} set
+   */
+  _color(label, get, set) {
+    const row = document.createElement('label');
+    row.className = 'tp-colorrow';
+    const span = document.createElement('span');
+    span.textContent = label;
+    const input = document.createElement('input');
+    input.type = 'color';
+    input.value = get();
+    input.addEventListener('input', () => set(input.value));
+    this._sync.push(() => { input.value = get(); });
+    row.append(span, input);
+    return row;
+  }
+}

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#16171c">
+<title>Fable Paint — stress test</title>
+<style>
+  body { margin: 0; min-height: 100vh; background: #16171c; color: #e8e9ee;
+         font: 15px/1.5 system-ui, sans-serif; display: grid; place-items: center; }
+  main { max-width: 660px; padding: 40px 20px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  h1 span { color: #7aa2f7; }
+  p.sub { margin: 0 0 26px; opacity: .7; }
+  a.card { display: flex; align-items: baseline; gap: 14px; text-decoration: none;
+           color: inherit; background: #1d1f27; border: 1px solid #3a3d4a;
+           border-radius: 12px; padding: 14px 18px; margin-bottom: 10px;
+           transition: border-color .15s, transform .15s; }
+  a.card:hover { border-color: #7aa2f7; transform: translateX(3px); }
+  a.card b { font-size: 17px; white-space: nowrap; }
+  a.card .mem { color: #7aa2f7; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  a.card .desc { opacity: .75; font-size: 13px; }
+  a.card.warn { border-color: #6b4a3a; }
+  a.card.warn:hover { border-color: #e0af68; }
+  a.card.warn .mem { color: #e0af68; }
+  footer { margin-top: 26px; font-size: 13px; opacity: .6; }
+  footer code { background: #1d1f27; border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>⚡ Stress test <span>boards × layers × text</span></h1>
+  <p class="sub">Each preset opens the app and fills the document immediately: 2048×2048 boards in a grid,
+     each layer painted with colored diagonal stripes (all layers remain visible).
+     One full layer = 64 chunks = 16&nbsp;MB of pixels. Text items are real layers,
+     interleaved into each board stack.</p>
+
+  <a class="card" href="./?stress=4x4">
+    <b>4 × 4 full</b><span class="mem">256 MB</span>
+    <span class="desc">Warm-up: smooth everywhere, including zoom-out.</span>
+  </a>
+  <a class="card" href="./?stress=8x8">
+    <b>8 × 8 full</b><span class="mem">1 GB</span>
+    <span class="desc">Comfort zone: smooth drawing, zoom-out still manageable.</span>
+  </a>
+  <a class="card" href="./?stress=16x8">
+    <b>16 × 8 full</b><span class="mem">2 GB</span>
+    <span class="desc">Recommended limit: at zoom-out, draw calls and uploads become noticeable.</span>
+  </a>
+  <a class="card" href="./?stress=16x16x40">
+    <b>16 × 16 at 40%</b><span class="mem">~1.6 GB</span>
+    <span class="desc">Realistic: partial chunk-level coverage, like a real document.</span>
+  </a>
+  <a class="card" href="./?stress=16x14t2">
+    <b>16 × 14 full + 2 text layers</b><span class="mem">~3.5 GB</span>
+    <span class="desc">Two vector text layers interleaved into EVERY board stack: sandwich stacks,
+      the worst case for planes and zoom-out proxies — text is baked into quads.</span>
+  </a>
+  <a class="card warn" href="./?stress=16x16">
+    <b>16 × 16 full</b><span class="mem">4 GB ⚠</span>
+    <span class="desc">The wall: the wasm32 heap ceiling — filling stops by itself
+      and the panel reports where. “Fit All” may lose the WebGL context.</span>
+  </a>
+
+  <footer>
+    In the app: use the ⚡ toolbar button for presets, custom values (boards, layers, coverage,
+    text layers per board), and live stats (fps, peak frame, chunks, CPU/heap/GPU).
+    After filling: zoom out, pan between boards, draw on a layer, and watch
+    fps and peak frame time. URL: <code>?stress=BxL[xCOV%][tN]</code> — e.g. <code>?stress=8x8x50t3</code>
+    = 8 boards × 8 layers at 50% with 3 text layers per board (<code>t</code> alone = 1).
+    Pure JS engine: add <code>&amp;engine=js</code>.
+  </footer>
+</main>
+</body>
+</html>

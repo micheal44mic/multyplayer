@@ -1,0 +1,8 @@
+{
+  "name": "Fable Paint",
+  "short_name": "Fable Paint",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#131418",
+  "theme_color": "#1c1c1e"
+}
