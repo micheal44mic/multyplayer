@@ -10,9 +10,9 @@ import { CHUNK, CHUNK_SHIFT } from './store.js';
  * @returns {Promise<ImageBitmap|HTMLImageElement>}
  */
 async function decodeImageFile(file) {
-  if (!file) throw new Error('File immagine mancante.');
+  if (!file) throw new Error('Missing image file.');
   if (file.type && !file.type.startsWith('image/')) {
-    throw new Error('Il file selezionato non e un\'immagine.');
+    throw new Error('The selected file is not an image.');
   }
 
   if (typeof createImageBitmap === 'function') {
@@ -27,7 +27,7 @@ async function decodeImageFile(file) {
     const url = URL.createObjectURL(file);
     const im = new Image();
     im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
-    im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Decodifica immagine fallita.')); };
+    im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Image decoding failed.')); };
     im.src = url;
   });
 }
@@ -40,7 +40,7 @@ async function decodeImageFile(file) {
  * @returns {Promise<{imageData: ImageData, srcW: number, srcH: number, drawW: number, drawH: number, scale: number}>}
  */
 export async function imageDataFromFile(file, maxW, maxH) {
-  if (maxW <= 0 || maxH <= 0) throw new Error('Canvas non valido.');
+  if (maxW <= 0 || maxH <= 0) throw new Error('Invalid canvas.');
 
   /** @type {ImageBitmap|HTMLImageElement|null} */
   let src = null;
@@ -48,7 +48,7 @@ export async function imageDataFromFile(file, maxW, maxH) {
     src = await decodeImageFile(file);
     const srcW = /** @type {any} */ (src).width || /** @type {HTMLImageElement} */ (src).naturalWidth;
     const srcH = /** @type {any} */ (src).height || /** @type {HTMLImageElement} */ (src).naturalHeight;
-    if (!srcW || !srcH) throw new Error('Immagine vuota.');
+    if (!srcW || !srcH) throw new Error('Empty image.');
 
     const scale = Math.min(1, maxW / srcW, maxH / srcH);
     const drawW = Math.max(1, Math.round(srcW * scale));
@@ -133,6 +133,6 @@ export function blitImageDataToStore(store, img, worldX, worldY) {
 
 /** @param {string} name */
 export function imageLayerName(name) {
-  const base = (name || 'Immagine').replace(/\.[^.]+$/, '').trim();
-  return base || 'Immagine';
+  const base = (name || 'Image').replace(/\.[^.]+$/, '').trim();
+  return base || 'Image';
 }

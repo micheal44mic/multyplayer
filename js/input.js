@@ -13,10 +13,12 @@ const CAP = 8192;
  * dinamica velocità/taper dello stroke engine.
  * @typedef {Object} InputHooks
  * @property {() => boolean} isPanTool
- * @property {(x: number, y: number, p: number, t: number) => void} onStrokeStart
+ * @property {(x: number, y: number, p: number, t: number, direct?: boolean) => void} onStrokeStart
  * @property {(x: number, y: number, p: number, t: number) => void} onStrokePoint
  * @property {(x: number, y: number, p: number, t: number) => void} onStrokeEnd
  * @property {() => void} onStrokeCancel
+ * @property {() => void} [onHover]
+ * @property {() => void} [onActivity]
  */
 
 export class InputManager {
@@ -35,10 +37,6 @@ export class InputManager {
     this.ring = new Float64Array(CAP * FIELDS);
     this.head = 0;
     this.tail = 0;
-
-    this.eventsPerSec = 0;
-    this._evCount = 0;
-    this._evWindowStart = performance.now();
 
     // stato della macchina (solo nel drain, mai negli handler)
     this.drawingId = -1;
@@ -78,13 +76,20 @@ export class InputManager {
    * @param {number} p @param {number} pt @param {number} buttons @param {number} t
    */
   _push(type, id, x, y, p, pt, buttons, t) {
+    this.hooks.onActivity?.();
     const next = (this.tail + 1) % CAP;
     if (next === this.head) return; // pieno: scarta il più vecchio implicito
     const o = this.tail * FIELDS, r = this.ring;
     r[o] = type; r[o + 1] = id; r[o + 2] = x; r[o + 3] = y;
     r[o + 4] = p; r[o + 5] = pt; r[o + 6] = buttons; r[o + 7] = t;
     this.tail = next;
-    this._evCount++;
+  }
+
+  _setHover(x, y, visible, touch) {
+    this.hover.x = x; this.hover.y = y;
+    this.hover.visible = visible;
+    this.hover.touch = touch;
+    this.hooks.onHover?.();
   }
 
   // Il bersaglio viene sostituito: si riallacciano i listener e si chiude
@@ -135,6 +140,7 @@ export class InputManager {
     c.addEventListener('pointerdown', (e) => {
       try { c.setPointerCapture(e.pointerId); } catch { /* eventi sintetici o pointer già rilasciato */ }
       const pt = ptType(e);
+      this._setHover(e.clientX, e.clientY, pt !== PT_TOUCH, pt === PT_TOUCH);
       this._contact.add(e.pointerId);
       this._push(EV_DOWN, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, e.buttons, time(e, performance.now()));
       e.preventDefault();
@@ -144,11 +150,10 @@ export class InputManager {
       const pt = ptType(e);
       if (!this._contact.has(e.pointerId)) {
         // solo hover: aggiorna il cursore, niente ring
-        this.hover.x = e.clientX; this.hover.y = e.clientY;
-        this.hover.visible = pt !== PT_TOUCH;
+        this._setHover(e.clientX, e.clientY, pt !== PT_TOUCH, pt === PT_TOUCH);
         return;
       }
-      this.hover.x = e.clientX; this.hover.y = e.clientY;
+      this._setHover(e.clientX, e.clientY, pt !== PT_TOUCH, pt === PT_TOUCH);
       // coalesced: nessun campione perso da una penna a 240 Hz
       const co = e.getCoalescedEvents ? e.getCoalescedEvents() : null;
       if (co && co.length > 0) {
@@ -167,22 +172,28 @@ export class InputManager {
     const up = (e) => {
       const pt = ptType(e);
       this._contact.delete(e.pointerId);
+      this._setHover(e.clientX, e.clientY, pt !== PT_TOUCH, pt === PT_TOUCH);
       this._push(EV_UP, e.pointerId, e.clientX, e.clientY, press(e, pt), pt, 0, time(e, performance.now()));
       e.preventDefault();
     };
     c.addEventListener('pointerup', up);
     c.addEventListener('pointercancel', (e) => {
       this._contact.delete(e.pointerId);
+      this._setHover(e.clientX, e.clientY, false, ptType(e) === PT_TOUCH);
       this._push(EV_CANCEL, e.pointerId, e.clientX, e.clientY, 0, ptType(e), 0, time(e, performance.now()));
     });
     // capture persa senza up (rarissimo, browser mobile): tratta come cancel
     c.addEventListener('lostpointercapture', (e) => {
       if (this._contact.has(e.pointerId)) {
         this._contact.delete(e.pointerId);
+        this._setHover(e.clientX, e.clientY, false, ptType(e) === PT_TOUCH);
         this._push(EV_CANCEL, e.pointerId, e.clientX, e.clientY, 0, ptType(e), 0, time(e, performance.now()));
       }
     });
-    c.addEventListener('pointerleave', () => { this.hover.visible = false; });
+    c.addEventListener('pointerleave', () => {
+      this.hover.visible = false;
+      this.hooks.onHover?.();
+    });
 
     // Cinture di sicurezza mobile: blocca pinch/double-tap zoom della PAGINA
     // (Safari iOS ignora user-scalable=no; preventDefault sui touch event
@@ -192,6 +203,7 @@ export class InputManager {
 
     c.addEventListener('wheel', (e) => {
       e.preventDefault();
+      this.hooks.onActivity?.();
       this._wheelDelta += e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
       this._wheelX = e.clientX;
       this._wheelY = e.clientY;
@@ -221,14 +233,25 @@ export class InputManager {
       else if (type === EV_MOVE) this._onMove(id, x, y, p, pt, t);
       else this._onUp(id, x, y, p, pt, type === EV_CANCEL, t);
     }
+  }
 
-    // contatore eventi/s per HUD
-    const now = performance.now();
-    if (now - this._evWindowStart >= 1000) {
-      this.eventsPerSec = this._evCount * 1000 / (now - this._evWindowStart);
-      this._evCount = 0;
-      this._evWindowStart = now;
+  // La pagina sta andando in background: non lasciamo gesture sospese che al
+  // ritorno potrebbero ripartire con timestamp vecchi o pointer ormai persi.
+  cancelActive() {
+    this.head = this.tail;
+    if (this.drawingId !== -1) {
+      this.drawingId = -1;
+      this.hooks.onStrokeCancel();
     }
+    this.panningId = -1;
+    this.gesture = false;
+    this._gestA = -1;
+    this._gestB = -1;
+    this.touches.clear();
+    this._contact.clear();
+    this._wheelDelta = 0;
+    this.hover.visible = false;
+    this.spaceHeld = false;
   }
 
   /**
@@ -279,7 +302,7 @@ export class InputManager {
     this.strokeDist = 0;
     this._lastPoint = { x, y, p, t };
     cam.screenToWorld(x, y, this._tmpW);
-    H.onStrokeStart(this._tmpW.x, this._tmpW.y, p, t);
+    H.onStrokeStart(this._tmpW.x, this._tmpW.y, p, t, pt === PT_MOUSE);
   }
 
   /** @param {number} id @param {number} x @param {number} y @param {number} p @param {number} pt @param {number} t */

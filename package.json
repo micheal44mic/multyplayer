@@ -1,11 +1,26 @@
 {
+  "name": "fable-paint",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "scripts": {
-    "dev": "node server/signaling.js",
-    "start": "node server/signaling.js"
+    "build": "vite build && node scripts/build.mjs",
+    "ci": "npm test && npm run build",
+    "start": "node serve.mjs 8000",
+    "serve": "node serve.mjs 8000",
+    "test": "npm run test:wasm && npm run test:puppet && npm run test:stroke",
+    "test:wasm": "node wasm/test.mjs",
+    "test:puppet": "node js/puppet_test.mjs",
+    "test:stroke": "node js/stroke_straight_test.mjs"
+  },
+  "devDependencies": {
+    "vite": "^8.0.16"
   },
   "dependencies": {
-    "ws": "^8.18.0"
-  },
-  "devDependencies": {}
+    "opentype.js": "^2.0.0",
+    "vtracer-webapp": "^0.4.0"
+  }
 }

@@ -36,6 +36,21 @@ function fnv(bytes) {
   return h >>> 0;
 }
 
+/** @param {number} v */
+function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** @param {number} a @param {number} b @param {number} t */
+function mixByte(a, b, t) {
+  return a + (b - a) * t;
+}
+
+/** @param {number} src @param {number} dst */
+function screenByte(src, dst) {
+  return 255 - div255((255 - src) * (255 - dst));
+}
+
 export class Rasterizer {
   /**
    * @param {ChunkStore} strokeStore @param {StampCache} stampCache
@@ -47,6 +62,8 @@ export class Rasterizer {
     this.heap = heap; // core SIMD: stessi identici output del path JS
     /** @type {Snap|null} */
     this.snap = null;
+    /** @type {ChunkStore|null} */
+    this.sampleStore = null;
     // Pass finale del taper: set di chiavi chunk (i soli svuotati della
     // punta) a cui il replay può scrivere. Il resto del tratto è già giusto
     // e in buildup riscriverlo lo accumulerebbe due volte. null = nessun clip.
@@ -65,8 +82,8 @@ export class Rasterizer {
     this.selMask = null;
     // bbox ritagliato riusato (zero allocazioni per dab)
     this._box = { x0: 0, y0: 0, x1: 0, y1: 0 };
-    // stats per HUD
-    this.lastPx = 0;
+    // dab/segmenti applicati nell'ultimo run (la maschera di selezione parte
+    // solo se il run ha scritto qualcosa)
     this.lastDabs = 0;
     // LUT riusate (zero allocazioni per dab):
     // _maLut[m] = div255(m * a255)  — alpha del dab applicata alla maschera
@@ -110,16 +127,6 @@ export class Rasterizer {
     /** @type {Map<import('./brush.js').Stamp, {ver: number, mask: Uint8Array, ptr: number, rgb: Uint8Array|null}>} */
     this._baked = new Map();
     this._bakedBytes = 0; // i formati giganti hanno maschere da MB: bound in byte
-    // strumentazione per l'HUD: tempo speso nel lavoro texture (fill di tile
-    // e bake di maschere) nell'ultimo run
-    this.lastTexMs = 0;
-    this.lastTexDabs = 0;
-    // accumulatori cumulativi (mai azzerati): il profiler del tratto legge i
-    // delta per frame, così conta anche i run fuori dal frame loop (replay
-    // della punta al pen-up dentro gli handler di input)
-    this.texMsAcc = 0;
-    this.tileFillsAcc = 0;
-    this.bakesAcc = 0;
   }
 
   /** @param {number} n */
@@ -204,13 +211,18 @@ export class Rasterizer {
    * @param {{x0: number, y0: number, x1: number, y1: number}|null} [clipRect]
    *   bordi del canvas di destinazione (default: nessun limite)
    * @param {{mask: Uint8Array, x: number, y: number, w: number, h: number}|null} [selMask]
-   *   maschera di selezione attiva (default: nessuna — bench e stress
-   *   passano di qui e NON devono ereditare la selezione dell'utente)
+   *   maschera di selezione attiva (default: nessuna; i benchmark non
+   *   devono ereditare la selezione dell'utente)
+   * @param {ChunkStore|null} [sampleStore]
+   *   layer documento da campionare per i pennelli Aqua/glass. Separato dallo
+   *   stroke buffer: ogni stamp vede il colore gia' presente sotto, non quello
+   *   che lo stroke corrente ha appena scritto.
    */
-  beginStroke(snap, clipRect = null, selMask = null) {
+  beginStroke(snap, clipRect = null, selMask = null, sampleStore = null) {
     this.snap = snap;
     this.clipRect = clipRect;
     this.selMask = selMask;
+    this.sampleStore = sampleStore;
     this._lutA = -1;
     this._lutColorKey = -1;
     // Firma dei parametri texture: se cambia, tile e maschere baked cached
@@ -218,7 +230,7 @@ export class Rasterizer {
     if (snap && snap.tex && snap.texLut) {
       if (!snap.texMoving) this._tileLevel = this._texLevel(0); // step = 1/scale, la taglia non conta
       const sig = `${texTag(snap.tex)}|${snap.texMoving ? 'm' : this._tileLevel}|${snap.texScale}|` +
-        `${fnv(snap.texLut)}|${snap.texColorLut ? fnv(snap.texColorLut) : 0}`;
+        `${snap.texAngle || 0}|${fnv(snap.texLut)}|${snap.texColorLut ? fnv(snap.texColorLut) : 0}`;
       if (sig !== this._texSig) { this._texSig = sig; this._texVer++; }
       // la cache dei tile deve contenere almeno l'impronta del pennello (un
       // dab gigante tocca ~(diam/256+2)² chunk) con margine di avanzamento
@@ -242,7 +254,6 @@ export class Rasterizer {
     } else {
       t = { ver: 0, lum: new Uint8Array(CHUNK * CHUNK), lumPtr: 0, rgbx: null, rgbxPtr: 0 };
     }
-    const t0 = performance.now();
     if (needRgb && t.rgbx === null) t.rgbx = new Uint8Array(CHUNK * CHUNK * 4);
     this._tileFill(t, chunk.cx << CHUNK_SHIFT, chunk.cy << CHUNK_SHIFT, needRgb);
     t.ver = this._texVer;
@@ -265,10 +276,6 @@ export class Rasterizer {
       }
     }
     this._tileFillPx += CHUNK * CHUNK;
-    const dt = performance.now() - t0;
-    this.lastTexMs += dt;
-    this.texMsAcc += dt;
-    this.tileFillsAcc++;
     return t;
   }
 
@@ -278,6 +285,10 @@ export class Rasterizer {
   /** @param {{lum: Uint8Array, rgbx: Uint8Array|null}} t @param {number} ox @param {number} oy @param {boolean} needRgb */
   _tileFill(t, ox, oy, needRgb) {
     const snap = this.snap, tex = snap.tex, lut = snap.texLut;
+    if (snap.texAngle) {
+      this._tileFillRot(t, ox, oy, needRgb);
+      return;
+    }
     const level = this._tileLevel;
     this._ensureJsLuts(CHUNK);
     const u0 = this._cu0, u1 = this._cu1, uf = this._cuf;
@@ -311,6 +322,53 @@ export class Rasterizer {
     }
   }
 
+  // Variante ruotata del tile ancorato al canvas. Il caso 0° resta nel path
+  // fattorizzato sopra; qui u e v dipendono sia da x che da y.
+  /** @param {{lum: Uint8Array, rgbx: Uint8Array|null}} t @param {number} ox @param {number} oy @param {boolean} needRgb */
+  _tileFillRot(t, ox, oy, needRgb) {
+    const snap = this.snap, tex = snap.tex, lut = snap.texLut;
+    const level = this._tileLevel;
+    const lw = tex.mw[level], lh = tex.mh[level];
+    const data = tex.mips[level];
+    const lum = t.lum;
+    const rgbx = needRgb ? t.rgbx : null;
+    const rgbData = needRgb ? tex.rgbMips[level] : null;
+    const lutC = snap.texColorLut;
+    const kx = lw / (tex.w * snap.texScale);
+    const ky = lh / (tex.h * snap.texScale);
+    const cos = snap.texCos, sin = snap.texSin;
+    const du = cos * kx, dv = -sin * ky;
+
+    let i = 0;
+    for (let y = 0; y < CHUNK; y++) {
+      const py = oy + y + 0.5;
+      let u = ((ox + 0.5) * cos + py * sin) * kx - 0.5;
+      let v = (-(ox + 0.5) * sin + py * cos) * ky - 0.5;
+      for (let x = 0; x < CHUNK; x++, i++, u += du, v += dv) {
+        const iu = Math.floor(u), iv = Math.floor(v);
+        let ux0 = iu % lw; if (ux0 < 0) ux0 += lw;
+        let vy0 = iv % lh; if (vy0 < 0) vy0 += lh;
+        const ux1 = ux0 + 1 < lw ? ux0 + 1 : 0;
+        const vy1 = vy0 + 1 < lh ? vy0 + 1 : 0;
+        const fu = (u - iu) * 256 | 0;
+        const fv = (v - iv) * 256 | 0;
+        const o0 = vy0 * lw, o1 = vy1 * lw;
+        const top = data[o0 + ux0] * (256 - fu) + data[o0 + ux1] * fu;
+        const bot = data[o1 + ux0] * (256 - fu) + data[o1 + ux1] * fu;
+        lum[i] = lut[(top * (256 - fv) + bot * fv + 32768) >> 16];
+        if (rgbx !== null) {
+          const a3 = ux0 * 3, b3 = ux1 * 3, p0 = o0 * 3, p1 = o1 * 3, ci = i * 4;
+          for (let c = 0; c < 3; c++) {
+            const tc = rgbData[p0 + a3 + c] * (256 - fu) + rgbData[p0 + b3 + c] * fu;
+            const bc = rgbData[p1 + a3 + c] * (256 - fu) + rgbData[p1 + b3 + c] * fu;
+            rgbx[ci + c] = lutC[(tc * (256 - fv) + bc * fv + 32768) >> 16];
+          }
+          rgbx[ci + 3] = 255;
+        }
+      }
+    }
+  }
+
   // Maschera pre-modulata per la texture moving: m2 = div255(m * f) con f
   // calcolato sulle coordinate locali dello stamp — identico, byte per byte,
   // al vecchio campionamento per-dab (la grana che segue lo stamp non dipende
@@ -329,7 +387,6 @@ export class Rasterizer {
       b = { ver: 0, mask: new Uint8Array(stamp.size * stamp.size), ptr: 0, rgb: null };
       this._bakedBytes += stamp.size * stamp.size;
     }
-    const t0 = performance.now();
     const n = stamp.size * stamp.size;
     if (needRgb && b.rgb === null) { b.rgb = new Uint8Array(n * 3); this._bakedBytes += n * 3; }
     this._textureMask(stamp.mask, b.mask, stamp.size, 0, 0, needRgb ? b.rgb : null);
@@ -348,10 +405,6 @@ export class Rasterizer {
       if (this.heap && old.ptr) this.heap.free(old.ptr, old.mask.length);
     }
     this._tileFillPx += n;
-    const dt = performance.now() - t0;
-    this.lastTexMs += dt;
-    this.texMsAcc += dt;
-    this.bakesAcc++;
     return b;
   }
 
@@ -383,10 +436,7 @@ export class Rasterizer {
   /** @param {DabQueue} queue @param {number} budgetPx */
   run(queue, budgetPx) {
     const snap = this.snap;
-    this.lastPx = 0;
     this.lastDabs = 0;
-    this.lastTexMs = 0;
-    this.lastTexDabs = 0;
     this._tileFillPx = 0;
     if (!snap) { queue.clear(); return 0; }
 
@@ -402,7 +452,8 @@ export class Rasterizer {
       if (type === T_DAB) {
         const r = q[o + 3];
         const d = (Math.ceil(r) + 1) * 2;
-        cost = d * d;
+        // il riquadro di una shape ruotata arriva a r·√2 per lato -> area ×2
+        cost = snap.shape ? d * d * 2 : d * d;
       } else {
         const maxR = Math.max(q[o + 3], q[o + 7]) + 1;
         const w = Math.abs(q[o + 5] - q[o + 1]) + maxR * 2;
@@ -426,7 +477,6 @@ export class Rasterizer {
     // selezione attiva: il fuori-maschera scritto da questo run si azzera
     // PRIMA che il renderer carichi i dirty e che il commit fonda i chunk
     if (this.selMask !== null && this.lastDabs > 0) this._maskSelection();
-    this.lastPx = used;
     return used;
   }
 
@@ -468,6 +518,10 @@ export class Rasterizer {
    */
   _textureMask(src, dst, size, ix, iy, rgbOut) {
     const snap = this.snap;
+    if (snap.texAngle) {
+      this._textureMaskRot(src, dst, size, ix, iy, rgbOut);
+      return;
+    }
     const tex = snap.tex, lut = snap.texLut;
     const level = this._texLevel(size);
     this._ensureJsLuts(size);
@@ -492,6 +546,62 @@ export class Rasterizer {
         dst[i] = div255(m * lut[lum]);
         if (rgbData !== null) {
           const a3 = a * 3, b3 = b * 3, p0 = o0 * 3, p1 = o1 * 3, ci = i * 3;
+          for (let c = 0; c < 3; c++) {
+            const t = rgbData[p0 + a3 + c] * (256 - fu) + rgbData[p0 + b3 + c] * fu;
+            const bo = rgbData[p1 + a3 + c] * (256 - fu) + rgbData[p1 + b3 + c] * fu;
+            rgbOut[ci + c] = lutC[(t * (256 - fv) + bo * fv + 32768) >> 16];
+          }
+        }
+      }
+    }
+  }
+
+  // Texture ruotata su uno stamp. In modalità moving ruota attorno al centro
+  // dello stamp, così la grana resta centrata mentre cambia angolo.
+  /**
+   * @param {Uint8Array} src @param {Uint8Array} dst
+   * @param {number} size @param {number} ix @param {number} iy
+   * @param {Uint8Array|null} rgbOut
+   */
+  _textureMaskRot(src, dst, size, ix, iy, rgbOut) {
+    const snap = this.snap;
+    const tex = snap.tex, lut = snap.texLut;
+    const level = this._texLevel(size);
+    const lw = tex.mw[level], lh = tex.mh[level];
+    const data = tex.mips[level];
+    const rgbData = rgbOut ? tex.rgbMips[level] : null;
+    const lutC = snap.texColorLut;
+    const moving = snap.texMoving;
+    const kx = moving ? lw / (size * snap.texScale) : lw / (tex.w * snap.texScale);
+    const ky = moving ? lh / (size * snap.texScale) : lh / (tex.h * snap.texScale);
+    const cos = snap.texCos, sin = snap.texSin;
+    const cx = moving ? size * 0.5 : 0;
+    const cy = moving ? size * 0.5 : 0;
+    const baseX = moving ? 0.5 - cx : ix + 0.5;
+    const du = cos * kx, dv = -sin * ky;
+
+    let i = 0;
+    for (let y = 0; y < size; y++) {
+      const py = moving ? y + 0.5 - cy : iy + y + 0.5;
+      let u = (baseX * cos + py * sin + cx) * kx - 0.5;
+      let v = (-baseX * sin + py * cos + cy) * ky - 0.5;
+      for (let x = 0; x < size; x++, i++, u += du, v += dv) {
+        const m = src[i];
+        if (m === 0) { dst[i] = 0; continue; }
+        const iu = Math.floor(u), iv = Math.floor(v);
+        let ux0 = iu % lw; if (ux0 < 0) ux0 += lw;
+        let vy0 = iv % lh; if (vy0 < 0) vy0 += lh;
+        const ux1 = ux0 + 1 < lw ? ux0 + 1 : 0;
+        const vy1 = vy0 + 1 < lh ? vy0 + 1 : 0;
+        const fu = (u - iu) * 256 | 0;
+        const fv = (v - iv) * 256 | 0;
+        const o0 = vy0 * lw, o1 = vy1 * lw;
+        const top = data[o0 + ux0] * (256 - fu) + data[o0 + ux1] * fu;
+        const bot = data[o1 + ux0] * (256 - fu) + data[o1 + ux1] * fu;
+        const lum = (top * (256 - fv) + bot * fv + 32768) >> 16;
+        dst[i] = div255(m * lut[lum]);
+        if (rgbData !== null) {
+          const a3 = ux0 * 3, b3 = ux1 * 3, p0 = o0 * 3, p1 = o1 * 3, ci = i * 3;
           for (let c = 0; c < 3; c++) {
             const t = rgbData[p0 + a3 + c] * (256 - fu) + rgbData[p0 + b3 + c] * fu;
             const bo = rgbData[p1 + a3 + c] * (256 - fu) + rgbData[p1 + b3 + c] * fu;
@@ -550,6 +660,131 @@ export class Rasterizer {
       }, this.clip);
   }
 
+  // Aqua/glass: colore per stamp derivato dal layer sotto la punta, senza
+  // memoria direzionale. Il dettaglio locale viene incorporato nel colore
+  // sorgente, quindi il centro dello stamp puo' restare opaco ma sembrare
+  // comunque una velatura.
+  /**
+   * @param {Uint8Array} mask @param {number} sSize @param {number} ix @param {number} iy
+   * @param {number} a255 @param {number} cr @param {number} cg @param {number} cb
+   * @param {import('./brush.js').Stamp|null} tileStamp stamp non-null quando la texture e' ancorata al canvas
+   */
+  _dabAqua(mask, sSize, ix, iy, a255, cr, cg, cb, tileStamp = null) {
+    const snap = this.snap;
+    const store = this.store;
+    const sampleStore = this.sampleStore;
+    const box = this._clampBox(ix, iy, ix + sSize - 1, iy + sSize - 1);
+    if (!box) return;
+
+    let sumW = 0, sumR = 0, sumG = 0, sumB = 0;
+    forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
+      (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+        const lum = tileStamp ? this._tile(chunk, false).lum : null;
+        const sample = sampleStore ? sampleStore.getByKey(chunk.key) : null;
+        const sd = sample ? sample.data : null;
+        for (let y2 = ly0; y2 <= ly1; y2++) {
+          let mi = (y2 + oy - iy) * sSize + (lx0 + ox - ix);
+          let ti = (y2 << CHUNK_SHIFT) + lx0;
+          let si = ti << 2;
+          for (let x2 = lx0; x2 <= lx1; x2++, mi++, ti++, si += 4) {
+            const m0 = mask[mi];
+            if (m0 === 0) continue;
+            const m = lum ? div255(m0 * lum[ti]) : m0;
+            if (m === 0) continue;
+            if (sd) {
+              const a = sd[si + 3];
+              sumR += (sd[si] + (255 - a)) * m;
+              sumG += (sd[si + 1] + (255 - a)) * m;
+              sumB += (sd[si + 2] + (255 - a)) * m;
+            } else {
+              sumR += 255 * m;
+              sumG += 255 * m;
+              sumB += 255 * m;
+            }
+            sumW += m;
+          }
+        }
+      }, this.clip);
+
+    if (sumW <= 0) return;
+
+    const avgR = sumR / sumW;
+    const avgG = sumG / sumW;
+    const avgB = sumB / sumW;
+    const colorMix = clamp01(snap.aquaColorMix ?? 0);
+    const wet = clamp01(snap.aquaWetness ?? 0.5);
+    const glass = wet * 0.62;
+    const baseR = mixByte(cr, avgR, colorMix);
+    const baseG = mixByte(cg, avgG, colorMix);
+    const baseB = mixByte(cb, avgB, colorMix);
+    const lightenBase = snap.aquaLighten ? 0.18 + wet * 0.42 : 0;
+    const whiteLift = snap.aquaLighten ? wet * 0.06 : 0;
+    const buildup = snap.buildup;
+
+    forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
+      (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+        const lum = tileStamp ? this._tile(chunk, false).lum : null;
+        const sample = sampleStore ? sampleStore.getByKey(chunk.key) : null;
+        const sd = sample ? sample.data : null;
+        store.markDirty(chunk, lx0, ly0, lx1, ly1);
+        const d = chunk.data;
+        let wrote = false;
+        for (let y2 = ly0; y2 <= ly1; y2++) {
+          let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
+          let mi = (y2 + oy - iy) * sSize + (lx0 + ox - ix);
+          let ti = (y2 << CHUNK_SHIFT) + lx0;
+          for (let x2 = lx0; x2 <= lx1; x2++, di += 4, mi++, ti++) {
+            const m0 = mask[mi];
+            if (m0 === 0) continue;
+            const m = lum ? div255(m0 * lum[ti]) : m0;
+            if (m === 0) continue;
+            const ma = div255(m * a255);
+            if (ma === 0) continue;
+
+            let lr = 255, lg = 255, lb = 255;
+            if (sd) {
+              const a = sd[di + 3];
+              lr = sd[di] + (255 - a);
+              lg = sd[di + 1] + (255 - a);
+              lb = sd[di + 2] + (255 - a);
+            }
+
+            let sr = mixByte(baseR, lr, glass);
+            let sg = mixByte(baseG, lg, glass);
+            let sb = mixByte(baseB, lb, glass);
+            if (lightenBase > 0) {
+              const lumLocal = (0.2126 * lr + 0.7152 * lg + 0.0722 * lb) / 255;
+              const screenT = lightenBase * (0.45 + 0.55 * (1 - lumLocal));
+              sr = mixByte(sr, screenByte(sr, lr), screenT);
+              sg = mixByte(sg, screenByte(sg, lg), screenT);
+              sb = mixByte(sb, screenByte(sb, lb), screenT);
+              sr = mixByte(sr, 255, whiteLift);
+              sg = mixByte(sg, 255, whiteLift);
+              sb = mixByte(sb, 255, whiteLift);
+            }
+
+            const ir = Math.max(0, Math.min(255, Math.round(sr)));
+            const ig = Math.max(0, Math.min(255, Math.round(sg)));
+            const ib = Math.max(0, Math.min(255, Math.round(sb)));
+            if (buildup) {
+              const inv = 255 - ma;
+              d[di] = div255(ir * ma) + div255(d[di] * inv);
+              d[di + 1] = div255(ig * ma) + div255(d[di + 1] * inv);
+              d[di + 2] = div255(ib * ma) + div255(d[di + 2] * inv);
+              d[di + 3] = ma + div255(d[di + 3] * inv);
+            } else if (ma >= d[di + 3]) {
+              d[di] = div255(ir * ma);
+              d[di + 1] = div255(ig * ma);
+              d[di + 2] = div255(ib * ma);
+              d[di + 3] = ma;
+            }
+            wrote = true;
+          }
+        }
+        if (wrote) chunk.touched = true;
+      }, this.clip);
+  }
+
   // ---- via discreta: stamp dalla cache ----
   /**
    * @param {number} x @param {number} y @param {number} r @param {number} alpha
@@ -557,7 +792,8 @@ export class Rasterizer {
    */
   _dab(x, y, r, alpha, angle, cr, cg, cb) {
     const snap = this.snap;
-    const stamp = this.cache.getStamp(r, snap.hardness, snap.roundness, angle);
+    const stamp = this.cache.getStamp(r, snap.hardness, snap.roundness, angle,
+      snap.shape, snap.shapeInvert);
     const sSize = stamp.size;
     const ix = Math.round(x - stamp.half);
     const iy = Math.round(y - stamp.half);
@@ -573,8 +809,11 @@ export class Rasterizer {
     //   poi il dab procede come un dab normale (modalità colore: composito JS).
     let mask = stamp.mask, maskPtr = stamp.ptr;
     if (snap.tex && snap.texLut) {
-      this.lastTexDabs++;
       if (!snap.texMoving) {
+        if (snap.aqua && !snap.texColor) {
+          this._dabAqua(stamp.mask, sSize, ix, iy, a255, cr, cg, cb, stamp);
+          return;
+        }
         this._dabTile(stamp, ix, iy, a255, cr, cg, cb);
         return;
       }
@@ -585,6 +824,10 @@ export class Rasterizer {
       }
       mask = baked.mask;
       maskPtr = baked.ptr;
+    }
+    if (snap.aqua) {
+      this._dabAqua(mask, sSize, ix, iy, a255, cr, cg, cb, null);
+      return;
     }
     const buildup = snap.buildup;
     const store = this.store;
@@ -876,7 +1119,6 @@ export class Rasterizer {
     const cr = snap.colR, cg = snap.colG, cb = snap.colB;
     const useColor = snap.texColor;
     const store = this.store;
-    this.lastTexDabs++; // l'HUD conta anche i segmenti texturizzati
 
     const maxR = Math.max(r0, r1) + 1;
     const box = this._clampBox(

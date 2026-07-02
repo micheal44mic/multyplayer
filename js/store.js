@@ -22,6 +22,7 @@ const KEY_OFF = 32768;                 // chunk coords in [-32768, 32767] → mo
  * @property {boolean} texDirty
  * @property {boolean} touched
  * @property {HTMLCanvasElement|null} c2d
+ * @property {boolean} c2dDirty
  * @property {number} dirX0 rect locale sporco accumulato (vuoto: x0=CHUNK, x1=-1)
  * @property {number} dirY0
  * @property {number} dirX1
@@ -37,6 +38,20 @@ export const chunkKey = (cx, cy) => ((cx + KEY_OFF) << 16) | (cy + KEY_OFF);
 export const keyCx = (key) => (key >>> 16) - KEY_OFF;
 /** @type {(key: number) => number} */
 export const keyCy = (key) => (key & 0xffff) - KEY_OFF;
+
+/** @param {number} v @param {number} lo @param {number} size */
+function wrapCoord(v, lo, size) {
+  let r = (v - lo) % size;
+  if (r < 0) r += size;
+  return lo + r;
+}
+
+/** Chunk senza alcun pixel scritto (premultiplied: parola u32 0 = vuoto). @param {Chunk} c */
+export function isChunkBlank(c) {
+  const u = new Uint32Array(c.data.buffer, c.data.byteOffset, c.data.length >> 2);
+  for (let i = 0; i < u.length; i++) if (u[i] !== 0) return false;
+  return true;
+}
 
 export class ChunkStore {
   /** @param {string} name @param {import('./wasm_core.js').WasmHeap|null} [heap] */
@@ -84,11 +99,12 @@ export class ChunkStore {
           texDirty: true,
           touched: false,   // true se il rasterizer ha scritto pixel reali
           c2d: null,        // canvas del fallback 2D
+          c2dDirty: true,
           dirX0: CHUNK, dirY0: CHUNK, dirX1: -1, dirY1: -1,
           mips: false, mipOn: false, magNear: true,
         };
       }
-      c.key = key; c.cx = cx; c.cy = cy; c.texDirty = true; c.touched = false;
+      c.key = key; c.cx = cx; c.cy = cy; c.texDirty = true; c.c2dDirty = true; c.touched = false;
       c.dirX0 = CHUNK; c.dirY0 = CHUNK; c.dirX1 = -1; c.dirY1 = -1;
       c.mips = false;
       this.map.set(key, c);
@@ -105,6 +121,7 @@ export class ChunkStore {
   markDirty(chunk, lx0 = 0, ly0 = 0, lx1 = CHUNK - 1, ly1 = CHUNK - 1) {
     this.ver++;
     this.dirty.add(chunk);
+    chunk.c2dDirty = true;
     if (lx0 < chunk.dirX0) chunk.dirX0 = lx0;
     if (ly0 < chunk.dirY0) chunk.dirY0 = ly0;
     if (lx1 > chunk.dirX1) chunk.dirX1 = lx1;
@@ -178,8 +195,8 @@ export class ChunkStore {
   // chunk — vivi E nel pool — appartengono al contesto morto, vanno dimenticati
   // (mai dispose: i loro handle non sono più validi).
   dropRendererResources() {
-    for (const c of this.map.values()) { c.tex = null; c.c2d = null; c.texDirty = true; }
-    for (const c of this._pool) { c.tex = null; c.c2d = null; c.texDirty = true; }
+    for (const c of this.map.values()) { c.tex = null; c.c2d = null; c.texDirty = true; c.c2dDirty = true; }
+    for (const c of this._pool) { c.tex = null; c.c2d = null; c.texDirty = true; c.c2dDirty = true; }
   }
 
   // memory.grow ha staccato il buffer wasm: tutte le viste (chunk vivi E
@@ -220,6 +237,29 @@ export function forEachChunkInRect(store, x0, y0, x1, y1, create, cb, clip = nul
       cb(chunk, lx0, ly0, lx1, ly1, ox, oy);
     }
   }
+}
+
+// bbox pixel-exact del contenuto (alpha > 0), in mondo inclusivo; null se lo
+// store è vuoto. Fotografa l'hull di partenza delle sessioni Sposta/
+// Trasforma e del pannello Effetti.
+/** @param {ChunkStore} store @returns {{x0:number,y0:number,x1:number,y1:number}|null} */
+export function contentBBox(store) {
+  let X0 = Infinity, Y0 = Infinity, X1 = -Infinity, Y1 = -Infinity;
+  for (const c of store.map.values()) {
+    const d = c.data, bx = c.cx * CHUNK, by = c.cy * CHUNK;
+    for (let y = 0; y < CHUNK; y++) {
+      let o = y * CHUNK * 4 + 3;
+      for (let x = 0; x < CHUNK; x++, o += 4) {
+        if (d[o] === 0) continue;
+        const wx = bx + x, wy = by + y;
+        if (wx < X0) X0 = wx;
+        if (wx > X1) X1 = wx;
+        if (wy < Y0) Y0 = wy;
+        if (wy > Y1) Y1 = wy;
+      }
+    }
+  }
+  return X1 < X0 ? null : { x0: X0, y0: Y0, x1: X1, y1: Y1 };
 }
 
 // Trasla TUTTI i pixel dello store di (dx, dy) px mondo INTERI, clippando al
@@ -322,6 +362,148 @@ export function translateStore(store, dx, dy, clip, disposeTex) {
     store.markDirty(chunk);
   }
   return lost;
+}
+
+// Traslazione intera con wrap toroidale dentro il rettangolo del board:
+// i pixel che escono da un bordo rientrano dal bordo opposto. Usata dalla
+// modalita' Pattern per trasformare immagini/livelli raster in tile seamless.
+/**
+ * @param {ChunkStore} store @param {number} dx @param {number} dy
+ * @param {{x0:number,y0:number,x1:number,y1:number}} clip
+ * @param {(c: Chunk) => void} disposeTex
+ * @returns {{key:number,cx:number,cy:number,existed:boolean,buf:ArrayBuffer,rawSize:number}[]}
+ */
+export function translateStoreWrapped(store, dx, dy, clip, disposeTex) {
+  if (store.map.size === 0 || (dx === 0 && dy === 0)) return [];
+  const w = clip.x1 - clip.x0 + 1;
+  const h = clip.y1 - clip.y0 + 1;
+  if (w <= 0 || h <= 0) return [];
+
+  /** @type {Map<number, {cx:number, cy:number, data:Uint8ClampedArray}>} */
+  const out = new Map();
+  for (const c of store.map.values()) {
+    const src = c.data;
+    const ox = c.cx * CHUNK, oy = c.cy * CHUNK;
+    for (let ly = 0; ly < CHUNK; ly++) {
+      const wy = oy + ly;
+      if (wy < clip.y0 || wy > clip.y1) continue;
+      const ty = wrapCoord(wy + dy, clip.y0, h);
+      const cy = ty >> CHUNK_SHIFT;
+      const dly = ty - cy * CHUNK;
+      for (let lx = 0; lx < CHUNK; lx++) {
+        const wx = ox + lx;
+        if (wx < clip.x0 || wx > clip.x1) continue;
+        const si = ((ly << CHUNK_SHIFT) + lx) * 4;
+        if (src[si + 3] === 0) continue;
+        const tx = wrapCoord(wx + dx, clip.x0, w);
+        const cx = tx >> CHUNK_SHIFT;
+        const key = chunkKey(cx, cy);
+        let dst = out.get(key);
+        if (!dst) {
+          dst = { cx, cy, data: new Uint8ClampedArray(CHUNK_BYTES) };
+          out.set(key, dst);
+        }
+        const dlx = tx - cx * CHUNK;
+        const di = ((dly << CHUNK_SHIFT) + dlx) * 4;
+        dst.data[di] = src[si];
+        dst.data[di + 1] = src[si + 1];
+        dst.data[di + 2] = src[si + 2];
+        dst.data[di + 3] = src[si + 3];
+      }
+    }
+  }
+
+  for (const key of [...store.map.keys()]) {
+    if (!out.has(key)) store.remove(key, disposeTex);
+  }
+  for (const d of out.values()) {
+    const chunk = store.getOrCreate(d.cx, d.cy);
+    chunk.data.set(d.data);
+    chunk.touched = true;
+    store.markDirty(chunk);
+  }
+  return [];
+}
+
+// Ripiega tutto il contenuto corrente dello store dentro il rettangolo del
+// board, con coordinate toroidali. Usato dopo i bake lossy (scala/warp/
+// prospettiva/puppet) quando Pattern e' attivo: prima il bake puo' uscire
+// dal bordo, poi qui i pixel rientrano dal lato opposto.
+/**
+ * @param {ChunkStore} store
+ * @param {{x0:number,y0:number,x1:number,y1:number}} clip
+ * @param {(key: number, cx: number, cy: number, before: Uint8ClampedArray|null) => void} capture
+ * @param {(c: Chunk) => void} disposeTex
+ */
+export function wrapStoreIntoClip(store, clip, capture, disposeTex) {
+  if (store.map.size === 0) return;
+  const w = clip.x1 - clip.x0 + 1;
+  const h = clip.y1 - clip.y0 + 1;
+  if (w <= 0 || h <= 0) return;
+
+  /** @type {Map<number, {key:number, cx:number, cy:number, data:Uint8ClampedArray}>} */
+  const out = new Map();
+  for (const c of store.map.values()) {
+    const src = c.data;
+    const ox = c.cx * CHUNK, oy = c.cy * CHUNK;
+    for (let ly = 0; ly < CHUNK; ly++) {
+      const ty = wrapCoord(oy + ly, clip.y0, h);
+      const cy = ty >> CHUNK_SHIFT;
+      const dly = ty - cy * CHUNK;
+      for (let lx = 0; lx < CHUNK; lx++) {
+        const si = ((ly << CHUNK_SHIFT) + lx) * 4;
+        const sa = src[si + 3];
+        if (sa === 0) continue;
+        const tx = wrapCoord(ox + lx, clip.x0, w);
+        const cx = tx >> CHUNK_SHIFT;
+        const key = chunkKey(cx, cy);
+        let dst = out.get(key);
+        if (!dst) {
+          dst = { key, cx, cy, data: new Uint8ClampedArray(CHUNK_BYTES) };
+          out.set(key, dst);
+        }
+        const dlx = tx - cx * CHUNK;
+        const di = ((dly << CHUNK_SHIFT) + dlx) * 4;
+        const da = dst.data[di + 3];
+        if (da === 0) {
+          dst.data[di] = src[si];
+          dst.data[di + 1] = src[si + 1];
+          dst.data[di + 2] = src[si + 2];
+          dst.data[di + 3] = sa;
+        } else {
+          const k = 1 - sa / 255;
+          dst.data[di] = src[si] + dst.data[di] * k;
+          dst.data[di + 1] = src[si + 1] + dst.data[di + 1] * k;
+          dst.data[di + 2] = src[si + 2] + dst.data[di + 2] * k;
+          dst.data[di + 3] = sa + da * k;
+        }
+      }
+    }
+  }
+
+  /** @type {Set<number>} */
+  const seen = new Set();
+  /** @param {number} key @param {number} cx @param {number} cy @param {Uint8ClampedArray|null} before */
+  const cap = (key, cx, cy, before) => {
+    if (seen.has(key)) return;
+    seen.add(key);
+    capture(key, cx, cy, before);
+  };
+  for (const c of store.map.values()) cap(c.key, c.cx, c.cy, c.data);
+  for (const d of out.values()) {
+    const cur = store.getByKey(d.key);
+    cap(d.key, d.cx, d.cy, cur ? cur.data : null);
+  }
+
+  for (const key of [...store.map.keys()]) {
+    if (!out.has(key)) store.remove(key, disposeTex);
+  }
+  for (const d of out.values()) {
+    const chunk = store.getOrCreate(d.cx, d.cy);
+    chunk.data.set(d.data);
+    chunk.touched = true;
+    store.markDirty(chunk);
+  }
 }
 
 // Trasforma TUTTI i pixel dello store con l'affine mondo m = [a,b,c,d,e,f]

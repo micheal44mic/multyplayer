@@ -91,6 +91,10 @@ export class WasmHeap {
     list.push(off);
   }
 
+  /** Acqua alta dell'allocatore: byte usati sopra __heap_base (i blocchi
+   * nelle liste libere contano, verranno riusati). */
+  get heapBytes() { return this._next; }
+
   /** Vista pixel (chunk RGBA). Da rigenerare dopo ogni grow.
    * @param {number} off @param {number} len */
   u8c(off, len) {
@@ -100,10 +104,5 @@ export class WasmHeap {
   /** Vista maschera (stamp). @param {number} off @param {number} len */
   u8(off, len) {
     return new Uint8Array(this.memory.buffer, off, len);
-  }
-
-  /** Byte attualmente riservati dallo slab (per l'HUD). */
-  get heapBytes() {
-    return this._next;
   }
 }

@@ -1,3 +1,37 @@
+# Dependencies
 node_modules/
-.tmp_server.*.log
-.tmp_tunnel.*.log
+
+# Local editor/tooling state
+.claude/
+.tools/
+
+# Local secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs and local server output
+*.log
+*.err.log
+*.out.log
+server.err.log
+server.out.log
+.tmp_server.err.log
+.tmp_server.out.log
+
+# Temporary QA/debug artifacts
+.tmp*
+qa-*.png
+
+# Rust/WASM build output
+wasm/target/
+
+# Generated deploy folders
+dist/
+release/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vercel

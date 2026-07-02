@@ -23,6 +23,7 @@ export class BrushPreview {
     this.canvas = canvas;
     this.ctx = /** @type {CanvasRenderingContext2D} */ (canvas.getContext('2d'));
     this.store = new ChunkStore('preview', null); // heap null: path JS puro
+    this.sampleStore = new ChunkStore('preview-sample', null);
     this.cache = new StampCache(48, null);
     this.queue = new DabQueue(1 << 12);
     this.engine = new StrokeEngine(this.queue);
@@ -82,9 +83,10 @@ export class BrushPreview {
     }
 
     this.queue.clear();
+    const sampleStore = cfg.aquaEnabled ? this._prepareAquaSample(W, H) : null;
     const engine = this.engine;
     engine.begin(px(0), py(0), 1, 0, { ...cfg, size: sizePx, tool: 'brush' }, SEED, 1);
-    this.raster.beginStroke(engine.snap);
+    this.raster.beginStroke(engine.snap, null, null, sampleStore);
     for (let i = 1; i <= POINTS; i++) {
       engine.move(px(i / POINTS), py(i / POINTS), 1, times[i]);
     }
@@ -93,15 +95,86 @@ export class BrushPreview {
       // pass finale come nell'app: si scarta il live e si ridisegna col cono
       this.queue.clear();
       this.store.releaseAll(() => { /* store CPU-only */ });
-      this.raster.beginStroke(engine.snap);
+      this.raster.beginStroke(engine.snap, null, null, sampleStore);
       engine.replay();
     }
     this.raster.run(this.queue, Infinity);
 
     // --- 2. composito chunk -> ImageData (unpremultiply) -----------------
     const img = this._tctx.createImageData(W, H);
+    this._copyStoreToImage(this.store, img, W, H);
+    if (this._tmp.width !== W) this._tmp.width = W;
+    if (this._tmp.height !== H) this._tmp.height = H;
+
+    // --- 3. presentazione: scacchiera + tratto con opacità globale -------
+    const ctx = this.ctx;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = this._checkerPattern(dpr);
+    ctx.fillRect(0, 0, W, H);
+    if (sampleStore) {
+      const bg = this._tctx.createImageData(W, H);
+      this._copyStoreToImage(sampleStore, bg, W, H);
+      this._tctx.clearRect(0, 0, W, H);
+      this._tctx.putImageData(bg, 0, 0);
+      ctx.drawImage(this._tmp, 0, 0);
+    }
+    this._tctx.clearRect(0, 0, W, H);
+    this._tctx.putImageData(img, 0, 0);
+    // wash: lo slider opacità agisce sul composito (come liveOpacity nel renderer)
+    ctx.globalAlpha = engine.snap ? engine.snap.globalOpacity : 1;
+    ctx.drawImage(this._tmp, 0, 0);
+    ctx.globalAlpha = 1;
+
+    this.store.releaseAll(() => { /* nessuna texture: store CPU-only */ });
+    this.sampleStore.releaseAll(() => { /* preview sample CPU-only */ });
+  }
+
+  /** @param {number} W @param {number} H */
+  _prepareAquaSample(W, H) {
+    this.sampleStore.releaseAll(() => { /* preview sample CPU-only */ });
+    const store = this.sampleStore;
+    const cx1 = (W - 1) >> CHUNK_SHIFT;
+    const cy1 = (H - 1) >> CHUNK_SHIFT;
+    for (let cy = 0; cy <= cy1; cy++) {
+      for (let cx = 0; cx <= cx1; cx++) {
+        const chunk = store.getOrCreate(cx, cy);
+        const data = chunk.data;
+        const ox = cx * CHUNK, oy = cy * CHUNK;
+        const xMax = Math.min(CHUNK, W - ox);
+        const yMax = Math.min(CHUNK, H - oy);
+        for (let y = 0; y < yMax; y++) {
+          let o = (y << CHUNK_SHIFT) << 2;
+          const wy = oy + y;
+          for (let x = 0; x < xMax; x++, o += 4) {
+            const wx = ox + x;
+            const t = W > 1 ? wx / (W - 1) : 0;
+            const band = Math.sin(wx * 0.035 + wy * 0.09) * 12;
+            let r = 246, g = 246, b = 242;
+            if (t < 0.38) {
+              r = 72 + band; g = 144 + band; b = 220;
+            } else if (t < 0.68) {
+              r = 235 + band; g = 128 + band * 0.4; b = 96;
+            } else {
+              r = 78 + band * 0.4; g = 190 + band; b = 150 + band;
+            }
+            data[o] = Math.max(0, Math.min(255, Math.round(r)));
+            data[o + 1] = Math.max(0, Math.min(255, Math.round(g)));
+            data[o + 2] = Math.max(0, Math.min(255, Math.round(b)));
+            data[o + 3] = 255;
+          }
+        }
+        chunk.touched = true;
+      }
+    }
+    return store;
+  }
+
+  /**
+   * @param {ChunkStore} store @param {ImageData} img @param {number} W @param {number} H
+   */
+  _copyStoreToImage(store, img, W, H) {
     const d = img.data;
-    for (const c of this.store.map.values()) {
+    for (const c of store.map.values()) {
       const ox = c.cx * CHUNK, oy = c.cy * CHUNK;
       const lx0 = Math.max(0, -ox), ly0 = Math.max(0, -oy);
       const lx1 = Math.min(CHUNK, W - ox), ly1 = Math.min(CHUNK, H - oy);
@@ -120,22 +193,6 @@ export class BrushPreview {
         }
       }
     }
-    if (this._tmp.width !== W) this._tmp.width = W;
-    if (this._tmp.height !== H) this._tmp.height = H;
-    this._tctx.clearRect(0, 0, W, H);
-    this._tctx.putImageData(img, 0, 0);
-
-    // --- 3. presentazione: scacchiera + tratto con opacità globale -------
-    const ctx = this.ctx;
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = this._checkerPattern(dpr);
-    ctx.fillRect(0, 0, W, H);
-    // wash: lo slider opacità agisce sul composito (come liveOpacity nel renderer)
-    ctx.globalAlpha = engine.snap ? engine.snap.globalOpacity : 1;
-    ctx.drawImage(this._tmp, 0, 0);
-    ctx.globalAlpha = 1;
-
-    this.store.releaseAll(() => { /* nessuna texture: store CPU-only */ });
   }
 
   // Scacchiera "trasparenza" chiara, in cache per dpr.

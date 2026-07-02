@@ -4,7 +4,8 @@
 // nuovo/duplica/elimina. Miniature rigenerate con debounce, mai nel frame.
 
 import { CHUNK } from './store.js';
-import { makeRasterLayer, makeTextLayer, MAX_LAYERS } from './layers.js';
+import { makeRasterLayer, duplicateLayer, refreshClipBases, MAX_LAYERS } from './layers.js';
+import { VectorizeUI } from './vectorize_ui.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./layers.js').Layer} Layer */
@@ -20,17 +21,28 @@ export class LayersUI {
     this.opacityRow = document.getElementById('ly-opacity');
     this.opacityInput = /** @type {HTMLInputElement} */ (document.getElementById('ly-opacity-range'));
     this.opacityVal = document.getElementById('ly-opacity-val');
+    this.modeRow = document.getElementById('ly-mode');
+    this.modeSel = /** @type {HTMLSelectElement} */ (document.getElementById('ly-mode-sel'));
     this.importBtn = /** @type {HTMLButtonElement} */ (document.getElementById('ly-import'));
     this.fileInput = document.createElement('input');
     this.fileInput.type = 'file';
-    this.fileInput.accept = 'image/*';
+    this.fileInput.accept = 'image/*,.svg,image/svg+xml';
     this.fileInput.hidden = true;
     this.panel.appendChild(this.fileInput);
     this._epoch = 0;
+    this._selectionEpoch = 0;
     /** @type {Map<number, HTMLCanvasElement>} layerId -> canvas miniatura */
     this._thumbs = new Map();
     /** @type {ReturnType<typeof setTimeout>|null} */
     this._thumbTimer = null;
+    this._menu = document.createElement('div');
+    this._menu.className = 'ly-menu';
+    this._menu.setAttribute('role', 'menu');
+    this._menu.hidden = true;
+    document.body.appendChild(this._menu);
+    /** @type {{timer: ReturnType<typeof setTimeout>, row: HTMLElement, pointerId: number}|null} */
+    this._longPress = null;
+    this.vectorizeUI = new VectorizeUI(app);
 
     document.getElementById('ly-close').addEventListener('click', () => this.open(false));
     document.getElementById('ly-add').addEventListener('click', () => this._addRaster());
@@ -50,13 +62,31 @@ export class LayersUI {
       if (l.kind === 'text') l.styleDirty = true;
       this.app.planes.invalidate();
     });
+    this.modeSel.addEventListener('change', () => {
+      const l = this.app.layerMgr.active;
+      if (!l || l.kind !== 'raster') return;
+      this.app.setModeUndoable(l.id,
+        /** @type {import('./layers.js').BlendMode} */ (this.modeSel.value));
+    });
+    this.listEl.addEventListener('scroll', () => this._hideLayerMenu(), { passive: true });
+    document.addEventListener('pointerdown', (e) => {
+      if (!this._menu.hidden && !this._menu.contains(/** @type {Node} */ (e.target))) {
+        this._hideLayerMenu();
+      }
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') this._hideLayerMenu();
+    });
+    window.addEventListener('resize', () => this._hideLayerMenu());
   }
 
   /** @param {boolean} v */
   open(v) {
     this.panel.classList.toggle('open', v);
-    if (!v) return;
+    if (!v) { this._hideLayerMenu(); return; }
     this.app.ui.textUI.open(false); // un pannello alla volta sul lato destro
+    this.app.ui.svgUI.open(false);
+    if (this.app.fxTools) for (const t of this.app.fxTools) t.openPanel(false);
     this.sync(true);
     this.scheduleThumbs();
   }
@@ -75,14 +105,20 @@ export class LayersUI {
   /** @param {boolean} [force] */
   sync(force) {
     const mgr = this.app.layerMgr;
-    if (!force && this._epoch === mgr.epoch) return;
+    if (!force && this._epoch === mgr.epoch && this._selectionEpoch === mgr.selectionEpoch) return;
+    const structureChanged = force || this._epoch !== mgr.epoch;
     this._epoch = mgr.epoch;
+    this._selectionEpoch = mgr.selectionEpoch;
     if (!this.isOpen) return;
-    this._rebuildList();
+    if (structureChanged) this._rebuildList();
+    else this._refreshSelection();
   }
 
   _rebuildList() {
     const mgr = this.app.layerMgr;
+    // base effettiva delle maschere di ritaglio: decide rientro e freccia
+    // (il frame loop la ricalcola comunque prima del render)
+    refreshClipBases(mgr.layers);
     this.listEl.textContent = '';
     // dall'alto verso il basso: l'ultima della lista è la prima riga
     for (let i = mgr.layers.length - 1; i >= 0; i--) {
@@ -93,9 +129,12 @@ export class LayersUI {
 
   _refreshSelection() {
     const mgr = this.app.layerMgr;
+    const multiSelected = mgr.selectedCount > 1;
     for (const el of this.listEl.children) {
       const row = /** @type {HTMLElement} */ (el);
-      row.classList.toggle('selected', Number(row.dataset.id) === mgr.activeId);
+      const id = Number(row.dataset.id);
+      row.classList.toggle('selected', mgr.isSelected(id));
+      row.classList.toggle('active', !multiSelected && id === mgr.activeId);
     }
     const act = mgr.active;
     this.opacityRow.classList.toggle('p-off', !act);
@@ -103,6 +142,128 @@ export class LayersUI {
       this.opacityInput.value = String(Math.round(act.opacity * 100));
       this.opacityVal.textContent = Math.round(act.opacity * 100) + '%';
     }
+    // metodo di fusione: solo livelli raster (il testo è un piano SVG)
+    this.modeRow.classList.toggle('p-off', !act || act.kind !== 'raster');
+    this.modeSel.value = act && act.kind === 'raster' ? (act.mode || 'normal') : 'normal';
+  }
+
+  /** @param {Layer} layer @param {MouseEvent|PointerEvent} [e] */
+  _selectLayer(layer, e = undefined) {
+    const mgr = this.app.layerMgr;
+    if (e && e.shiftKey) mgr.selectRange(layer.id);
+    else if (e && (e.ctrlKey || e.metaKey)) mgr.toggleSelected(layer.id);
+    else mgr.selectOnly(layer.id);
+    this._selectionEpoch = mgr.selectionEpoch;
+    this._refreshSelection();
+    if (layer.kind !== 'text') this.app.ui.textUI.open(false);
+    if (layer.kind !== 'svg') this.app.ui.svgUI.open(false);
+    else this.app.ui.svgUI.sync(true);
+    this.app.requestFrame();
+  }
+
+  /** @param {EventTarget|null} target */
+  _menuIgnoredTarget(target) {
+    const el = target instanceof Element ? target : null;
+    return !!el && !!el.closest('.ly-handle, .ly-mini, .ly-arrow, button, input, select, textarea');
+  }
+
+  _hideLayerMenu() {
+    this._menu.hidden = true;
+    this._menu.textContent = '';
+  }
+
+  /** @param {Layer} layer @param {number} x @param {number} y */
+  _showLayerMenu(layer, x, y) {
+    this._selectLayer(layer);
+    this._menu.textContent = '';
+    /** @param {string} label @param {{ok: boolean, reason: string}} state @param {() => void|Promise<void>} action */
+    const addAction = (label, state, action) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ly-menu-item';
+      btn.setAttribute('role', 'menuitem');
+      btn.textContent = label;
+      btn.disabled = !state.ok;
+      btn.title = state.ok ? label : state.reason;
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (!state.ok) return;
+        this._hideLayerMenu();
+        await action();
+      });
+      this._menu.appendChild(btn);
+    };
+
+    if (layer.kind === 'raster') {
+      addAction('Vectorize...', this.app.canVectorizeLayer(layer.id), () => this.vectorizeUI.open(layer));
+    }
+
+    /** @param {'above'|'below'} direction @param {string} label */
+    const addItem = (direction, label) => {
+      const state = this.app.canMergeLayerAdjacent(layer.id, direction);
+      addAction(label, state, () => this.app.mergeLayerAdjacent(layer.id, direction));
+    };
+    addItem('above', 'Merge with layer above');
+    addItem('below', 'Merge with layer below');
+
+    this._menu.hidden = false;
+    this._menu.style.visibility = 'hidden';
+    this._menu.style.left = '0px';
+    this._menu.style.top = '0px';
+    const r = this._menu.getBoundingClientRect();
+    const pad = 8;
+    const left = Math.max(pad, Math.min(x, window.innerWidth - r.width - pad));
+    const top = Math.max(pad, Math.min(y, window.innerHeight - r.height - pad));
+    this._menu.style.left = left + 'px';
+    this._menu.style.top = top + 'px';
+    this._menu.style.visibility = '';
+  }
+
+  /** @param {HTMLElement} row @param {Layer} layer */
+  _bindLayerMenu(row, layer) {
+    row.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this._showLayerMenu(layer, e.clientX, e.clientY);
+    });
+
+    let opened = false;
+    let startX = 0, startY = 0;
+    const clear = () => {
+      if (!this._longPress || this._longPress.row !== row) return;
+      clearTimeout(this._longPress.timer);
+      try { row.releasePointerCapture(this._longPress.pointerId); } catch { /* already released */ }
+      this._longPress = null;
+    };
+
+    row.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'touch' || e.button !== 0 || this._menuIgnoredTarget(e.target)) return;
+      clear();
+      opened = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      try { row.setPointerCapture(e.pointerId); } catch { /* optional */ }
+      const timer = setTimeout(() => {
+        this._longPress = null;
+        opened = true;
+        this._showLayerMenu(layer, startX, startY);
+        if (navigator.vibrate) navigator.vibrate(8);
+      }, 560);
+      this._longPress = { timer, row, pointerId: e.pointerId };
+    });
+    row.addEventListener('pointermove', (e) => {
+      if (!this._longPress || this._longPress.row !== row) return;
+      if (Math.hypot(e.clientX - startX, e.clientY - startY) > 8) clear();
+    });
+    row.addEventListener('pointerup', clear);
+    row.addEventListener('pointercancel', clear);
+    row.addEventListener('lostpointercapture', clear);
+    row.addEventListener('click', (e) => {
+      if (!opened) return;
+      opened = false;
+      e.preventDefault();
+      e.stopPropagation();
+    }, true);
   }
 
   /** @param {Layer} layer */
@@ -111,10 +272,24 @@ export class LayersUI {
     row.className = 'ly-row';
     row.dataset.id = String(layer.id);
 
+    // maschera di ritaglio EFFETTIVA (flag + base valida): riga rientrata
+    // a destra con la freccia a sinistra che indica la base sotto, alla
+    // Procreate. Il flag senza base valida (livello in fondo, testo sotto)
+    // resta sul bottone ma non rientra: il render lo ignora allo stesso modo.
+    if (layer.clip && layer.clipBase) {
+      row.classList.add('clipped');
+      const arrow = document.createElement('span');
+      arrow.className = 'ly-cliparrow';
+      arrow.innerHTML =
+        '<svg viewBox="0 0 24 24"><path d="M11 3h2v13.2l4.6-4.6L19 13l-7 7-7-7 1.4-1.4 4.6 4.6z"/></svg>';
+      arrow.title = 'Clipped to the layer below';
+      row.appendChild(arrow);
+    }
+
     const handle = document.createElement('span');
     handle.className = 'ly-handle';
     handle.textContent = '≡';
-    handle.title = 'Trascina per riordinare';
+    handle.title = 'Drag to reorder';
     this._bindDrag(handle, row);
 
     let thumb = this._thumbs.get(layer.id);
@@ -130,7 +305,7 @@ export class LayersUI {
     name.className = 'ly-name';
     name.textContent = layer.name;
     name.addEventListener('dblclick', () => {
-      const v = prompt('Nome del livello:', layer.name);
+      const v = prompt('Layer name:', layer.name);
       if (v && v.trim()) { layer.name = v.trim(); name.textContent = layer.name; }
     });
 
@@ -140,19 +315,57 @@ export class LayersUI {
       const edit = document.createElement('button');
       edit.className = 'ly-mini';
       edit.textContent = 'Aa';
-      edit.title = 'Stile del testo';
+      edit.title = 'Text style';
       edit.addEventListener('click', (e) => {
         e.stopPropagation();
-        this.app.layerMgr.activeId = layer.id;
+        this.app.layerMgr.selectOnly(layer.id);
         this._refreshSelection();
         this.app.ui.textUI.open(true);
       });
       btns.appendChild(edit);
+    } else if (layer.kind === 'svg') {
+      const edit = document.createElement('button');
+      edit.className = 'ly-mini ly-svg-edit';
+      edit.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18h1.5a1.8 1.8 0 0 0 .8-3.4 1.7 1.7 0 0 1 .8-3.2H16a5 5 0 0 0 5-5c0-3.5-4-6.4-9-6.4Z"/><circle cx="7.5" cy="10" r="1.2"/><circle cx="10.5" cy="7.5" r="1.2"/><circle cx="14.5" cy="7.8" r="1.2"/><circle cx="16.5" cy="11" r="1.2"/></svg>';
+      edit.title = 'SVG colors';
+      edit.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.app.layerMgr.selectOnly(layer.id);
+        this._refreshSelection();
+        this.app.ui.svgUI.open(true);
+      });
+      btns.appendChild(edit);
     }
+    // maschera di ritaglio alla Procreate: visibile solo dove il livello
+    // sotto ha alpha (solo raster; il render la ignora se la base non vale)
+    if (layer.kind === 'raster') {
+      const clip = document.createElement('button');
+      clip.className = 'ly-mini ly-clip' + (layer.clip ? ' on' : '');
+      clip.innerHTML =
+        '<svg viewBox="0 0 24 24"><path d="M11 4h2v9.2l3.6-3.6L18 11l-6 6-6-6 1.4-1.4L11 13.2zM5 19h14v2H5z"/></svg>';
+      clip.title = 'Clipping mask (uses the layer below)';
+      clip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.app.toggleClipUndoable(layer.id);
+      });
+      btns.appendChild(clip);
+    }
+    // riferimento del flood fill alla Procreate: il fill misura i bordi
+    // su questo livello anche riempiendone un altro (uno solo per board)
+    const ref = document.createElement('button');
+    ref.className = 'ly-mini ly-ref' + (layer.reference ? ' on' : '');
+    ref.textContent = '◎';
+    ref.title = 'Fill reference (ColorDrop)';
+    ref.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.app.layerMgr.toggleReference(layer.id);
+      this._rebuildList(); // anche l'eventuale riga smarcata si aggiorna
+    });
+    btns.appendChild(ref);
     const eye = document.createElement('button');
     eye.className = 'ly-mini' + (layer.visible ? '' : ' off');
     eye.textContent = layer.visible ? '👁' : '–';
-    eye.title = 'Mostra/nascondi';
+    eye.title = 'Show/hide';
     eye.addEventListener('click', (e) => {
       e.stopPropagation();
       layer.visible = !layer.visible;
@@ -171,7 +384,7 @@ export class LayersUI {
     const mkArrow = (up) => {
       const b = document.createElement('button');
       b.className = 'ly-arrow';
-      b.title = up ? 'Sposta sopra' : 'Sposta sotto';
+      b.title = up ? 'Move up' : 'Move down';
       b.innerHTML = up
         ? '<svg viewBox="0 0 24 24"><path d="M12 7 4.5 14.5 6 16l6-6 6 6 1.5-1.5z"/></svg>'
         : '<svg viewBox="0 0 24 24"><path d="M12 17l7.5-7.5L18 8l-6 6-6-6-1.5 1.5z"/></svg>';
@@ -190,13 +403,8 @@ export class LayersUI {
     updown.append(mkArrow(true), mkArrow(false));
 
     row.append(handle, thumb, name, btns, updown);
-    row.addEventListener('click', () => {
-      const mgr = this.app.layerMgr;
-      if (mgr.activeId === layer.id) return;
-      mgr.activeId = layer.id;
-      this._refreshSelection();
-      if (layer.kind !== 'text') this.app.ui.textUI.open(false);
-    });
+    this._bindLayerMenu(row, layer);
+    row.addEventListener('click', (e) => this._selectLayer(layer, e));
     return row;
   }
 
@@ -249,16 +457,22 @@ export class LayersUI {
   }
 
   // ---- azioni ----
+  _canAddLayer() {
+    if (this.app.layerMgr.canAdd) return true;
+    alert(`Maximum ${MAX_LAYERS} layers.`);
+    return false;
+  }
+
   _addRaster() {
     const app = this.app;
-    if (!app.layerMgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return; }
+    if (!this._canAddLayer()) return;
     app.addLayer(makeRasterLayer('', app.heap));
   }
 
   _pickImage() {
     const app = this.app;
     if (app.imageImporting) return;
-    if (!app.layerMgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return; }
+    if (!this._canAddLayer()) return;
     this.fileInput.value = '';
     this.fileInput.click();
   }
@@ -267,32 +481,18 @@ export class LayersUI {
     const app = this.app;
     const src = app.layerMgr.active;
     if (!src) return;
-    if (!app.layerMgr.canAdd) { alert(`Massimo ${MAX_LAYERS} livelli.`); return; }
-    /** @type {Layer} */
-    let copy;
-    if (src.kind === 'raster') {
-      copy = makeRasterLayer(src.name + ' copia', app.heap);
-      for (const c of src.store.map.values()) {
-        const dst = copy.store.getOrCreate(c.cx, c.cy);
-        dst.data.set(c.data);
-        dst.touched = c.touched;
-        copy.store.markDirty(dst);
-      }
-    } else {
-      // structuredClone: la gabbia distort è annidata, lo spread la
-      // condividerebbe fra originale e copia
-      copy = makeTextLayer(src.name + ' copia', { ...src.item }, structuredClone(src.style));
-    }
-    copy.visible = src.visible;
-    copy.opacity = src.opacity;
-    app.addLayer(copy);
+    if (!this._canAddLayer()) return;
+    app.addLayer(duplicateLayer(src, src.name + ' copy', app.heap));
   }
 
   _delete() {
     const app = this.app;
-    if (app.layerMgr.layers.length <= 1) { alert('Serve almeno un livello.'); return; }
-    const act = app.layerMgr.active;
-    if (act) app.deleteLayer(act.id);
+    if (app.layerMgr.layers.length <= 1) { alert('At least one layer is required.'); return; }
+    const selected = app.layerMgr.selectedLayers;
+    const deletable = selected.length >= app.layerMgr.layers.length
+      ? selected.slice(0, selected.length - 1)
+      : selected;
+    for (const layer of deletable) app.deleteLayer(layer.id);
   }
 
   // ---- miniature ----
@@ -333,6 +533,20 @@ export class LayersUI {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(layer.item.text.slice(0, 6), THUMB / 2, THUMB / 2);
+      return;
+    }
+
+    if (layer.kind === 'svg') {
+      ctx.fillStyle = '#f7f7fb';
+      ctx.fillRect(0, 0, THUMB, THUMB);
+      ctx.strokeStyle = '#4d7cfe';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(7, 7, THUMB - 14, THUMB - 14);
+      ctx.fillStyle = '#1d2433';
+      ctx.font = '700 10px system-ui, -apple-system, "Segoe UI", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('SVG', THUMB / 2, THUMB / 2);
       return;
     }
 

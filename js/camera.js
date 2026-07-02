@@ -11,14 +11,18 @@ export class Camera {
     this.zoom = 1;       // px CSS per px documento
     this.w = 1;          // viewport in px CSS
     this.h = 1;
+    this.ox = 0;         // origine CSS del viewport di lavoro nella pagina
+    this.oy = 0;
     this.dpr = 1;
+    this.maxZoom = ZOOM_MAX;
     this._mat = new Float32Array(9);
     this.changed = true; // per sapere se ridisegnare
   }
 
-  /** @param {number} w @param {number} h @param {number} dpr */
-  resize(w, h, dpr) {
+  /** @param {number} w @param {number} h @param {number} dpr @param {number} [ox] @param {number} [oy] */
+  resize(w, h, dpr, ox = 0, oy = 0) {
     this.w = w; this.h = h; this.dpr = dpr;
+    this.ox = ox; this.oy = oy;
     this.changed = true;
   }
 
@@ -27,8 +31,10 @@ export class Camera {
    * @param {{x: number, y: number}} out
    */
   screenToWorld(sx, sy, out) {
-    out.x = (sx - this.w * 0.5) / this.zoom + this.x;
-    out.y = (sy - this.h * 0.5) / this.zoom + this.y;
+    const lx = sx - this.ox;
+    const ly = sy - this.oy;
+    out.x = (lx - this.w * 0.5) / this.zoom + this.x;
+    out.y = (ly - this.h * 0.5) / this.zoom + this.y;
     return out;
   }
 
@@ -37,8 +43,8 @@ export class Camera {
    * @param {{x: number, y: number}} out
    */
   worldToScreen(wx, wy, out) {
-    out.x = (wx - this.x) * this.zoom + this.w * 0.5;
-    out.y = (wy - this.y) * this.zoom + this.h * 0.5;
+    out.x = (wx - this.x) * this.zoom + this.w * 0.5 + this.ox;
+    out.y = (wy - this.y) * this.zoom + this.h * 0.5 + this.oy;
     return out;
   }
 
@@ -52,13 +58,15 @@ export class Camera {
   // Zoom mantenendo fisso il punto schermo (sx, sy)
   /** @param {number} sx @param {number} sy @param {number} factor */
   zoomAt(sx, sy, factor) {
-    const z = clamp(this.zoom * factor, ZOOM_MIN, ZOOM_MAX);
+    const z = clamp(this.zoom * factor, ZOOM_MIN, this.maxZoom || ZOOM_MAX);
     if (z === this.zoom) return;
-    const wx = (sx - this.w * 0.5) / this.zoom + this.x;
-    const wy = (sy - this.h * 0.5) / this.zoom + this.y;
+    const lx = sx - this.ox;
+    const ly = sy - this.oy;
+    const wx = (lx - this.w * 0.5) / this.zoom + this.x;
+    const wy = (ly - this.h * 0.5) / this.zoom + this.y;
     this.zoom = z;
-    this.x = wx - (sx - this.w * 0.5) / z;
-    this.y = wy - (sy - this.h * 0.5) / z;
+    this.x = wx - (lx - this.w * 0.5) / z;
+    this.y = wy - (ly - this.h * 0.5) / z;
     this.changed = true;
   }
 

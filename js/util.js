@@ -75,6 +75,30 @@ export function rgbToHex(r, g, b) {
   return '#' + ((1 << 24) | (r << 16) | (g << 8) | b).toString(16).slice(1);
 }
 
+/**
+ * @param {File} file
+ * @returns {Promise<{src: ImageBitmap|HTMLImageElement, w: number, h: number}>}
+ */
+export async function decodeImageSource(file) {
+  /** @type {ImageBitmap|HTMLImageElement} */
+  let src;
+  try {
+    src = await createImageBitmap(file);
+  } catch {
+    src = await new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const im = new Image();
+      im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
+      im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decoding failed')); };
+      im.src = url;
+    });
+  }
+  const w = /** @type {any} */ (src).width || /** @type {any} */ (src).naturalWidth;
+  const h = /** @type {any} */ (src).height || /** @type {any} */ (src).naturalHeight;
+  if (!w || !h) throw new Error('empty image');
+  return { src, w, h };
+}
+
 // PRNG deterministico per stroke (mulberry32) — nessuna allocazione per chiamata.
 /** @param {number} seed @returns {() => number} */
 export function mulberry32(seed) {

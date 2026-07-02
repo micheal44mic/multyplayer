@@ -1,114 +1,128 @@
-# Fable Paint — canvas infinito
+# Fable Paint - Infinite Canvas
 
-Web app di disegno con canvas infinito, ispirata a Magma ma single-player.
-Architettura: input passivo su ring buffer → frame loop unico → pipeline
-matematica (descrittori, non pixel) → rasterizer a due vie con budget per
-frame → pixel store CPU sparso (chunk 256×256 RGBA premultiplied) → GPU come
-proiettore (WebGL, upload dei soli tile sporchi, pan/zoom in vertex shader).
+Drawing web app with an infinite canvas, inspired by Magma and built for single-player use.
+Architecture: passive input ring buffer -> single frame loop -> mathematical pipeline
+(descriptors, not pixels) -> two-path rasterizer with per-frame budget -> sparse CPU
+pixel store (256x256 premultiplied RGBA chunks) -> GPU as projector (WebGL, uploading
+only dirty tiles, pan/zoom in the vertex shader).
 
-## Avvio
+## LLM UI Performance Rule
 
-Serve un server statico (i moduli ES non girano da `file://`):
+Every LLM/agent changing UI must read this before editing styles: keep app
+chrome cheap to composite. Avoid `backdrop-filter`, blur, filters, large
+shadows, animated glow, decorative gradients, or any effect that adds paint or
+compositor work to persistent UI. Prefer flat or lightly transparent solid
+colors, reuse existing toolbar colors, and only add visual polish when it has a
+clear product value and a small performance cost.
 
-```
-npx serve .          # oppure: python -m http.server 8000
-```
+## Start
 
-e apri `http://localhost:3000` (o la porta indicata).
+Use a static server. ES modules do not run from `file://`:
 
-Per provare il multiplayer P2P locale usa il server incluso:
-
-```
-npm install
-npm run dev
-```
-
-Apri `http://localhost:8787`, premi **Host**, poi in un'altra finestra apri
-lo stesso URL, inserisci il codice stanza e premi **Entra**. Il disegno passa
-quando la toolbar mostra **Connesso** sul guest e `1/1` sull'host. Su altri
-dispositivi serve HTTPS: molti browser bloccano WebRTC su indirizzi LAN
-`http://192.168...`.
-
-## Pubblicazione GitHub Pages
-
-Per GitHub Pages usa **Settings → Pages → Deploy from a branch**:
-
-- Branch: `main`
-- Folder: `/ (root)`
-
-GitHub Pages pubblica la parte statica dell'app in HTTPS, ma non esegue il
-server WebSocket di signaling. Quando avrai un signaling online, inserisci il
-suo URL in `js/net/multiplayer_config.js` oppure apri la pagina con:
-
-```
-https://micheal44mic.github.io/multyplayer/?signal=wss://tuo-server/signaling
+```bash
+npx serve .          # or: python -m http.server 8000
 ```
 
-## Signaling online
+Then open `http://localhost:3000`, or the port shown by the server.
 
-Il server signaling e in `server/signaling.js`. Per pubblicarlo su un servizio
-Node come Render, usa questo repository e il file `render.yaml`. Quando il
-servizio e online, copia l'URL pubblico e configurane la versione WebSocket:
+## Release
 
+The app is shipped as a static site.
+
+```bash
+npm ci
+npm test
+npm run build
 ```
-export const SIGNALING_URL = 'wss://multyplayer-signaling.onrender.com/signaling';
+
+`npm run build` writes the deployable artifact to `dist/`. The GitHub Actions
+workflow in `.github/workflows/deploy.yml` runs tests, builds `dist/`, and
+deploys it to GitHub Pages on pushes to `main`.
+
+To enable GitHub Pages, set the repository Pages source to **GitHub Actions**.
+
+## Launch Config
+
+Runtime launch settings live in `config.js`:
+
+- `release`: release label included in feedback and telemetry.
+- `feedbackUrl`: the public support/feedback URL.
+- `telemetryEndpoint`: optional HTTP endpoint for JSON product events and
+  runtime errors. Empty means telemetry is disabled.
+
+Current first-user policy: project saving is manual. Users should press
+**Salva in cartella** or export a `.fablepaint` file before closing the browser.
+
+## AI Fill
+
+The selection AI tool calls Gemini from the local Node server so the API key
+never ships to the browser. Create `.env.local` from `.env.example`:
+
+```bash
+GEMINI_API_KEY=your-key
+GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
 ```
 
-Senza questo URL, GitHub Pages puo aprire l'app ma non puo creare stanze
-multiplayer.
+Then start with `npm start` or `npm run serve`. The Vite dev server also serves
+`/api/ai/fill` for local development.
 
-## Comandi
+The AI Fill panel can choose between Nano Banana (`gemini-2.5-flash-image`),
+Nano Banana 2 (`gemini-3.1-flash-image`), and Nano Banana Pro
+(`gemini-3-pro-image`) per generation.
 
-| Azione | Desktop | Mobile |
+## Controls
+
+| Action | Desktop | Mobile |
 |---|---|---|
-| Disegna | trascina (mouse/penna) | un dito |
-| Pan | spazio+trascina, tasto centrale/destro, strumento Mano (H) | due dita |
-| Zoom | rotella | pinch a due dita |
-| Annulla / Ripristina | Ctrl+Z / Ctrl+Y | pulsanti toolbar |
-| Dimensione pennello | `[` e `]` | slider |
-| Pennello / Gomma / Mano | B / E / H | pulsanti toolbar |
-| Pannello pennello | P | pulsante ⚙ |
-| Console prestazioni | `` ` `` | pulsante console |
-| Reimposta vista | 0 | pulsante vista |
+| Draw | drag with mouse or pen | one finger |
+| Pan | Space+drag, middle/right button, Hand tool (H) | two fingers |
+| Zoom | mouse wheel | two-finger pinch |
+| Undo / Redo | Ctrl+Z / Ctrl+Y | toolbar buttons |
+| Brush size | `[` and `]` | slider |
+| Brush / Eraser / Hand | B / E / H | toolbar buttons |
+| Brush panel | P | gear button |
+| Performance console | `` ` `` | console button |
+| Reset view | 0 | view button |
 
-## Pennello
+## Brush
 
-Dimensione, opacità, morbidezza, stabilizzazione, spaziatura 0,1%–300%,
-rotondità, angolo, scatter, jitter (posizione, spessore, opacità, spaziatura,
-angolo, luminosità, saturazione), pressione→dimensione/opacità.
+Size, opacity, softness, stabilization, 0.1%-300% spacing, roundness, angle,
+texture scale/angle/depth, scatter, jitter (position, thickness, opacity,
+spacing, angle, brightness, saturation), and pressure-to-size/opacity mapping.
 
-**Accumula opacità** (buildup): ON = l'opacità di ogni stamp si somma dentro
-il tratto; OFF (wash) = il tratto resta a opacità uniforme anche dove si
-auto-incrocia. In wash i dab vengono accumulati in uno stroke buffer con
-max(alpha) e compositati sul layer una sola volta al pointer-up.
+**Build up opacity**: ON means every stamp adds opacity inside the stroke.
+OFF (wash) keeps the stroke at a uniform opacity even where it crosses itself.
+In wash mode, dabs are accumulated in a stroke buffer with `max(alpha)` and
+composited onto the layer once on pointer-up.
 
-## Note architetturali
+## Architecture Notes
 
-- **Via continua**: con spacing < 5%, niente jitter e dab tondo, l'unione dei
-  dab è geometricamente una catena di capsule: lavoro ∝ area coperta, non al
-  numero di stamp (un flick da 5000 stamp diventa ~450k pixel).
-- **Budget raster adattivo**: max N Mpx toccati per frame (target ~6 ms);
-  l'eccedenza resta in coda e il tratto rincorre il dito (catch-up).
-- **Buildup a spacing basso**: lo spacing di rasterizzazione è clampato al 3%
-  e l'alpha per dab compensata con 1−(1−a)^k — stessa copertura accumulata,
-  fino a 30× meno lavoro.
-- **Undo tile-diff**: i chunk "prima" vengono compressi (deflate) in un worker,
-  fuori dal path del dito. Cap: 64 step / 256 MB equivalenti.
-- **Context loss WebGL**: il documento vive in CPU; le texture si ricreano.
-- **Fallback Canvas2D** dietro la stessa interfaccia del renderer.
+- **Continuous path**: with spacing below 5%, no jitter, and a round dab, the
+  union of dabs is geometrically a chain of capsules. Work scales with covered
+  area, not stamp count: a 5,000-stamp flick becomes roughly 450k pixels.
+- **Adaptive raster budget**: at most N touched megapixels per frame (target
+  around 6 ms). Excess work stays queued and the stroke catches up with the
+  pointer.
+- **Low-spacing buildup**: raster spacing is clamped to 3%, and dab alpha is
+  compensated with `1-(1-a)^k`: same accumulated coverage with up to 30x less
+  work.
+- **Tile-diff undo**: "before" chunks are compressed with deflate in a worker,
+  outside the pointer path. Limit: 64 steps / 256 MB equivalent.
+- **WebGL context loss**: the document lives on the CPU, so textures can be
+  recreated.
+- **Canvas2D fallback** behind the same renderer interface.
 
-## Struttura
+## Structure
 
-```
-js/main.js         frame loop unico (input→sample→raster→upload→present)
-js/input.js        pointer events coalesced → ring buffer; gesture touch
-js/stroke.js       smoother, sampler con spacing, dynamics → descrittori
-js/brush.js        impostazioni + StampCache (maschere AA per bucket, LRU)
-js/raster.js       capsule + stamp, budget, commit dello stroke buffer
-js/store.js        chunk store sparso 256² premultiplied + dirty tracking
-js/renderer_gl.js  WebGL: texture per chunk, griglia procedurale
-js/renderer_2d.js  fallback Canvas2D
-js/undo.js+worker  undo tile-diff con compressione in worker
-js/hud.js          console prestazioni (fps, timing, budget, memoria)
-js/ui.js           pannello pennello, toolbar, export PNG
+```text
+js/main.js         single frame loop (input -> sample -> raster -> upload -> present)
+js/input.js        coalesced pointer events -> ring buffer; touch gestures
+js/stroke.js       smoother, spacing sampler, dynamics -> descriptors
+js/brush.js        settings + StampCache (AA masks by bucket, LRU)
+js/raster.js       capsules + stamps, budget, stroke-buffer commit
+js/store.js        sparse 256² premultiplied chunk store + dirty tracking
+js/renderer_gl.js  WebGL: per-chunk textures, procedural grid
+js/renderer_2d.js  Canvas2D fallback
+js/undo.js+worker  tile-diff undo with worker compression
+js/ui.js           brush panel, toolbar, PNG export
 ```

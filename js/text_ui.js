@@ -2,9 +2,13 @@
 // testo SELEZIONATO vedendo il risultato live. Il bottone Testo in toolbar
 // crea ogni volta un NUOVO livello testo sopra quello attivo.
 
-import { TEXT_FONTS, ensureFont, defaultTextStyle, makeTextItem, textWidth, defaultDistort, distortBox, bumpDistort } from './text_layer.js';
+import {
+  TEXT_FONTS, ensureFont, ensureTextOutlineFont, defaultTextStyle,
+  makeTextItem, textWidth, defaultDistort, distortBox, bumpDistort, touchText,
+} from './text_layer.js';
 import { makeTextLayer } from './layers.js';
 import { DistortGizmo } from './distort_ui.js';
+import { createRangeRow } from './panel_controls.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./layers.js').Layer} Layer */
@@ -14,7 +18,7 @@ export class TextUI {
   constructor(app) {
     this.app = app;
     this.panel = document.getElementById('textpanel');
-    this.gizmo = new DistortGizmo(app); // gabbia distort sul canvas, sync per frame
+    this.gizmo = new DistortGizmo(app);
     this._fontsKicked = false;
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 }; // visibleRect riusato
     /** @type {(() => void)[]} */
@@ -38,14 +42,13 @@ export class TextUI {
   // vede sempre.
   placeAtView() {
     const app = this.app;
-    if (app.blockMultiplayerUnsupported('Testo')) return;
-    if (!app.layerMgr.canAdd) { alert('Massimo numero di livelli raggiunto.'); return; }
+    if (!app.layerMgr.canAdd) { alert('Maximum number of layers reached.'); return; }
     const board = app.boards.active;
     const cx = board.x + board.w / 2, cy = board.y + board.h / 2;
     const fill = /** @type {HTMLInputElement} */ (document.getElementById('color')).value;
     const size = Math.max(8, board.w * 0.8 / 5.7);
     const item = makeTextItem(cx, cy, fill, size);
-    const layer = makeTextLayer('Testo', item, defaultTextStyle());
+    const layer = makeTextLayer('Text', item, defaultTextStyle());
     app.addLayer(layer);
     const r = app.camera.visibleRect(this._rect);
     if (cx < r.x0 || cx > r.x1 || cy < r.y0 || cy > r.y1) app.fitBoard(board);
@@ -65,19 +68,22 @@ export class TextUI {
     this.panel.classList.toggle('open', v);
     if (!v) return;
     this.app.ui.layersUI.open(false); // un pannello alla volta sul lato destro
+    this.app.ui.svgUI.open(false);
+    if (this.app.fxTools) for (const t of this.app.fxTools) t.openPanel(false);
     for (const f of this._sync) f();
     if (!this._fontsKicked) {
       // pre-carica tutta la lista in background: il cambio font è istantaneo
       this._fontsKicked = true;
       for (const f of TEXT_FONTS) ensureFont(f.family, f.weight);
     }
+    this._warmOutline();
   }
 
   // Lo stile è cambiato: SVG da risincronizzare + miniatura del pannello.
   _dirty() {
     const l = this.layer;
     if (!l) return;
-    l.styleDirty = true;
+    touchText(l);
     l.thumbDirty = true;
     this.app.ui.layersUI.scheduleThumbs();
   }
@@ -109,11 +115,11 @@ export class TextUI {
       return l ? fn(l.item) : fallback;
     };
 
-    body.appendChild(this._section('Testo'));
+    body.appendChild(this._section('Text'));
     const txt = document.createElement('input');
     txt.type = 'text';
     txt.className = 'tp-text';
-    txt.placeholder = 'Scrivi qualcosa…';
+    txt.placeholder = 'Type something...';
     txt.autocomplete = 'off';
     txt.spellcheck = false;
     // ogni tasto = un setAttribute al frame dopo (via styleDirty): l'SVG è
@@ -126,10 +132,13 @@ export class TextUI {
     body.appendChild(txt);
     this._textInput = txt;
 
-    body.appendChild(this._slider('Dimensione', 4, 2000, 1,
+    body.appendChild(this._slider('Size', 4, 2000, 1,
       () => readItem((it) => it.size, 70),
       (v) => withItem((it) => { it.size = v; }),
       (v) => Math.round(v) + ' px', true));
+    body.appendChild(this._color('Text color',
+      () => readItem((it) => it.fill, '#1a1a1f'),
+      (v) => withItem((it) => { it.fill = v; })));
 
     body.appendChild(this._section('Font'));
     const sel = document.createElement('select');
@@ -146,15 +155,16 @@ export class TextUI {
       if (!def) return;
       withStyle((st) => { st.font = def.family; st.weight = def.weight; });
       ensureFont(def.family, def.weight);
+      this._warmOutline();
     });
     this._sync.push(() => { sel.value = readStyle((st) => st.font, 'Orbitron'); });
     body.appendChild(sel);
 
-    body.appendChild(this._section('Trasformazione'));
+    body.appendChild(this._section('Transform'));
     const wsel = document.createElement('select');
     wsel.className = 'tp-select';
-    for (const [v, name] of [['none', 'Nessuna'], ['arc', 'Arco'],
-      ['circle', 'Cerchio'], ['wave', 'Onda'], ['distort', 'Distorsione']]) {
+    for (const [v, name] of [['none', 'None'], ['arc', 'Arc'],
+      ['circle', 'Circle'], ['wave', 'Wave'], ['distort', 'Distort']]) {
       const o = document.createElement('option');
       o.value = v;
       o.textContent = name;
@@ -179,47 +189,49 @@ export class TextUI {
           distortBox(l.item, st);
           bumpDistort(st);
         }
+        if (st.warp === 'distort') this._warmOutline(l);
       });
       for (const f of this._sync) f(); // nuovi default + visibilità delle righe
     });
-    this._sync.push(() => { wsel.value = readStyle((st) => st.warp ?? 'none', 'none'); });
+    this._sync.push(() => {
+      const w = readStyle((st) => st.warp ?? 'none', 'none');
+      wsel.value = ['arc', 'circle', 'wave', 'distort'].includes(w) ? w : 'none';
+    });
     body.appendChild(wsel);
-    const rowBend = this._slider('Curvatura', -360, 360, 1,
+    const rowBend = this._slider('Bend', -360, 360, 1,
       () => readStyle((st) => st.warpBend ?? 90, 90),
       (v) => withStyle((st) => { st.warpBend = v; }),
       (v) => Math.round(v) + '°');
-    const rowRadius = this._slider('Raggio', 20, 8000, 1,
+    const rowRadius = this._slider('Radius', 20, 8000, 1,
       () => readStyle((st) => st.warpRadius || 200, 200),
       (v) => withStyle((st) => { st.warpRadius = v; }),
       (v) => Math.round(v) + ' px', true);
-    const rowAmp = this._slider('Ampiezza', 1, 1000, 1,
+    const rowAmp = this._slider('Amplitude', 1, 1000, 1,
       () => readStyle((st) => st.warpAmp || 20, 20),
       (v) => withStyle((st) => { st.warpAmp = v; }),
       (v) => Math.round(v) + ' px', true);
-    const rowFreq = this._slider('Onde', 0.5, 6, 0.25,
+    const rowFreq = this._slider('Waves', 0.5, 6, 0.25,
       () => readStyle((st) => st.warpFreq ?? 2, 2),
       (v) => withStyle((st) => { st.warpFreq = v; }),
       (v) => String(Math.round(v * 4) / 4));
-    // distorsione: si edita sul canvas (gabbia con ancore e maniglie),
-    // qui restano solo la guida e il reset
     const rowDistort = document.createElement('div');
     rowDistort.className = 'p-row';
     const dHint = document.createElement('div');
     dHint.className = 'p-hint';
-    dHint.textContent = 'Trascina sul canvas: angoli, punti centrali e maniglie di curvatura.';
+    dHint.textContent = 'Drag on the canvas: corners, center points, and curve handles.';
     const dReset = document.createElement('button');
     dReset.className = 'tp-reset';
     dReset.type = 'button';
-    dReset.textContent = 'Reimposta gabbia';
+    dReset.textContent = 'Reset Cage';
     dReset.addEventListener('click', () => {
       const l = this.layer;
       if (!l) return;
       withStyle((st) => {
         st.distort = defaultDistort();
-        // il frame congelato si ricattura sull'inchiostro del testo corrente
         st.distortFrame = undefined;
         distortBox(l.item, st);
         bumpDistort(st);
+        this._warmOutline(l);
       });
     });
     rowDistort.append(dHint, dReset);
@@ -233,56 +245,52 @@ export class TextUI {
       rowDistort.style.display = w === 'distort' ? '' : 'none';
     });
 
-    body.appendChild(this._section('Bordo'));
-    body.appendChild(this._slider('Spessore', 0, 24, 0.5,
+    body.appendChild(this._section('Stroke'));
+    body.appendChild(this._slider('Width', 0, 24, 0.5,
       () => readStyle((st) => st.stroke, 0),
       (v) => withStyle((st) => { st.stroke = v; }),
       (v) => v.toFixed(1) + ' px'));
-    body.appendChild(this._color('Colore bordo',
+    body.appendChild(this._color('Stroke color',
       () => readStyle((st) => st.strokeColor, '#ffffff'),
       (v) => withStyle((st) => { st.strokeColor = v; })));
 
-    body.appendChild(this._section('Ombra'));
-    body.appendChild(this._toggle('Blocco 3D',
-      'estrusione solida invece dell\'ombra morbida',
+    body.appendChild(this._section('Shadow'));
+    body.appendChild(this._toggle('3D Block',
+      'solid extrusion instead of a soft shadow',
       () => readStyle((st) => st.block, false),
       (v) => withStyle((st) => {
         st.block = v;
         // acceso con distanza 0 non si vedrebbe: parte da un blocco visibile
         if (v && st.shadowDist === 0) st.shadowDist = 12;
       })));
-    body.appendChild(this._slider('Sfocatura', 0, 80, 1,
+    body.appendChild(this._slider('Blur', 0, 80, 1,
       () => readStyle((st) => st.shadowBlur, 0),
       (v) => withStyle((st) => { st.shadowBlur = v; }),
       (v) => v + ' px'));
-    body.appendChild(this._slider('Distanza', 0, 80, 1,
+    body.appendChild(this._slider('Distance', 0, 80, 1,
       () => readStyle((st) => st.shadowDist, 0),
       (v) => withStyle((st) => { st.shadowDist = v; }),
       (v) => v + ' px'));
-    body.appendChild(this._slider('Angolo', 0, 360, 1,
+    body.appendChild(this._slider('Angle', 0, 360, 1,
       () => readStyle((st) => st.shadowAngle ?? 45, 45),
       (v) => withStyle((st) => { st.shadowAngle = v; }),
       (v) => Math.round(v) + '°'));
-    body.appendChild(this._slider('Opacità', 5, 100, 1,
-      () => readStyle((st) => (st.shadowOpacity ?? 0.65) * 100, 65),
-      (v) => withStyle((st) => { st.shadowOpacity = v / 100; }),
-      (v) => Math.round(v) + '%'));
-    body.appendChild(this._color('Colore ombra',
+    body.appendChild(this._color('Shadow color',
       () => readStyle((st) => st.shadowColor, '#000000'),
       (v) => withStyle((st) => { st.shadowColor = v; })));
 
-    body.appendChild(this._section('Rasterizza'));
+    body.appendChild(this._section('Rasterize'));
     const rRow = document.createElement('div');
     rRow.className = 'p-row';
     const rHint = document.createElement('div');
     rHint.className = 'p-hint';
-    rHint.textContent = 'Converte il testo in pixel alla risoluzione del ' +
-      'canvas (qualità export): diventa dipingibile ma non più modificabile ' +
-      'come testo. Annullabile con Undo.';
+    rHint.textContent = 'Converts text to pixels at canvas resolution ' +
+      '(export quality): it becomes paintable, but no longer editable as text. ' +
+      'Undo can revert it.';
     const rBtn = document.createElement('button');
     rBtn.className = 'tp-reset';
     rBtn.type = 'button';
-    rBtn.textContent = 'Rasterizza testo';
+    rBtn.textContent = 'Rasterize Text';
     rBtn.addEventListener('click', () => {
       const l = this.layer;
       if (!l) return;
@@ -290,6 +298,13 @@ export class TextUI {
     });
     rRow.append(rHint, rBtn);
     body.appendChild(rRow);
+  }
+
+  /** @param {Layer|null} [layer] */
+  _warmOutline(layer = this.layer) {
+    if (!layer || layer.style.warp !== 'distort') return;
+    ensureTextOutlineFont(layer.style.font, layer.style.weight)
+      .then((font) => { if (font) touchText(layer); });
   }
 
   /** @param {string} title */
@@ -308,39 +323,12 @@ export class TextUI {
    * @param {boolean} [log]
    */
   _slider(label, min, max, step, get, set, fmt, log) {
-    const row = document.createElement('div');
-    row.className = 'p-row';
-    const head = document.createElement('div');
-    head.className = 'p-row-head';
-    const name = document.createElement('span');
-    name.textContent = label;
-    const val = document.createElement('span');
-    val.className = 'p-val';
-    head.append(name, val);
-    const input = document.createElement('input');
-    input.type = 'range';
-    if (log) {
-      input.min = String(Math.log(min));
-      input.max = String(Math.log(max));
-      input.step = String((Math.log(max) - Math.log(min)) / 500);
-    } else {
-      input.min = String(min); input.max = String(max); input.step = String(step);
-    }
-    const refresh = () => {
-      const v = get();
-      input.value = String(log ? Math.log(Math.max(min, Math.min(max, v))) : v);
-      val.textContent = fmt(v);
-    };
-    input.addEventListener('input', () => {
-      let v = log ? Math.exp(parseFloat(input.value)) : parseFloat(input.value);
-      if (step >= 1) v = Math.round(v);
-      set(v);
-      val.textContent = fmt(get());
+    const control = createRangeRow({
+      label, min, max, step, get, set, fmt, log,
+      syncLogClamp: true,
     });
-    this._sync.push(refresh);
-    refresh();
-    row.append(head, input);
-    return row;
+    this._sync.push(control.sync);
+    return control.row;
   }
 
   /**

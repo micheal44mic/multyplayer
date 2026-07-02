@@ -16,9 +16,17 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
  * @property {number} opacity
  * @property {number} hardness
  * @property {number} roundness
+ * @property {import('./shape.js').BrushShape|null} shape forma importata dello stamp (null = tonda)
+ * @property {boolean} shapeInvert
  * @property {number} baseAngle
+ * @property {number} rotation -1..1: quota della direzione del tratto sommata all'angolo
  * @property {number} spacing
  * @property {number} smoothing
+ * @property {boolean} direct input mouse: usato solo dal fallback rope legacy
+ * @property {number} pressureSize
+ * @property {number} pressureCurveX
+ * @property {number} pressureCurveY
+ * @property {'smart'|'rope'} stabilizationMode
  * @property {boolean} scatter
  * @property {number} partN particelle per stamp (1 se scatter off)
  * @property {number} partSize raggio particella come frazione del raggio dab
@@ -30,6 +38,10 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
  * @property {number} jAngle
  * @property {number} jBright
  * @property {number} jSat
+ * @property {boolean} aqua
+ * @property {number} aquaColorMix
+ * @property {number} aquaWetness
+ * @property {boolean} aquaLighten
  * @property {boolean} buildup
  * @property {number} alphaCompPow
  * @property {number} taperStart rapporto di spessore al vertice d'inizio (0..1)
@@ -37,6 +49,9 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
  * @property {number} speedScale px documento -> px CSS (zoom camera al pen-down)
  * @property {import('./texture.js').BrushTexture|null} tex texture/grana (null = off)
  * @property {number} texScale
+ * @property {number} texAngle
+ * @property {number} texCos
+ * @property {number} texSin
  * @property {boolean} texMoving
  * @property {Uint8Array|null} texLut luminanza -> fattore alpha 0..255
  * @property {boolean} texColor il tratto usa i colori della texture
@@ -56,6 +71,7 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
 export const T_DAB = 0;
 export const T_SEG = 1;
 const STRIDE = 10;
+const TWO_PI_STROKE = Math.PI * 2;
 
 // Sotto questa frazione di spacing, in modalità wash, l'unione dei dab tondi
 // è geometricamente identica a una catena di capsule -> via continua.
@@ -66,7 +82,9 @@ const MIN_BUILDUP_SPACING = 0.03;
 
 // Dinamica delle punte (modello "pennellata a cerchi"). La lunghezza di ogni
 // punta è velocità × SENS_MS: una frustata lascia punte lunghe, un gesto
-// posato corte. La velocità è misurata agli ESTREMI del gesto su una finestra
+// posato corte. Il rapporto al vertice resta quello impostato: 0 deve chiudere
+// davvero a punta anche quando il gesto è lento o il pennello è grande.
+// La velocità è misurata agli ESTREMI del gesto su una finestra
 // di SW_MS (o SW_PTS punti filtrati a SW_FILTER px CSS).
 // Punta d'INIZIO: le emissioni vengono trattenute finché la finestra non si
 // chiude (~70 ms), poi lunghezza e rapporto della punta sono congelati e il
@@ -81,8 +99,6 @@ const MIN_BUILDUP_SPACING = 0.03;
 // disegnata live (tratto corto), il replay rifà il tratto intero: costo
 // comunque piccolo, il tratto è corto.
 const SENS_MS = 250;   // ms: lunghezza punta = velocità × SENS_MS
-const VFULL = 1.5;     // px CSS/ms: a questa velocità il vertice raggiunge il rapporto impostato
-const EXTRA = 0.35;    // pavimento extra a velocità zero: lento = moncone
 const SW_MS = 70;      // ms: finestra di misura della velocità agli estremi
 const SW_PTS = 10;     // ...o al massimo 10 punti filtrati
 const SW_FILTER = 1.5; // px CSS: distanza minima tra punti per la misura
@@ -90,8 +106,39 @@ const TIP_MAX_FRAC = 0.65; // ogni punta: al massimo 65% della lunghezza del tra
 const TIP_SUM_FRAC = 0.95; // le due insieme: al massimo 95%
 const MIN_R_PX = 0.06; // raggio sotto cui il dab non si stampa: la punta finisce a zero
 const REPLAY_MIN_GAP_PX = 0.5; // passo minimo del ricampionamento delle punte
-const REC_STRIDE = 5;    // registro: x, y, m, mP, burn
-const REC_MAX = 1 << 21; // tetto del registro (~40MB): oltre, niente pass finale
+// dir: angolo di direzione UNWRAPPATO al momento dell'emissione — il replay
+// del corpo deve ristampare gli stessi identici dab del live (rotazione
+// inclusa), i chunk al confine della punta non devono mostrare cuciture.
+const REC_STRIDE = 6;    // registro: x, y, m, mP, burn, dir
+const REC_MAX = 1 << 21; // tetto del registro (~50MB): oltre, niente pass finale
+
+// Snap rapido "draw and hold": dopo una breve pausa una linea quasi dritta,
+// o un anello quasi chiuso, diventa geometria perfetta. Dopo l'aggancio il
+// punto finale/maniglia puo' muoversi liberamente: non si ricontrolla piu'
+// la forma originale.
+const SNAP_HOLD_MS = 260;
+const SNAP_SAMPLE_CSS = 0.6;
+const SNAP_STILL_CSS = 2.5;
+const LINE_MIN_CSS = 24;
+const LINE_DEV_CSS = 7;
+const LINE_DEV_BRUSH = 0.45;
+const LINE_PATH_RATIO = 1.08;
+const ELLIPSE_MIN_CSS = 28;
+const ELLIPSE_CLOSE_CSS = 26;
+const ELLIPSE_RADIAL_ERR = 0.22;
+const ELLIPSE_MAX_ERR = 0.48;
+const ELLIPSE_MIN_SWEEP = Math.PI * 1.55;
+const CIRCLE_RATIO = 0.86;
+const ELLIPSE_MIN_RATIO = 0.16;
+
+// Stabilizzazione Magma-style: lo slider 1..100 viene mappato a r=20..80,
+// buffer effettivo r/4 e alpha = 1 - clamp(r/100, 0, .95). Il cursore resta
+// raw; solo la geometria del tratto passa dalla catena esponenziale.
+const MAGMA_STAB_IN_MIN = 0.01;
+const MAGMA_STAB_R_MIN = 20;
+const MAGMA_STAB_R_MAX = 80;
+const ROPE_PEN_RADIUS_CSS = 34;
+const ROPE_MOUSE_RADIUS_CSS = 48;
 
 // Salto massimo di raggio tra due emissioni consecutive: oltre, si inseriscono
 // dab intermedi interpolati — i gradini del bordo restano sub-pixel dovunque
@@ -124,15 +171,38 @@ function tipFactor(d, len, th) {
   return th + (1 - th) * easeTip(d / len);
 }
 
-// Rapporto al vertice: il valore impostato più un pavimento EXTRA che
-// svanisce con la velocità (S-curve fino a VFULL) — un'estremità posata
-// lascia un moncone, solo la frustata arriva al valore scelto (0 = punta
-// vera), come un pennello fisico.
-/** @param {number} setting rapporto impostato (0..1) @param {number} velCss px CSS/ms */
-function tipRatio(setting, velCss) {
-  let k = velCss / VFULL;
-  k = k <= 0 ? 0 : k >= 1 ? 1 : k * k * (3 - 2 * k);
-  return setting + (1 - k) * EXTRA * (1 - setting);
+// Rapporto al vertice: il valore impostato. La velocità decide solo la
+// lunghezza della punta, non lascia un cap rotondo quando il taper è a zero.
+/** @param {number} setting rapporto impostato (0..1) @param {number} _velCss px CSS/ms */
+function tipRatio(setting, _velCss) {
+  return clamp(setting, 0, 1);
+}
+
+/** @param {number} p @param {number} cx @param {number} cy */
+function pressureCurve(p, cx, cy) {
+  p = clamp(p, 0, 1);
+  cx = clamp(cx, 0.05, 0.95);
+  cy = clamp(cy, 0.05, 0.95);
+  if (Math.abs(cx - 0.5) < 0.001 && Math.abs(cy - 0.5) < 0.001) return p;
+  let lo = 0, hi = 1;
+  for (let i = 0; i < 12; i++) {
+    const t = (lo + hi) * 0.5;
+    const x = 2 * (1 - t) * t * cx + t * t;
+    if (x < p) lo = t;
+    else hi = t;
+  }
+  const t = (lo + hi) * 0.5;
+  return 2 * (1 - t) * t * cy + t * t;
+}
+
+/** @param {number} p @param {number} amount @param {number} cx @param {number} cy */
+function pressureSizeFactor(p, amount, cx, cy) {
+  amount = clamp(amount, -1, 1);
+  if (amount === 0) return 1;
+  const v = pressureCurve(p, cx, cy);
+  return amount > 0
+    ? (1 - amount) + v * amount
+    : 1 + amount * v;
 }
 
 export class DabQueue {
@@ -143,6 +213,17 @@ export class DabQueue {
     this.head = 0;   // indice entry di lettura
     this.tail = 0;   // indice entry di scrittura
     this.count = 0;
+    // Specchio verticale: x dell'asse in coordinate documento (null = off).
+    // Ogni entry accodata viene duplicata riflessa qui, l'unico imbuto della
+    // pipeline: vale per live, replay della punta e quindi commit e undo
+    // senza altri punti di aggancio. Fotografato dall'App al pen-down.
+    /** @type {number|null} */
+    this.mirrorX = null;
+    // Pattern seamless: ogni entry viene ripetuta sui tile adiacenti, poi il
+    // rasterizer clippa al canvas attivo. Basta a far rientrare sui bordi
+    // opposti tutto cio' che esce dalla tile.
+    /** @type {{x: number, y: number, w: number, h: number}|null} */
+    this.patternTile = null;
   }
   get free() { return this.cap - this.count; }
   _grow() {
@@ -159,6 +240,68 @@ export class DabQueue {
    * @param {number} e @param {number} f @param {number} g @param {number} h @param {number} i
    */
   push(t, a, b, c, d, e, f, g, h, i) {
+    this._putRepeated(t, a, b, c, d, e, f, g, h, i);
+    const ax = this.mirrorX;
+    if (ax !== null) {
+      const m2 = ax * 2;
+      if (t === T_DAB) {
+        // dab: x riflessa, angolo π-θ (la riflessione di una direzione θ
+        // sull'asse verticale). Lo stamp in sé non viene flippato: per
+        // ellissi e tonde è esatto, una shape asimmetrica segue comunque
+        // la direzione specchiata del tratto.
+        this._putRepeated(t, m2 - a, b, c, d, Math.PI - e, f, g, h, i);
+      } else {
+        // capsula: entrambi gli estremi riflessi (entry autosufficiente,
+        // l'interleave con la catena originale non cuce niente)
+        this._putRepeated(t, m2 - a, b, c, d, m2 - e, f, g, h, i);
+      }
+    }
+  }
+  /**
+   * @param {number} t @param {number} a @param {number} b @param {number} c @param {number} d
+   * @param {number} e @param {number} f @param {number} g @param {number} h @param {number} i
+   */
+  _putRepeated(t, a, b, c, d, e, f, g, h, i) {
+    const tile = this.patternTile;
+    if (!tile || tile.w <= 0 || tile.h <= 0) {
+      this._put(t, a, b, c, d, e, f, g, h, i);
+      return;
+    }
+    const xs = [-tile.w, 0, tile.w];
+    const ys = [-tile.h, 0, tile.h];
+    for (const ox of xs) {
+      for (const oy of ys) {
+        if (!this._repeatHitsTile(t, a, b, c, e, f, g, ox, oy, tile)) continue;
+        if (t === T_DAB) this._put(t, a + ox, b + oy, c, d, e, f, g, h, i);
+        else this._put(t, a + ox, b + oy, c, d, e + ox, f + oy, g, h, i);
+      }
+    }
+  }
+  /**
+   * @param {number} t @param {number} a @param {number} b @param {number} c
+   * @param {number} e @param {number} f @param {number} g
+   * @param {number} ox @param {number} oy
+   * @param {{x: number, y: number, w: number, h: number}} tile
+   */
+  _repeatHitsTile(t, a, b, c, e, f, g, ox, oy, tile) {
+    let x0, y0, x1, y1;
+    if (t === T_DAB) {
+      const pad = c * 1.5 + 4;
+      x0 = a + ox - pad; y0 = b + oy - pad;
+      x1 = a + ox + pad; y1 = b + oy + pad;
+    } else {
+      const pad = Math.max(c, g) + 4;
+      x0 = Math.min(a, e) + ox - pad; y0 = Math.min(b, f) + oy - pad;
+      x1 = Math.max(a, e) + ox + pad; y1 = Math.max(b, f) + oy + pad;
+    }
+    return x1 >= tile.x && y1 >= tile.y &&
+      x0 <= tile.x + tile.w - 1 && y0 <= tile.y + tile.h - 1;
+  }
+  /**
+   * @param {number} t @param {number} a @param {number} b @param {number} c @param {number} d
+   * @param {number} e @param {number} f @param {number} g @param {number} h @param {number} i
+   */
+  _put(t, a, b, c, d, e, f, g, h, i) {
     if (this.count === this.cap) this._grow();
     const o = this.tail * STRIDE, q = this.buf;
     q[o] = t; q[o + 1] = a; q[o + 2] = b; q[o + 3] = c; q[o + 4] = d;
@@ -200,6 +343,13 @@ function crEval(p0, p1, p2, p3, t0, t1, t2, t3, t, out) {
   return out;
 }
 
+/** @param {number} cutoffHz @param {number} dtMs */
+function filterAlpha(cutoffHz, dtMs) {
+  const dt = clamp(dtMs, 1, 64) * 0.001;
+  const tau = 1 / (TWO_PI_STROKE * Math.max(0.001, cutoffHz));
+  return 1 / (1 + tau / dt);
+}
+
 // Sotto questa deviazione (px documento) la corda è indistinguibile dalla
 // curva: niente suddivisione, costo zero rispetto a prima.
 const CURVE_TOL = 0.25;
@@ -214,10 +364,18 @@ export class StrokeEngine {
     this.dabsEmitted = 0;
     // stato smoother
     this._sx = 0; this._sy = 0; this._sp = 0;
+    this._rx = 0; this._ry = 0; this._rt = 0;
+    this._svx = 0; this._svy = 0;
+    /** @type {{x: number, y: number, p: number}[]} */
+    this._stabBuf = [];
+    this._stabAlpha = 1;
     // stato sampler
     this._lx = 0; this._ly = 0; this._lp = 0;     // ultimo punto campionato
     this._gapLeft = 0;
     this._dirX = 1; this._dirY = 0;               // direzione corrente del tratto
+    this._dirA = 0;                               // ...come angolo UNWRAPPATO (radianti,
+                                                  // continuo: niente flip a ±π con la
+                                                  // rotazione parziale; può accumulare giri)
     this._moved = 0;                              // distanza campionata totale
     // dinamica delle punte
     this._t0 = 0;                                 // tempo pen-down
@@ -256,6 +414,27 @@ export class StrokeEngine {
     this._cq = [{ x: 0, y: 0, p: 0 }, { x: 0, y: 0, p: 0 }, { x: 0, y: 0, p: 0 }, { x: 0, y: 0, p: 0 }];
     this._cqN = 0;
     this._cm = { x: 0, y: 0 }; // out riusato per crEval
+    // stato dello snap rapido (linea/cerchio/ellisse)
+    this._snapMode = false;
+    this._snapKind = '';
+    this._snapEligible = false;
+    this._snapDirty = false;
+    this._straightSX = 0; this._straightSY = 0; this._straightSP = 1; this._straightST = 0;
+    this._straightEX = 0; this._straightEY = 0; this._straightEP = 1; this._straightET = 0;
+    this._straightLastX = 0; this._straightLastY = 0;
+    this._straightStillX = 0; this._straightStillY = 0; this._straightStillT = 0;
+    this._straightPath = 0;
+    this._straightN = 0; this._straightCap = 128;
+    this._straightX = new Float64Array(this._straightCap);
+    this._straightY = new Float64Array(this._straightCap);
+    this._snapCx = 0; this._snapCy = 0;
+    this._snapRx = 0; this._snapRy = 0; this._snapAngle = 0;
+    this._snapUx = 1; this._snapUy = 0; this._snapVx = 0; this._snapVy = 1;
+    this.debug = {
+      active: false, mode: 'smart', rawX: 0, rawY: 0, outX: 0, outY: 0,
+      lagCss: 0, maxLagCss: 0, speedCssS: 0, strength: 0,
+      gated: false, clamped: false,
+    };
   }
 
   // Fotografa il pennello: lo stroke è deterministico e indipendente
@@ -264,11 +443,12 @@ export class StrokeEngine {
   // t: timeStamp dell'evento (stesso orologio di performance.now()).
   // speedScale: zoom camera, così la velocità è quella fisica del gesto
   // (px CSS/ms) e non dipende da quanto si è zoomati.
+  // direct: input mouse, usa un profilo anti-jitter piu' vincolato.
   /**
    * @param {number} x @param {number} y @param {number} p @param {number} t
-   * @param {Brush} brush @param {number} [seed] @param {number} [speedScale]
+   * @param {Brush} brush @param {number} [seed] @param {number} [speedScale] @param {boolean} [direct]
    */
-  begin(x, y, p, t, brush, seed, speedScale = 1) {
+  begin(x, y, p, t, brush, seed, speedScale = 1, direct = false) {
     const rngSeed = seed !== undefined ? seed >>> 0 : (strokeSeed = (strokeSeed * 1103515245 + 12345) >>> 0);
     const baseR = Math.max(0.5, brush.size * 0.5);
     const eraser = brush.tool === 'eraser';
@@ -279,6 +459,9 @@ export class StrokeEngine {
     const tex = brush.textureOn && brush.texture &&
       (brush.textureDepth > 0.0001 || (brush.textureUseColor && !eraser))
       ? brush.texture : null;
+    let texAngle = ((brush.textureAngle || 0) % 360) * Math.PI / 180;
+    if (texAngle < 0) texAngle += TWO_PI_STROKE;
+    if (texAngle >= TWO_PI_STROKE - 1e-9) texAngle = 0;
 
     const noJitter = !brush.scatter && brush.jitterPos === 0 && brush.jitterSize === 0 &&
       brush.jitterOpacity === 0 && brush.jitterSpacing === 0 &&
@@ -287,7 +470,9 @@ export class StrokeEngine {
     // qualunque sia il dab che lo copre: l'unione wash dei dab resta una
     // catena di capsule anche texturizzata (capsule_tex legge il fattore dai
     // tile). Solo la grana moving (che segue lo stamp) forza la via discreta.
-    const continuous = !brush.buildup && noJitter && brush.roundness >= 0.999 &&
+    // ...e la shape importata forza la via discreta: le capsule sanno
+    // interpolare solo dischi.
+    const continuous = !brush.aquaEnabled && !brush.shape && !brush.buildup && noJitter && brush.roundness >= 0.999 &&
       brush.spacing < CONTINUOUS_THRESHOLD && (!tex || !brush.textureMoving);
 
     // compensazione alpha per il clamp di spacing in buildup
@@ -304,9 +489,17 @@ export class StrokeEngine {
       opacity: brush.opacity,
       hardness: eraser ? Math.min(brush.hardness, 0.95) : brush.hardness,
       roundness: brush.roundness,
+      shape: brush.shape || null,
+      shapeInvert: !!brush.shapeInvert,
       baseAngle: brush.angle * Math.PI / 180,
+      rotation: clamp(brush.rotation || 0, -1, 1),
       spacing: rasterSpacing,
       smoothing: brush.smoothing,
+      direct: !!direct,
+      pressureSize: clamp(brush.pressureSize ?? 0.55, -1, 1),
+      pressureCurveX: clamp(brush.pressureCurveX ?? 0.36, 0.05, 0.95),
+      pressureCurveY: clamp(brush.pressureCurveY ?? 0.68, 0.05, 0.95),
+      stabilizationMode: brush.stabilizationMode === 'rope' ? 'rope' : 'smart',
       scatter: brush.scatter,
       partN: brush.scatter ? Math.max(1, Math.min(12, Math.round(4 * brush.particleDensity / 100))) : 1,
       partSize: Math.max(0.02, brush.particleSize / 100),
@@ -318,6 +511,10 @@ export class StrokeEngine {
       jAngle: brush.jitterAngle,
       jBright: brush.jitterBright,
       jSat: brush.jitterSat,
+      aqua: !!(brush.aquaEnabled && !eraser),
+      aquaColorMix: clamp(brush.aquaColorMix ?? 0, 0, 1),
+      aquaWetness: clamp(brush.aquaWetness ?? 0.5, 0, 1),
+      aquaLighten: !!brush.aquaLighten,
       buildup: brush.buildup,
       alphaCompPow,
       taperStart: clamp(brush.taperStart, 0, 1),
@@ -325,6 +522,9 @@ export class StrokeEngine {
       speedScale,
       tex,
       texScale: clamp(brush.textureScale || 1, 0.05, 16),
+      texAngle,
+      texCos: Math.cos(texAngle),
+      texSin: Math.sin(texAngle),
       texMoving: !!brush.textureMoving,
       texLut: tex ? buildTextureLut(brush.textureDepth, brush.textureContrast,
         brush.textureFloor, brush.textureInvert) : null,
@@ -349,8 +549,12 @@ export class StrokeEngine {
     this.active = true;
     this.dabsEmitted = 0;
     this._sx = x; this._sy = y; this._sp = p;
+    this._rx = x; this._ry = y; this._rt = t;
+    this._svx = 0; this._svy = 0;
+    this._resetMagmaStabilizer(x, y, p);
     this._lx = x; this._ly = y; this._lp = p;
     this._dirX = 1; this._dirY = 0;
+    this._dirA = 0;
     this._moved = 0;
     this._recN = 0;
     this._lemM = -1;
@@ -359,6 +563,10 @@ export class StrokeEngine {
     this._full = false;
     this._segStarted = false;
     this._cqN = 0;
+    this._straightBegin(x, y, p, t);
+    this._setDebug(x, y, x, y, {
+      speedCssS: 0, maxLagCss: 0, gated: false, clamped: false,
+    });
     // misura della velocità: finestra d'inizio + ring di fine
     this._t0 = t;
     this._tipMin = Math.max(2, brush.size * 0.06);
@@ -382,6 +590,11 @@ export class StrokeEngine {
   /** @param {number} x @param {number} y @param {number} p @param {number} t */
   move(x, y, p, t) {
     if (!this.active) return;
+    if (this._snapMode || this._tryActivateSnap(t)) {
+      this._snapSetHandle(x, y, p, t);
+      return;
+    }
+    this._straightTrack(x, y, p, t);
     // misura della velocità sui punti grezzi, filtrati a SW_FILTER px CSS
     // (il jitter sub-pixel della mano non deve sporcare i timestamp)
     const d = Math.hypot(x - this._swX, y - this._swY);
@@ -395,17 +608,128 @@ export class StrokeEngine {
       if (t - this._t0 >= SW_MS || this._swN > SW_PTS) this._closeWindow();
       return;
     }
-    this._moveBody(x, y, p);
+    this._moveBody(x, y, p, t);
   }
 
-  // Smoother: il punto stabilizzato insegue il punto grezzo
-  /** @param {number} x @param {number} y @param {number} p */
-  _moveBody(x, y, p) {
-    const k = lerp(1, 0.06, Math.sqrt(this.snap.smoothing));
-    this._sx += (x - this._sx) * k;
-    this._sy += (y - this._sy) * k;
-    this._sp += (p - this._sp) * k;
+  // Slider Stabilization 0..100: moving average esponenziale in stile Magma.
+  // Ogni punto della catena insegue il precedente; si disegna l'ultimo.
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _moveBody(x, y, p, t) {
+    const strength = clamp(this.snap.smoothing, 0, 1);
+    const amount = Math.sqrt(strength);
+    if (strength <= 0.0001) {
+      this._sx = x; this._sy = y; this._sp = p;
+      this._rx = x; this._ry = y; this._rt = t;
+      this._setDebug(x, y, x, y, {
+        speedCssS: 0, maxLagCss: 0, gated: false, clamped: false,
+      });
+      this._pushPoint(x, y, p);
+      return 0;
+    }
+    if (this.snap.stabilizationMode === 'rope') {
+      return this._moveBodyRope(x, y, p, t, amount);
+    }
+
+    const scale = Math.max(0.001, this.snap.speedScale);
+    const dt = clamp(t - this._rt || 16, 1, 64);
+    const rawDx = x - this._rx, rawDy = y - this._ry;
+    const rawSpeedCssS = Math.hypot(rawDx / dt, rawDy / dt) * scale * 1000;
+    this._rx = x; this._ry = y; this._rt = t;
+
+    const dist = this._advanceMagmaStabilizer(x, y, p);
+    const lagCss = Math.hypot((x - this._sx) * scale, (y - this._sy) * scale);
+    this._setDebug(x, y, this._sx, this._sy, {
+      speedCssS: rawSpeedCssS, maxLagCss: lagCss, gated: dist <= 1, clamped: false,
+    });
     this._pushPoint(this._sx, this._sy, this._sp);
+    return dist;
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t @param {number} amount */
+  _moveBodyRope(x, y, p, t, amount) {
+    const scale = Math.max(0.001, this.snap.speedScale);
+    const dt = clamp(t - this._rt || 16, 1, 64);
+    const vx = (x - this._rx) / dt, vy = (y - this._ry) / dt;
+    const rawSpeedCssS = Math.hypot(vx, vy) * scale * 1000;
+    this._rx = x; this._ry = y; this._rt = t;
+
+    const radiusCss = lerp(0.25, this.snap.direct ? ROPE_MOUSE_RADIUS_CSS : ROPE_PEN_RADIUS_CSS, amount);
+    const radius = radiusCss / scale;
+    const dx = x - this._sx, dy = y - this._sy;
+    const dist = Math.hypot(dx, dy);
+    if (dist > radius) {
+      const keep = radius / dist;
+      this._sx = x - dx * keep;
+      this._sy = y - dy * keep;
+    }
+    const pa = filterAlpha(18, dt);
+    this._sp += (p - this._sp) * pa;
+    this._setDebug(x, y, this._sx, this._sy, {
+      speedCssS: rawSpeedCssS, maxLagCss: radiusCss, gated: dist <= radius, clamped: dist > radius,
+    });
+    this._pushPoint(this._sx, this._sy, this._sp);
+    return dist;
+  }
+
+  /** @param {number} x @param {number} y @param {number} p */
+  _resetMagmaStabilizer(x, y, p) {
+    const strength = clamp(this.snap.smoothing, 0, 1);
+    if (strength <= 0.0001) {
+      this._stabBuf.length = 0;
+      this._stabAlpha = 1;
+      return;
+    }
+    const v = clamp(strength, MAGMA_STAB_IN_MIN, 1);
+    const r = MAGMA_STAB_R_MIN +
+      (MAGMA_STAB_R_MAX - MAGMA_STAB_R_MIN) * ((v - MAGMA_STAB_IN_MIN) / (1 - MAGMA_STAB_IN_MIN));
+    const n = Math.max(1, Math.ceil(r / 4 - 1e-9));
+    this._stabAlpha = 1 - clamp(r / 100, 0, 0.95);
+    for (let i = 0; i < n; i++) {
+      let pt = this._stabBuf[i];
+      if (!pt) pt = this._stabBuf[i] = { x, y, p };
+      pt.x = x; pt.y = y; pt.p = p;
+    }
+    this._stabBuf.length = n;
+  }
+
+  /** @param {number} x @param {number} y @param {number} p */
+  _advanceMagmaStabilizer(x, y, p) {
+    const b = this._stabBuf;
+    if (b.length === 0) {
+      this._sx = x; this._sy = y; this._sp = p;
+      return 0;
+    }
+    b[0].x = x; b[0].y = y; b[0].p = p;
+    let total = 0;
+    const a = this._stabAlpha;
+    for (let i = 1; i < b.length; i++) {
+      const curr = b[i], prev = b[i - 1];
+      const dx = prev.x - curr.x;
+      const dy = prev.y - curr.y;
+      const dp = prev.p - curr.p;
+      total += Math.abs(dx) + Math.abs(dy);
+      curr.x += dx * a;
+      curr.y += dy * a;
+      curr.p += dp * a;
+    }
+    const last = b[b.length - 1];
+    this._sx = last.x; this._sy = last.y; this._sp = last.p;
+    return total;
+  }
+
+  /** @param {number} rawX @param {number} rawY @param {number} outX @param {number} outY @param {{speedCssS:number, maxLagCss:number, gated:boolean, clamped:boolean}} meta */
+  _setDebug(rawX, rawY, outX, outY, meta) {
+    const scale = this.snap ? Math.max(0.001, this.snap.speedScale) : 1;
+    const d = this.debug;
+    d.active = !!this.active;
+    d.mode = this.snap ? (this.snap.stabilizationMode === 'rope' ? 'rope' : 'magma') : 'magma';
+    d.rawX = rawX; d.rawY = rawY; d.outX = outX; d.outY = outY;
+    d.lagCss = Math.hypot(rawX - outX, rawY - outY) * scale;
+    d.maxLagCss = meta.maxLagCss;
+    d.speedCssS = meta.speedCssS;
+    d.strength = this.snap ? clamp(this.snap.smoothing, 0, 1) : 0;
+    d.gated = meta.gated;
+    d.clamped = meta.clamped;
   }
 
   // Chiude la finestra di velocità d'inizio: congela lunghezza e rapporto
@@ -421,7 +745,7 @@ export class StrokeEngine {
     this._held = false;
     const hw = this._hw;
     this._emitFirst(hw[0], hw[1], hw[2]);
-    for (let i = 4; i < hw.length; i += 4) this._moveBody(hw[i], hw[i + 1], hw[i + 2]);
+    for (let i = 4; i < hw.length; i += 4) this._moveBody(hw[i], hw[i + 1], hw[i + 2], hw[i + 3]);
     hw.length = 0;
   }
 
@@ -443,6 +767,7 @@ export class StrokeEngine {
   /** @param {number} now */
   tick(now) {
     if (this.active && this._held && now - this._t0 >= SW_MS) this._closeWindow();
+    if (this.active) this._tryActivateSnap(now);
   }
 
   // Catch-up: a fine tratto lo stabilizzatore raggiunge il punto grezzo;
@@ -451,17 +776,26 @@ export class StrokeEngine {
   end(x, y, p, t) {
     if (!this.active) return;
     if (this._held) this._closeWindow();
-    if (this.snap.smoothing > 0) {
-      const steps = 6;
-      for (let i = 1; i <= steps; i++) {
-        const f = i / steps;
-        this._pushPoint(lerp(this._sx, x, f), lerp(this._sy, y, f), lerp(this._sp, p, f));
+    if (this._snapMode || this._tryActivateSnap(t)) {
+      this._snapSetHandle(x, y, p, t);
+      this.active = false;
+      this.debug.active = false;
+      this.endPassNeeded = false;
+      return;
+    }
+    let dist = this._moveBody(x, y, p, t) || 0;
+    if (this.snap.smoothing > 0 && this.snap.stabilizationMode !== 'rope') {
+      while (dist > 1) {
+        dist = this._advanceMagmaStabilizer(x, y, p);
+        this._pushPoint(this._sx, this._sy, this._sp);
       }
-    } else {
+    } else if (this.snap.smoothing > 0 && Math.hypot(this._sx - x, this._sy - y) > 0.05) {
+      this._sx = x; this._sy = y; this._sp = p;
       this._pushPoint(x, y, p);
     }
     this._flushCurve();
     this.active = false;
+    this.debug.active = false;
 
     // serve il pass finale? (il chiamante fa drop dei chunk della punta —
     // o di tutto il buffer se _full — e poi replay())
@@ -494,6 +828,306 @@ export class StrokeEngine {
   cancel() {
     this.active = false; this._held = false; this._hw.length = 0;
     this._cqN = 0; this._recN = 0; this.endPassNeeded = false;
+    this._snapMode = false; this._snapDirty = false; this._straightN = 0;
+    this.debug.active = false;
+  }
+
+  get snapMode() { return this._snapMode; }
+  get snapDirty() { return this._snapDirty; }
+  get snapKind() { return this._snapKind; }
+  get straightMode() { return this._snapMode; }
+  get straightDirty() { return this._snapDirty; }
+
+  // Accoda la geometria perfetta corrente nel DabQueue. Il chiamante svuota
+  // prima la preview live, cosi' spostare la maniglia costa un rerender/frame.
+  emitSnap() {
+    const s = this.snap;
+    if (!s || !this._snapMode) return false;
+    if (this._snapKind === 'ellipse' || this._snapKind === 'circle') {
+      return this._emitEllipseSnap();
+    }
+    return this._emitLineSnap();
+  }
+
+  emitStraight() { return this.emitSnap(); }
+
+  _emitLineSnap() {
+    const s = this.snap;
+    const dx = this._straightEX - this._straightSX;
+    const dy = this._straightEY - this._straightSY;
+    if (dx * dx + dy * dy > 0.0001) this._setDir(Math.atan2(dy, dx));
+    const len = Math.hypot(dx, dy);
+    const hasTaper = s.taperStart < 1 || s.taperEnd < 1;
+    if (!hasTaper || len < 0.05) {
+      const r0 = Math.max(0, s.baseR * this._pressMult(this._straightSP));
+      const r1 = Math.max(0, s.baseR * this._pressMult(this._straightEP));
+      this.q.push(T_SEG, this._straightSX, this._straightSY, r0, 1,
+        this._straightEX, this._straightEY, r1, 1, 0);
+      this.dabsEmitted++;
+    } else {
+      let la = s.taperStart < 1 ? Math.min(Math.max(this._tipMin, s.baseR * 1.5), TIP_MAX_FRAC * len) : 0;
+      let lb = s.taperEnd < 1 ? Math.min(Math.max(this._tipMin, s.baseR * 1.5), TIP_MAX_FRAC * len) : 0;
+      if (la + lb > TIP_SUM_FRAC * len) {
+        const k = TIP_SUM_FRAC * len / (la + lb);
+        la *= k; lb *= k;
+      }
+      const th0 = s.taperStart < 1 ? tipRatio(s.taperStart, 0) : 1;
+      const th1 = s.taperEnd < 1 ? tipRatio(s.taperEnd, 0) : 1;
+      const steps = Math.max(2, Math.min(160, Math.ceil(len / Math.max(2, s.baseR * 0.35))));
+      let px = this._straightSX, py = this._straightSY;
+      let pm = this._pressMult(this._straightSP) * tipFactor(0, la, th0) * tipFactor(len, lb, th1);
+      let pr = s.baseR * pm;
+      for (let i = 1; i <= steps; i++) {
+        const f = i / steps;
+        const d = len * f;
+        const x = this._straightSX + dx * f;
+        const y = this._straightSY + dy * f;
+        const press = this._pressMult(lerp(this._straightSP, this._straightEP, f));
+        const m = press * tipFactor(d, la, th0) * tipFactor(len - d, lb, th1);
+        const r = s.baseR * m;
+        if (pr >= MIN_R_PX || r >= MIN_R_PX) {
+          this.q.push(T_SEG, px, py, pr < MIN_R_PX ? 0 : pr, 1, x, y, r < MIN_R_PX ? 0 : r, 1, 0);
+          this.dabsEmitted++;
+        }
+        px = x; py = y; pr = r;
+      }
+    }
+    this._snapDirty = false;
+    return true;
+  }
+
+  _emitEllipseSnap() {
+    const s = this.snap;
+    const rx = this._snapRx, ry = this._snapRy;
+    if (rx < 0.5 || ry < 0.5) return false;
+    const h = Math.pow(rx - ry, 2) / Math.pow(rx + ry, 2);
+    const circumference = Math.PI * (rx + ry) * (1 + 3 * h / (10 + Math.sqrt(4 - 3 * h)));
+    const n = Math.max(28, Math.min(256, Math.ceil(circumference / Math.max(4, s.baseR))));
+    const ux = this._snapUx, uy = this._snapUy, vx = this._snapVx, vy = this._snapVy;
+    let px = this._snapCx + ux * rx;
+    let py = this._snapCy + uy * rx;
+    const m = this._pressMult((this._straightSP + this._straightEP) * 0.5);
+    const r = Math.max(0.25, s.baseR * m);
+    for (let i = 1; i <= n; i++) {
+      const a = i * TWO_PI_STROKE / n;
+      const ca = Math.cos(a), sa = Math.sin(a);
+      const x = this._snapCx + ux * rx * ca + vx * ry * sa;
+      const y = this._snapCy + uy * rx * ca + vy * ry * sa;
+      this.q.push(T_SEG, px, py, r, 1, x, y, r, 1, 0);
+      px = x; py = y;
+    }
+    this.dabsEmitted += n;
+    this._snapDirty = false;
+    return true;
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _straightBegin(x, y, p, t) {
+    this._snapMode = false;
+    this._snapKind = '';
+    this._snapDirty = false;
+    this._snapEligible = !!this.snap.continuous;
+    this._straightSX = x; this._straightSY = y; this._straightSP = p; this._straightST = t;
+    this._straightEX = x; this._straightEY = y; this._straightEP = p; this._straightET = t;
+    this._straightLastX = x; this._straightLastY = y;
+    this._straightStillX = x; this._straightStillY = y; this._straightStillT = t;
+    this._straightPath = 0;
+    this._straightN = 0;
+    this._straightPush(x, y);
+    this._snapCx = x; this._snapCy = y; this._snapRx = 0; this._snapRy = 0; this._snapAngle = 0;
+    this._snapUx = 1; this._snapUy = 0; this._snapVx = 0; this._snapVy = 1;
+  }
+
+  /** @param {number} x @param {number} y */
+  _straightPush(x, y) {
+    if (this._straightN === this._straightCap) {
+      const nx = new Float64Array(this._straightCap * 2);
+      const ny = new Float64Array(this._straightCap * 2);
+      nx.set(this._straightX); ny.set(this._straightY);
+      this._straightX = nx; this._straightY = ny; this._straightCap *= 2;
+    }
+    this._straightX[this._straightN] = x;
+    this._straightY[this._straightN] = y;
+    this._straightN++;
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _straightTrack(x, y, p, t) {
+    const invScale = 1 / Math.max(0.001, this.snap.speedScale);
+    const sample = SNAP_SAMPLE_CSS * invScale;
+    const still = SNAP_STILL_CSS * invScale;
+    this._straightEX = x; this._straightEY = y; this._straightEP = p; this._straightET = t;
+    const dx = x - this._straightLastX, dy = y - this._straightLastY;
+    const d = Math.hypot(dx, dy);
+    if (d >= sample) {
+      this._straightPath += d;
+      this._straightLastX = x; this._straightLastY = y;
+      this._straightPush(x, y);
+    }
+    const sx = x - this._straightStillX, sy = y - this._straightStillY;
+    if (sx * sx + sy * sy >= still * still) {
+      this._straightStillX = x; this._straightStillY = y; this._straightStillT = t;
+    }
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _snapSetHandle(x, y, p, t) {
+    if (this._snapKind === 'ellipse' || this._snapKind === 'circle') {
+      this._ellipseSetHandle(x, y, p, t);
+      return;
+    }
+    this._straightSetEnd(x, y, p, t);
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _straightSetEnd(x, y, p, t) {
+    const dx = x - this._straightEX, dy = y - this._straightEY;
+    this._straightEX = x; this._straightEY = y; this._straightEP = p; this._straightET = t;
+    if (dx * dx + dy * dy > 0.0001) this._snapDirty = true;
+  }
+
+  /** @param {number} x @param {number} y @param {number} p @param {number} t */
+  _ellipseSetHandle(x, y, p, t) {
+    const dx = x - this._straightEX, dy = y - this._straightEY;
+    this._straightEX = x; this._straightEY = y; this._straightEP = p; this._straightET = t;
+    const invScale = 1 / Math.max(0.001, this.snap.speedScale);
+    const minMove = SNAP_STILL_CSS * invScale;
+    if (dx * dx + dy * dy < minMove * minMove) return;
+    const hx = x - this._snapCx, hy = y - this._snapCy;
+    const minR = Math.max(ELLIPSE_MIN_CSS * invScale * 0.35, this.snap.baseR * 1.2);
+    if (this._snapKind === 'circle') {
+      const r = Math.max(minR, Math.hypot(hx, hy));
+      this._snapRx = r; this._snapRy = r;
+      this._snapDirty = true;
+      return;
+    }
+    const u = Math.abs(hx * this._snapUx + hy * this._snapUy) / Math.max(1, this._snapRx);
+    const v = Math.abs(hx * this._snapVx + hy * this._snapVy) / Math.max(1, this._snapRy);
+    const scale = Math.max(0.15, Math.hypot(u, v));
+    this._snapRx = Math.max(minR, this._snapRx * scale);
+    this._snapRy = Math.max(minR, this._snapRy * scale);
+    this._snapDirty = true;
+  }
+
+  /** @param {number} now */
+  _tryActivateSnap(now) {
+    if (!this._snapEligible || this._snapMode || !this.active) return false;
+    if (now - this._straightStillT < SNAP_HOLD_MS) return false;
+    if (this._straightLooksLinear()) {
+      this._snapKind = 'line';
+      this._snapMode = true;
+      this._snapDirty = true;
+      this.endPassNeeded = false;
+      return true;
+    }
+    const ellipse = this._looksLikeEllipse();
+    if (!ellipse) return false;
+    this._snapKind = ellipse.kind;
+    this._snapCx = ellipse.cx; this._snapCy = ellipse.cy;
+    this._snapRx = ellipse.rx; this._snapRy = ellipse.ry; this._snapAngle = ellipse.angle;
+    this._snapUx = Math.cos(ellipse.angle); this._snapUy = Math.sin(ellipse.angle);
+    this._snapVx = -this._snapUy; this._snapVy = this._snapUx;
+    this._snapMode = true;
+    this._snapDirty = true;
+    this.endPassNeeded = false;
+    return true;
+  }
+
+  _straightLooksLinear() {
+    const s = this.snap;
+    if (!s || this._straightN < 2) return false;
+    const dx = this._straightEX - this._straightSX;
+    const dy = this._straightEY - this._straightSY;
+    const chord = Math.hypot(dx, dy);
+    const invScale = 1 / Math.max(0.001, s.speedScale);
+    const minLen = Math.max(LINE_MIN_CSS * invScale, s.baseR * 1.5);
+    if (chord < minLen) return false;
+    const tol = Math.max(LINE_DEV_CSS * invScale, s.baseR * LINE_DEV_BRUSH);
+    const maxPath = chord + Math.max(tol * 2, chord * (LINE_PATH_RATIO - 1));
+    if (this._straightPath > maxPath) return false;
+    const invChord = 1 / chord;
+    let maxDev = 0;
+    for (let i = 1; i < this._straightN - 1; i++) {
+      const px = this._straightX[i] - this._straightSX;
+      const py = this._straightY[i] - this._straightSY;
+      const dev = Math.abs(px * dy - py * dx) * invChord;
+      if (dev > maxDev) maxDev = dev;
+      if (maxDev > tol) return false;
+    }
+    return true;
+  }
+
+  _looksLikeEllipse() {
+    const s = this.snap;
+    if (!s || this._straightN < 10) return null;
+    const invScale = 1 / Math.max(0.001, s.speedScale);
+    const closeD = Math.hypot(this._straightEX - this._straightSX, this._straightEY - this._straightSY);
+
+    let sx = 0, sy = 0;
+    const n = this._straightN;
+    for (let i = 0; i < n; i++) { sx += this._straightX[i]; sy += this._straightY[i]; }
+    const mx = sx / n, my = sy / n;
+    let cxx = 0, cxy = 0, cyy = 0;
+    for (let i = 0; i < n; i++) {
+      const x = this._straightX[i] - mx, y = this._straightY[i] - my;
+      cxx += x * x; cxy += x * y; cyy += y * y;
+    }
+    const angle0 = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+    let ux = Math.cos(angle0), uy = Math.sin(angle0);
+    let vx = -uy, vy = ux;
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const x = this._straightX[i] - mx, y = this._straightY[i] - my;
+      const u = x * ux + y * uy, v = x * vx + y * vy;
+      if (u < minU) minU = u; if (u > maxU) maxU = u;
+      if (v < minV) minV = v; if (v > maxV) maxV = v;
+    }
+    let rx = (maxU - minU) * 0.5;
+    let ry = (maxV - minV) * 0.5;
+    let cx = mx + ux * ((minU + maxU) * 0.5) + vx * ((minV + maxV) * 0.5);
+    let cy = my + uy * ((minU + maxU) * 0.5) + vy * ((minV + maxV) * 0.5);
+    let angle = angle0;
+    if (ry > rx) {
+      const tr = rx; rx = ry; ry = tr;
+      angle += Math.PI * 0.5;
+      ux = Math.cos(angle); uy = Math.sin(angle);
+      vx = -uy; vy = ux;
+    }
+
+    const minR = Math.max(ELLIPSE_MIN_CSS * invScale, s.baseR * 1.4);
+    if (rx < minR || ry < minR) return null;
+    const ratio = ry / rx;
+    if (ratio < ELLIPSE_MIN_RATIO) return null;
+    const closeLimit = Math.max(ELLIPSE_CLOSE_CSS * invScale, ry * 0.65, rx * 0.18);
+    if (closeD > closeLimit) return null;
+
+    let errSum = 0, errMax = 0, sweep = 0, prevA = 0;
+    for (let i = 0; i < n; i++) {
+      const x = this._straightX[i] - cx, y = this._straightY[i] - cy;
+      const u = x * ux + y * uy, v = x * vx + y * vy;
+      const rr = Math.sqrt((u / rx) * (u / rx) + (v / ry) * (v / ry));
+      const err = Math.abs(rr - 1);
+      errSum += err;
+      if (err > errMax) errMax = err;
+      const a = Math.atan2(v / ry, u / rx);
+      if (i > 0) {
+        let d = a - prevA;
+        if (d > Math.PI || d < -Math.PI) d -= Math.round(d / TWO_PI_STROKE) * TWO_PI_STROKE;
+        sweep += Math.abs(d);
+      }
+      prevA = a;
+    }
+    const errMean = errSum / n;
+    if (sweep < ELLIPSE_MIN_SWEEP || errMean > ELLIPSE_RADIAL_ERR || errMax > ELLIPSE_MAX_ERR) return null;
+    const h = Math.pow(rx - ry, 2) / Math.pow(rx + ry, 2);
+    const circumference = Math.PI * (rx + ry) * (1 + 3 * h / (10 + Math.sqrt(4 - 3 * h)));
+    if (this._straightPath < circumference * 0.45 || this._straightPath > circumference * 1.9) return null;
+
+    if (ratio >= CIRCLE_RATIO) {
+      const r = (rx + ry) * 0.5;
+      return { kind: 'circle', cx, cy, rx: r, ry: r, angle: 0 };
+    }
+    return { kind: 'ellipse', cx, cy, rx, ry, angle };
   }
 
   // ---- misura della velocità agli estremi ----
@@ -568,10 +1202,11 @@ export class StrokeEngine {
     }
 
     // corpo: dab registrati fino al confine della punta, identici al live
-    // (i burn tengono allineato lo stream del seed; la coda ricampionata
-    // può divergere senza conseguenze)
+    // (i burn tengono allineato lo stream del seed, la direzione registrata
+    // la rotazione; la coda ricampionata può divergere senza conseguenze)
     const bodyEnd = D - lb;
     let cum = 0;
+    this._dirA = r[5];
     this._emitNow(r[0], r[1], r[2]);
     if (burnGap && r[4]) s.rng();
     let i = 1;
@@ -580,6 +1215,7 @@ export class StrokeEngine {
       const seg = Math.hypot(r[o] - r[o - REC_STRIDE], r[o + 1] - r[o - REC_STRIDE + 1]);
       if (cum + seg > bodyEnd) break;
       cum += seg;
+      this._dirA = r[o + 5];
       this._emitNow(r[o], r[o + 1], r[o + 2]);
       if (burnGap && r[o + 4]) s.rng();
     }
@@ -603,6 +1239,7 @@ export class StrokeEngine {
     const o0 = (i0 - 1) * REC_STRIDE;
     let wx = r[o0], wy = r[o0 + 1], wm = r[o0 + 3];
     let ex = wx, ey = wy, em = wm * cone(cum); // ultima emissione
+    this._dirA = r[o0 + 5]; // direzione registrata: l'unwrap riparte da lì
     /** @type {(x: number, y: number, m: number) => void} */
     const emit = (x, y, m) => {
       const dr = Math.abs(s.baseR * (m - em));
@@ -627,6 +1264,7 @@ export class StrokeEngine {
       const o = i * REC_STRIDE;
       const nx = r[o], ny = r[o + 1], nm = r[o + 3];
       const seg = Math.hypot(nx - wx, ny - wy);
+      if (seg > 0.0001) this._setDir(Math.atan2(ny - wy, nx - wx));
       let travelled = 0;
       while (gapLeft <= seg - travelled) {
         travelled += gapLeft;
@@ -656,8 +1294,9 @@ export class StrokeEngine {
     if (!s || n === 0 || this._full) return null;
     // ingombro massimo di un'emissione oltre il centro: nuvola scatter
     // (offset + raggio particella), jitter di posizione, bordo morbido dello
-    // stamp e arrotondamenti
-    const spreadK = 1 + 2 * s.jPos + (s.scatter ? s.partSize : 0);
+    // stamp e arrotondamenti; il riquadro di una shape ruotata arriva a r·√2
+    const spreadK = (1 + 2 * s.jPos + (s.scatter ? s.partSize : 0)) *
+      (s.shape ? 1.4143 : 1);
     const pad = s.jPos * s.diam + 3;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     /** @type {(x: number, y: number, m: number) => void} */
@@ -749,12 +1388,24 @@ export class StrokeEngine {
     this._advance(p2.x, p2.y, p2.p);
   }
 
+  // Aggiorna l'angolo di direzione mantenendolo CONTINUO: si somma il delta
+  // più corto verso il nuovo atan2 — con la rotazione parziale l'orientamento
+  // non salta quando la direzione attraversa ±π (e su una spirale lo stamp
+  // continua a girare, com'è giusto).
+  /** @param {number} a angolo atan2 della nuova direzione */
+  _setDir(a) {
+    let d = a - this._dirA;
+    if (d > Math.PI || d < -Math.PI) d -= Math.round(d / TWO_PI_STROKE) * TWO_PI_STROKE;
+    this._dirA += d;
+  }
+
   /** @param {number} x @param {number} y @param {number} p */
   _advance(x, y, p) {
     const dx = x - this._lx, dy = y - this._ly;
     const dist = Math.sqrt(dx * dx + dy * dy);
     if (dist < 0.05) { this._lp = p; return; }
     this._dirX = dx / dist; this._dirY = dy / dist;
+    this._setDir(Math.atan2(dy, dx));
     this._moved += dist;
 
     if (this.snap.continuous) {
@@ -790,12 +1441,13 @@ export class StrokeEngine {
     return tipFactor(s, this._la, this._th0);
   }
 
-  // Moltiplicatore di pressione (reale solo dalla penna: mouse e tocco
-  // arrivano a 1 da input.js — con la penna le estremità si assottigliano
-  // anche per la rampa di pressione al pen-down/lift-off).
+  // Moltiplicatore di pressione: mouse e tocco arrivano a 1 da input.js,
+  // la penna passa invece dalla curva Stylus e da Size Pressure.
   /** @param {number} p */
   _pressMult(p) {
-    return p < 1 ? Math.pow(Math.max(0.02, p), 1.5) : 1;
+    const s = this.snap;
+    if (!s || s.direct || p >= 0.999) return 1;
+    return Math.max(0.02, pressureSizeFactor(p, s.pressureSize, s.pressureCurveX, s.pressureCurveY));
   }
 
   // ---- registro + emissione ----
@@ -807,21 +1459,23 @@ export class StrokeEngine {
   // raggio di più di MAX_R_STEP_PX rispetto all'emissione precedente, si
   // inseriscono dab intermedi interpolati (registrati anche loro: il replay
   // del corpo resta identico al live) — il bordo non fa gradini. La via
-  // continua non ne ha bisogno (le capsule interpolano il raggio).
+  // continua suddivide invece i segmenti al momento di accodarli, così anche
+  // il replay della punta finale chiude senza cap circolari.
   /** @param {number} x @param {number} y @param {number} m @param {number} mP @param {boolean} burn */
   _emitLive(x, y, m, mP, burn) {
     if (!this.snap.continuous && this._moved >= 1 && this._lemM >= 0) {
       const s = this.snap;
-      const dr = Math.abs(s.baseR * (m - this._lemM));
+      const prevX = this._lemX, prevY = this._lemY, prevM = this._lemM, prevP = this._lemP;
+      const dr = Math.abs(s.baseR * (m - prevM));
       if (dr > MAX_R_STEP_PX) {
-        const dist = Math.hypot(x - this._lemX, y - this._lemY);
-        const rSum = Math.max(0.25, s.baseR * this._lemM) + Math.max(0.25, s.baseR * m);
+        const dist = Math.hypot(x - prevX, y - prevY);
+        const rSum = Math.max(0.25, s.baseR * prevM) + Math.max(0.25, s.baseR * m);
         if (dist < rSum * SUBDIV_OVERLAP) {
           const n = Math.min(64, Math.ceil(dr / MAX_R_STEP_PX));
           for (let k = 1; k < n; k++) {
             const f = k / n;
-            this._emitRec(lerp(this._lemX, x, f), lerp(this._lemY, y, f),
-              lerp(this._lemM, m, f), lerp(this._lemP, mP, f), false);
+            this._emitRec(lerp(prevX, x, f), lerp(prevY, y, f),
+              lerp(prevM, m, f), lerp(prevP, mP, f), false);
           }
         }
       }
@@ -839,6 +1493,7 @@ export class StrokeEngine {
       }
       const o = this._recN * REC_STRIDE, r = this._rec;
       r[o] = x; r[o + 1] = y; r[o + 2] = m; r[o + 3] = mP; r[o + 4] = burn ? 1 : 0;
+      r[o + 5] = this._dirA;
       this._recN++;
     }
     this._lemX = x; this._lemY = y; this._lemM = m; this._lemP = mP;
@@ -851,15 +1506,21 @@ export class StrokeEngine {
   _emitNow(x, y, m) {
     const s = this.snap;
     if (s.continuous) {
-      const r = Math.max(0.25, s.baseR * m);
+      const rawR = s.baseR * m;
+      const r = rawR < MIN_R_PX ? 0 : rawR;
       if (this._segStarted) {
-        this.q.push(T_SEG, this._fx, this._fy, this._fr, 1, x, y, r, 1, 0);
-      } else {
-        this.q.push(T_SEG, x, y, r, 1, x, y, r, 1, 0);
-        this._segStarted = true;
+        const dr = Math.abs(r - this._fr);
+        if (dr > MAX_R_STEP_PX) {
+          const sx = this._fx, sy = this._fy, sr = this._fr;
+          const n = Math.min(128, Math.ceil(dr / MAX_R_STEP_PX));
+          for (let k = 1; k <= n; k++) {
+            const f = k / n;
+            this._emitContinuousNode(lerp(sx, x, f), lerp(sy, y, f), lerp(sr, r, f));
+          }
+          return;
+        }
       }
-      this._fx = x; this._fy = y; this._fr = r;
-      this.dabsEmitted++;
+      this._emitContinuousNode(x, y, r);
     } else {
       // punta vera: sotto MIN_R_PX di raggio il dab non si stampa (il clamp
       // a 0.25 px lo renderebbe un puntino visibile dove il cono è a zero)
@@ -881,6 +1542,23 @@ export class StrokeEngine {
       this._enX = x; this._enY = y; this._enValid = true;
       this._emitDab(x, y, m, aPow);
     }
+  }
+
+  /** @param {number} x @param {number} y @param {number} r */
+  _emitContinuousNode(x, y, r) {
+    if (this._segStarted) {
+      if (this._fr > 0 || r > 0) {
+        this.q.push(T_SEG, this._fx, this._fy, this._fr, 1, x, y, r, 1, 0);
+        this.dabsEmitted++;
+      }
+    } else {
+      if (r > 0) {
+        this.q.push(T_SEG, x, y, r, 1, x, y, r, 1, 0);
+        this.dabsEmitted++;
+      }
+      this._segStarted = true;
+    }
+    this._fx = x; this._fy = y; this._fr = r;
   }
 
   /** @param {number} r */
@@ -945,6 +1623,9 @@ export class StrokeEngine {
       }
 
       let angle = s.baseAngle;
+      // rotazione "segue il tratto": quota della direzione corrente (angolo
+      // unwrappato — live, replay e resample lo tengono allineato)
+      if (s.rotation !== 0) angle += s.rotation * this._dirA;
       if (s.jAngle > 0) angle += (rng() * 2 - 1) * Math.PI * s.jAngle;
 
       let cr = s.colR, cg = s.colG, cb = s.colB;

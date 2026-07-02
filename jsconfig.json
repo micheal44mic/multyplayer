@@ -1,9 +1,9 @@
 {
-  // Type-checking zero-build: VS Code legge questo file e controlla i .js
-  // così come sono (JSDoc = annotazioni). Verifica da terminale:
+  // Zero-build type checking: VS Code reads this file and checks .js files
+  // as they are (JSDoc = annotations). Verify from the terminal with:
   //   npx tsc -p jsconfig.json
-  // Niente strictNullChecks: i pattern pool/null del codice richiederebbero
-  // cast ovunque; noImplicitAny è la rete di sicurezza sui parametri.
+  // No strictNullChecks: the code's pool/null patterns would require casts
+  // everywhere. noImplicitAny is the safety net for parameters.
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",

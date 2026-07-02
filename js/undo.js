@@ -33,8 +33,15 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * op 'move' (sposta da from a to; undo = inverso),
  * op 'replace' (rasterizza testo: l'entry POSSIEDE il livello sostituito,
  * layerId è quello vivo in lista; undo = scambiarli di nuovo),
+ * op 'swap' (sostituisce un gruppo di livelli con un altro: l'entry POSSIEDE
+ * insertLayers; undo/redo scambiano i gruppi in modo atomico),
  * op 'textform' (item del testo spostato/scalato: posizione e corpo
- * prima (x0,y0,s0) e dopo (x1,y1,s1); undo = rimettere i "prima").
+ * prima (x0,y0,s0) e dopo (x1,y1,s1); undo = rimettere i "prima"),
+ * op 'svgform' (matrice affine di un SVG importato: m0 prima, m1 dopo),
+ * op 'svgitem' (contenuto/style SVG prima e dopo),
+ * op 'clip' (maschera di ritaglio: v è il valore impostato; undo = rimettere
+ * il precedente),
+ * op 'mode' (metodo di fusione: m0 prima, m1 dopo; undo = rimettere m0).
  * move: i pixel del livello layerId sono stati traslati di dx/dy; undo =
  * traslare all'indietro e ripristinare i chunks (stati "prima" dei chunk
  * che hanno perso pixel nel clip al board — la traslazione è lossless,
@@ -46,17 +53,31 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * @property {boolean} compressed
  * @property {Promise<any>} ready
  * @property {number} [layerId] stroke/move: livello di destinazione; replace: livello vivo
- * @property {'attach'|'detach'|'move'|'replace'|'textform'} [op]
+ * @property {'attach'|'detach'|'move'|'replace'|'swap'|'textform'|'svgform'|'svgitem'|'clip'|'mode'} [op]
  * @property {Layer} [layer] solo op 'detach'/'replace'
+ * @property {Layer[]} [insertLayers] solo op 'swap'
+ * @property {number[]} [removeIds] solo op 'swap'
+ * @property {number} [activeId] solo op 'swap': livello attivo dopo lo swap
  * @property {number} [index] solo op 'attach'/'detach'
  * @property {number} [from] solo op 'move'
  * @property {number} [to]
  * @property {number} [dx] kind 'move'
  * @property {number} [dy]
+ * @property {boolean} [wrap] kind 'move': traslazione toroidale dentro il board
  * @property {number} [x0] op 'textform': item prima/dopo
  * @property {number} [y0] @property {number} [s0]
  * @property {number} [x1] @property {number} [y1] @property {number} [s1]
+ * @property {[number, number, number, number, number, number]} [tm0] op 'svgform'
+ * @property {[number, number, number, number, number, number]} [tm1]
+ * @property {import('./svg_layer.js').SvgItem} [si0] op 'svgitem'
+ * @property {import('./svg_layer.js').SvgItem} [si1]
+ * @property {boolean} [v] op 'clip': valore impostato del flag
+ * @property {string} [m0] op 'mode': metodo prima/dopo
+ * @property {string} [m1]
  * @property {number} [boardId] struct: canvas di appartenenza dell'operazione
+ * @property {string} [cid] collaborazione: id dell'op ('uid:n') — l'undo
+ *   mirato (undoCid) trova l'entry per id ovunque sia nello stack; il
+ *   counter EREDITA il cid, così il round-trip undo↔redo resta aggangiato
  */
 
 /**
@@ -69,15 +90,27 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * @property {(c: Chunk) => void} disposeTex
  * @property {(layer: Layer, index: number, boardId: number) => void} attachLayer
  * @property {(layerId: number) => {layer: Layer, index: number, boardId: number}|null} detachLayer
+ * @property {(boardId: number, removeIds: number[], insertLayers: Layer[], index: number, activeId: number) => {removedLayers: Layer[], index: number, boardId: number, prevActiveId: number}|null} swapLayers
  * @property {(from: number, to: number, boardId: number) => void} moveLayer
- * @property {(layerId: number, dx: number, dy: number) => UndoChunk[]|null} translateLayer
+ * @property {(layerId: number, dx: number, dy: number, wrap?: boolean) => UndoChunk[]|null} translateLayer
  * @property {(layerId: number, x: number, y: number, size: number) => boolean} setTextForm
+ * @property {(layerId: number, m: [number, number, number, number, number, number]) => [number, number, number, number, number, number]|null} setSvgTransform
+ * @property {(layerId: number, item: import('./svg_layer.js').SvgItem) => import('./svg_layer.js').SvgItem|null} setSvgItem
+ * @property {(layerId: number, v: boolean) => boolean|null} setClip null = livello sparito/non raster
+ * @property {(layerId: number, m: string) => string|null} setMode metodo di fusione, ritorna il precedente (null = sparito/non raster)
  */
 
 const MAX_ENTRIES = 64;
 const MAX_RAW_BYTES = 256 * 1024 * 1024; // budget equivalente non compresso
 
 let nextMsgId = 1;
+
+/** @param {Layer[]|undefined} layers */
+function ownedLayersBytes(layers) {
+  let bytes = 0;
+  for (const layer of layers || []) if (layer.store) bytes += layer.store.cpuBytes;
+  return bytes;
+}
 
 export class UndoManager {
   /** @param {() => void} [onChange] @param {(e: UndoEntry) => void} [onDrop] */
@@ -93,6 +126,10 @@ export class UndoManager {
     // se possiede un livello eliminato, qui lo si libera davvero
     this.onDrop = onDrop || (() => {});
     this.busy = false;        // un'operazione undo/redo alla volta
+    // collaborazione: true = una nuova op NON svuota tutto il redo (il redo
+    // di un utente sopravvive alle op degli ALTRI; chi tagga una nuova entry
+    // butta via solo il redo del SUO autore con dropRedoByPrefix)
+    this.selectiveRedo = false;
     /** @type {UndoEntry|null} */
     this._entry = null;
     /** @type {Map<number, {resolve: (v: any) => void, reject: (e: Error) => void}>} */
@@ -157,10 +194,14 @@ export class UndoManager {
     this.undoStack.push(e);
     this.rawBytes += e.rawSize;
     this.storedBytes += e.rawSize;
-    this._dropRedo();
+    if (!this.selectiveRedo) this._dropRedo();
     this._trim();
     this._compressEntry(e);
     this.onChange();
+  }
+
+  captureCancel() {
+    this._entry = null;
   }
 
   // Operazione di struttura già ESEGUITA dal chiamante: qui si registra solo.
@@ -172,11 +213,13 @@ export class UndoManager {
     e.chunks = [];
     e.compressed = false;
     e.ready = Promise.resolve();
-    e.rawSize = (e.op === 'detach' || e.op === 'replace') &&
-      e.layer && e.layer.store ? e.layer.store.cpuBytes : 0;
+    e.rawSize = e.op === 'swap'
+      ? ownedLayersBytes(e.insertLayers)
+      : (e.op === 'detach' || e.op === 'replace') &&
+        e.layer && e.layer.store ? e.layer.store.cpuBytes : 0;
     this.undoStack.push(e);
     this.rawBytes += e.rawSize;
-    this._dropRedo();
+    if (!this.selectiveRedo) this._dropRedo();
     this._trim();
     this.onChange();
   }
@@ -192,7 +235,7 @@ export class UndoManager {
     this.undoStack.push(e);
     this.rawBytes += e.rawSize;
     this.storedBytes += e.rawSize;
-    this._dropRedo();
+    if (!this.selectiveRedo) this._dropRedo();
     this._trim();
     this._compressEntry(e);
     this.onChange();
@@ -339,12 +382,67 @@ export class UndoManager {
         rawSize: d.layer.store ? d.layer.store.cpuBytes : 0,
       });
     }
+    if (e.op === 'clip') {
+      // l'azione registrata ha impostato v: l'inverso rimette !v; il counter
+      // registra come "impostato" il contrario dello stato trovato (riapplicarlo
+      // riporta esattamente lì — round-trip perfetto anche se desincronizzato)
+      const prev = host.setClip(e.layerId, !e.v);
+      if (prev === null) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'clip', layerId: e.layerId, boardId: e.boardId,
+        v: !prev, chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
     if (e.op === 'textform') {
       if (!host.setTextForm(e.layerId, e.x0, e.y0, e.s0)) return null;
       return /** @type {UndoEntry} */ ({
         kind: 'struct', op: 'textform', layerId: e.layerId, boardId: e.boardId,
         x0: e.x1, y0: e.y1, s0: e.s1, x1: e.x0, y1: e.y0, s1: e.s0,
         chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
+    if (e.op === 'swap') {
+      const inserted = e.insertLayers || [];
+      const removed = host.swapLayers(e.boardId, e.removeIds || [], inserted,
+        e.index || 0, e.activeId || 0);
+      if (!removed) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'swap', boardId: removed.boardId,
+        removeIds: inserted.map((layer) => layer.id),
+        insertLayers: removed.removedLayers,
+        index: removed.index,
+        activeId: removed.prevActiveId,
+        chunks: [], compressed: false, ready: Promise.resolve(),
+        rawSize: ownedLayersBytes(removed.removedLayers),
+      });
+    }
+    if (e.op === 'svgform') {
+      const prev = host.setSvgTransform(e.layerId, e.tm0);
+      if (prev === null) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'svgform', layerId: e.layerId, boardId: e.boardId,
+        tm0: e.tm1, tm1: e.tm0,
+        chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
+    if (e.op === 'svgitem') {
+      const prev = host.setSvgItem(e.layerId, e.si0);
+      if (prev === null) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'svgitem', layerId: e.layerId, boardId: e.boardId,
+        si0: e.si1, si1: e.si0,
+        chunks: [], compressed: false, ready: Promise.resolve(), rawSize: 0,
+      });
+    }
+    if (e.op === 'mode') {
+      // rimette m0; il counter registra come "prima" lo stato trovato
+      // (round-trip perfetto anche se desincronizzato, come per 'clip')
+      const prev = host.setMode(e.layerId, e.m0);
+      if (prev === null) return null;
+      return /** @type {UndoEntry} */ ({
+        kind: 'struct', op: 'mode', layerId: e.layerId, boardId: e.boardId,
+        m0: prev, m1: e.m0, chunks: [], compressed: false,
+        ready: Promise.resolve(), rawSize: 0,
       });
     }
     return null;
@@ -359,7 +457,7 @@ export class UndoManager {
     const store = host.storeFor(e.layerId);
     if (!store) return null;
     await this._materialize(e);
-    const lost = host.translateLayer(e.layerId, -e.dx, -e.dy);
+    const lost = host.translateLayer(e.layerId, -e.dx, -e.dy, !!e.wrap);
     if (!lost) return null;
     for (const c of e.chunks) {
       const chunk = store.getOrCreate(c.cx, c.cy);
@@ -369,18 +467,24 @@ export class UndoManager {
     }
     return /** @type {UndoEntry} */ ({
       kind: 'move', layerId: e.layerId, dx: -e.dx, dy: -e.dy,
-      boardId: e.boardId, chunks: lost, compressed: false,
+      boardId: e.boardId, chunks: lost, wrap: !!e.wrap, compressed: false,
       ready: Promise.resolve(),
       rawSize: lost.reduce((s, c) => s + c.rawSize, 0),
     });
   }
 
-  /** @param {UndoEntry[]} fromStack @param {UndoEntry[]} toStack @param {UndoHost} host */
-  async _swap(fromStack, toStack, host) {
-    if (this.busy || fromStack.length === 0) return false;
+  // Scambia l'entry all'indice i (non necessariamente la cima): serve
+  // all'undo collaborativo per-utente. È corretto fuori ordine perché
+  // _apply/_applyStruct/_applyMove sono SWAP che fotografano lo stato
+  // corrente: il counter è un round-trip perfetto qualunque cosa sia
+  // successo nel frattempo. Counter scartato (livello sparito) = l'entry
+  // muore davvero (onDrop libera gli eventuali livelli posseduti).
+  /** @param {UndoEntry[]} fromStack @param {number} i @param {UndoEntry[]} toStack @param {UndoHost} host */
+  async _swapAt(fromStack, i, toStack, host) {
+    if (this.busy || i < 0 || i >= fromStack.length) return false;
     this.busy = true;
     try {
-      const e = fromStack.pop();
+      const [e] = fromStack.splice(i, 1);
       this._account(e, -1);
       const counter = e.kind === 'struct'
         ? this._applyStruct(e, host)
@@ -388,9 +492,12 @@ export class UndoManager {
           ? await this._applyMove(e, host)
           : await this._apply(e, host);
       if (counter) {
+        counter.cid = e.cid; // l'identità collaborativa segue il round-trip
         toStack.push(counter);
         this._account(counter, +1);
         if (counter.kind !== 'struct') this._compressEntry(counter);
+      } else {
+        this.onDrop(e);
       }
     } finally {
       this.busy = false;
@@ -400,10 +507,56 @@ export class UndoManager {
   }
 
   /** @param {UndoHost} host */
-  undo(host) { return this._swap(this.undoStack, this.redoStack, host); }
+  undo(host) { return this._swapAt(this.undoStack, this.undoStack.length - 1, this.redoStack, host); }
 
   /** @param {UndoHost} host */
-  redo(host) { return this._swap(this.redoStack, this.undoStack, host); }
+  redo(host) { return this._swapAt(this.redoStack, this.redoStack.length - 1, this.undoStack, host); }
+
+  // ---- undo collaborativo per cid ----
+
+  /** Ultimo indice con quel cid (le entry più recenti vincono). @param {UndoEntry[]} stack @param {string} cid */
+  _indexOfCid(stack, cid) {
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (stack[i].cid === cid) return i;
+    }
+    return -1;
+  }
+
+  /** Annulla l'entry con quel cid ovunque sia. false = non trovata/occupato. @param {string} cid @param {UndoHost} host */
+  undoCid(cid, host) {
+    return this._swapAt(this.undoStack, this._indexOfCid(this.undoStack, cid), this.redoStack, host);
+  }
+
+  /** @param {string} cid @param {UndoHost} host */
+  redoCid(cid, host) {
+    return this._swapAt(this.redoStack, this._indexOfCid(this.redoStack, cid), this.undoStack, host);
+  }
+
+  /** Tagga l'ultima entry pushata (quella dell'op appena conclusa). @param {string} cid */
+  tagTop(cid) {
+    const e = this.undoStack[this.undoStack.length - 1];
+    if (e) e.cid = cid;
+  }
+
+  /** Una nuova op dell'autore butta via il SUO redo (semantica standard). @param {string} prefix 'uid:' */
+  dropRedoByPrefix(prefix) {
+    let dropped = false;
+    for (let i = this.redoStack.length - 1; i >= 0; i--) {
+      const c = this.redoStack[i].cid;
+      if (c && c.startsWith(prefix)) {
+        const [e] = this.redoStack.splice(i, 1);
+        this._account(e, -1);
+        this.onDrop(e);
+        dropped = true;
+      }
+    }
+    if (dropped) this.onChange();
+  }
+
+  dropRedoAll() {
+    this._dropRedo();
+    this.onChange();
+  }
 
   clear() {
     for (const e of this.undoStack) this.onDrop(e);

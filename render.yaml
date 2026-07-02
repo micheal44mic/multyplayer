@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: multyplayer-signaling
-    env: node
-    buildCommand: npm install
-    startCommand: npm start
-    autoDeploy: true

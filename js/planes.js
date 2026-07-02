@@ -1,12 +1,11 @@
 // PIANI — la lista livelli diventa una pila di piani DOM.
-// I run consecutivi di livelli raster si raggruppano: il gruppo PIÙ IN BASSO
-// usa il renderer principale (WebGL, o il fallback 2D), i gruppi sopra un
-// testo usano renderer Canvas2D dedicati; ogni livello testo è un piano SVG
-// (vettore puro, dipinto dal browser). L'ordine dei figli del container è
-// l'ordine della pila. Caso comune (niente sandwich): un canvas + eventuali
-// SVG in cima — zero overhead rispetto a prima.
+// I run consecutivi di livelli si raggruppano: il gruppo PIÙ IN BASSO usa il
+// renderer principale (WebGL, o il fallback 2D), i gruppi sopra un piano SVG
+// usano renderer Canvas2D dedicati. Solo il testo live resta un piano SVG;
+// gli altri testi entrano nei run raster come quad cache.
 
-import { syncTextSvg, createTextSvg, refreshBlockBitmap, syncBlockTransform, COARSE_POINTER } from './text_layer.js';
+import { syncTextSvg, createTextSvg, refreshBlockBitmap, syncBlockTransform, syncTextClip, freeBlockBitmap } from './text_layer.js';
+import { createSvgPlane, syncSvgLayer, syncSvgClip, freeSvgPlane } from './svg_layer.js';
 import { Canvas2DRenderer } from './renderer_2d.js';
 
 /** @typedef {import('./camera.js').Camera} Camera */
@@ -14,10 +13,18 @@ import { Canvas2DRenderer } from './renderer_2d.js';
 /** @typedef {import('./boards.js').BoardManager} BoardManager */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
 /** @typedef {import('./renderer_gl.js').GLRenderer} GLRenderer */
+/** @typedef {import('./renderer_gl.js').TransformFrame|import('./renderer_gl.js').TransformFrame[]|null} TransformFrameSet */
 
-/** @typedef {{type: 'raster', layers: Layer[]}|{type: 'text', layer: Layer}} Group */
+/** @typedef {{type: 'raster', layers: Layer[]}|{type: 'text', layer: Layer}|{type: 'svg', layer: Layer}} Group */
 
-// Frame a camera ferma prima di scongelare i piani testo dopo uno zoom
+/** @param {TransformFrameSet} transform @param {Layer[]} layers */
+function transformTouchesLayers(transform, layers) {
+  if (!transform) return false;
+  if (Array.isArray(transform)) return transform.some((f) => layers.some((l) => l.id === f.layerId));
+  return layers.some((l) => l.id === transform.layerId);
+}
+
+// Frame a camera ferma prima di scongelare i piani vettoriali dopo uno zoom
 // touch (~100ms a 60Hz: il repaint nitido arriva subito dopo il rilascio).
 const FREEZE_SETTLE_FRAMES = 6;
 
@@ -44,18 +51,28 @@ export class Planes {
     this._camChanged = true;
     this._vb = '';
     this._w = 1; this._h = 1; this._dpr = 1;
-    // Freeze del testo durante lo zoom touch: finché lo zoom si muove i
-    // piani SVG restano dipinti al viewBox di partenza e il delta lo fa un
-    // transform CSS (compositor: leggera sfocatura, come le anteprime degli
-    // slider); a gesto fermo tornano vettoriali e nitidi. Solo pointer
-    // coarse: su desktop ridipingere i glifi a ogni frame regge ed è nitido.
-    this._freezeOk = COARSE_POINTER;
+    // Freeze del testo durante il movimento camera: finché pan/zoom cambiano,
+    // i piani SVG live restano dipinti al viewBox di partenza e il delta lo
+    // fa un transform CSS (compositor). A gesto fermo tornano vettoriali e
+    // nitidi; il dato testo non viene rasterizzato nel modello.
+    this._freezeOk = true;
     this._frozen = false;
     this._fz = { x: 0, y: 0, z: 1, w: 0, h: 0 }; // camera del viewBox congelato
     this._fzVb = '';
     this._fzT = '';
     this._fzStable = 0;
     this._hadLoading = false; // board in warm-up nel frame precedente
+    // testi nascosti perché il loro board è coperto da un quad proxy
+    // (visibility, non display: display appartiene a syncTextSvg)
+    /** @type {Set<number>} */
+    this._hiddenText = new Set();
+    this._skipKey = 0; // firma dello skip dei proxy nel frame precedente
+    // 0 = nessun testo SVG vivo; id layer = quel testo resta piano SVG.
+    // -1 è ancora accettato come compat diagnostica: tutti SVG vivi.
+    this._liveTextId = 0;
+    this._liveSvgId = 0;
+    /** @type {(() => void)|null} */
+    this.onInvalidate = null;
   }
 
   /** @param {number} w @param {number} h @param {number} dpr */
@@ -82,10 +99,27 @@ export class Planes {
     let run = null;
     for (const board of boards.boards) {
       for (const layer of board.mgr.layers) {
-        if (layer.kind === 'text') {
+        if (layer.kind === 'svg' && (this._liveSvgId === -1 || layer.id === this._liveSvgId)) {
+          layer.clipBoard = board;
+          groups.push({ type: 'svg', layer });
+          run = null;
+        } else if (layer.kind === 'text' && (this._liveTextId === -1 || layer.id === this._liveTextId)) {
+          // piano SVG vettoriale: il run raster si spezza qui
+          layer.clipBoard = board; // maschera al rettangolo del suo canvas
           groups.push({ type: 'text', layer });
           run = null;
         } else {
+          // raster, o testo cotto: resta nel run — lo disegna il renderer
+          // del gruppo come quad (scissor/clip al board via clipBoard)
+          if (layer.kind === 'text') {
+            layer.clipBoard = board;
+            // la bitmap dell'effetto live (canvas + SDF GPU) serve solo al
+            // piano SVG: cotto, si libera (no-op se già vuota)
+            freeBlockBitmap(layer);
+          } else if (layer.kind === 'svg') {
+            layer.clipBoard = board;
+            freeSvgPlane(layer);
+          }
           if (!run) { run = { type: 'raster', layers: [] }; groups.push(run); }
           run.layers.push(layer);
         }
@@ -103,9 +137,23 @@ export class Planes {
     for (const g of groups) {
       if (g.type === 'text') {
         if (!g.layer.svg) createTextSvg(g.layer);
+        // rientro in editing: la visibility può essere rimasta 'hidden' da
+        // una copertura proxy di quando il livello era cotto (il registro
+        // _hiddenText lo dimentica appena il testo esce dal piano SVG)
+        if (!this._hiddenText.has(g.layer.id)) {
+          g.layer.svg.style.visibility = '';
+          g.layer.blockCanvas.style.visibility = '';
+        }
         // canvas dell'effetto subito sotto il suo testo vettoriale
         order.push(g.layer.blockCanvas, g.layer.svg);
         where.set(g.layer.id, -2); // i testi non migrano: piano proprio
+        continue;
+      }
+      if (g.type === 'svg') {
+        if (!g.layer.svgPlane) createSvgPlane(g.layer);
+        g.layer.svgPlane.style.visibility = '';
+        order.push(g.layer.svgPlane);
+        where.set(g.layer.id, -2);
         continue;
       }
       if (!bottomDone) {
@@ -141,11 +189,16 @@ export class Planes {
             bottomRenderer.disposeChunkTex(c);
             c.c2d = null;
             c.texDirty = true;
+            c.c2dDirty = true;
           });
         }
       }
     }
     this._where = where;
+    // testi spariti dalla pila: via dal registro dei nascosti
+    for (const id of this._hiddenText) {
+      if (where.get(id) !== -2) this._hiddenText.delete(id);
+    }
     // i contatori dei renderer 2D si riallineano al mondo reale
     for (let i = 0; i < this._pool.length; i++) this._recount(this._pool[i], i);
 
@@ -164,6 +217,7 @@ export class Planes {
       if (g.type !== 'raster') continue;
       for (const l of g.layers) {
         if (this._where.get(l.id) !== poolIdx) break;
+        if (!l.store) continue; // testo cotto nel run: niente chunk
         l.store.forEachChunkAll((c) => { if (c.c2d) n++; });
       }
     }
@@ -177,17 +231,27 @@ export class Planes {
    * @param {Camera} o.camera
    * @param {BoardManager} o.boards
    * @param {number} o.activeId livello attivo del canvas attivo
+   * @param {number} [o.activeBoardId] canvas evidenziato; 0 = nessun canvas selezionato
    * @param {ChunkStore} o.strokeStore
    * @param {number} o.liveOpacity
    * @param {boolean} o.eraserLive
    * @param {GLRenderer|Canvas2DRenderer} o.bottom
    * @param {HTMLCanvasElement} o.bottomCanvas
    * @param {import('./board_proxy.js').ProxyFrame|null} [o.proxies] board coperti dal quad piatto (zoom-out)
-   * @param {import('./renderer_gl.js').TransformFrame|null} [o.transform] sessione Sposta/Trasforma
-   * @returns {{uploadMs: number, drawMs: number}}
+   * @param {TransformFrameSet} [o.transform] sessione Sposta/Trasforma
+   * @param {import('./renderer_gl.js').FxFrame|null} [o.fx] sessione del pannello Effetti (blur)
+   * @param {import('./text_quad.js').TextQuadCache|null} [o.textQuads] bake dei testi non in editing
+   * @param {import('./svg_quad.js').SvgQuadCache|null} [o.svgQuads] bake degli SVG non in editing
+   * @param {number} [o.liveTextId] testo in editing (piano SVG vivo)
+   * @param {number} [o.liveSvgId] SVG in editing (piano SVG vivo)
+   * @param {import('./boards.js').Board|null} [o.patternTile] board ripetuto in Pattern mode
    */
   render(o) {
     const { camera, boards, strokeStore, bottom } = o;
+    // PRIMA del check epoch: il cambio di liveTextId arriva insieme a un
+    // bump dei board (App), la rebuild deve leggere il valore nuovo
+    this._liveTextId = o.liveTextId || 0;
+    this._liveSvgId = o.liveSvgId || 0;
     const epoch = boards.combinedEpoch;
     if (this._epoch !== epoch) {
       this._epoch = epoch;
@@ -210,37 +274,47 @@ export class Planes {
     // un board si sta caricando (warm-up del proxy) si risincronizzano ogni
     // frame per la percentuale sull'etichetta (e un frame oltre, per pulire)
     const loading = o.proxies && o.proxies.loading.size > 0 ? o.proxies.loading : null;
+    const activeBoardId = o.activeBoardId ?? boards.activeId;
     if (camChanged || boards.epoch !== this._bEpoch || loading !== null || this._hadLoading) {
       this._bEpoch = boards.epoch;
-      this._syncBoards(camera, boards, loading);
+      this._syncBoards(camera, boards, loading, activeBoardId);
     }
     this._hadLoading = loading !== null;
 
     const activeId = o.activeId;
-    const t0 = performance.now();
 
     // upload dei chunk sporchi, ciascuno sul renderer del proprio piano.
     // I layer coperti da un proxy non si caricano: si segnano texDirty e
     // rinasceranno on-demand quando il board tornerà al path per-chunk.
     const skip = o.proxies ? o.proxies.skip : null;
+    // la copertura dei proxy è cambiata (board coperto/scoperto): i piani 2D
+    // devono ridipingere anche a camera ferma
+    let skipKey = 0;
+    if (skip !== null) for (const id of skip) skipKey = (Math.imul(skipKey, 31) + id) | 0;
+    if (skipKey !== this._skipKey) {
+      this._skipKey = skipKey;
+      this._forceDraw = true;
+    }
     let bottomDone = false;
     let c2dIdx = 0;
-    let uploaded = 0;
     for (const g of this.groups) {
-      if (g.type === 'text') continue;
+      if (g.type === 'text' || g.type === 'svg') continue;
       const r = bottomDone ? this._pool[c2dIdx++] : bottom;
       bottomDone = true;
       for (const l of g.layers) {
+        if (!l.store) continue; // testo cotto nel run: niente chunk
         if (skip !== null && skip.has(l.id)) {
-          for (const c of l.store.dirty) c.texDirty = true;
+          for (const c of l.store.dirty) {
+            c.texDirty = true;
+            c.c2dDirty = true;
+          }
           l.store.dirty.clear();
           continue;
         }
-        uploaded += r.uploadDirty(l.store);
-        if (l.id === activeId) uploaded += r.uploadDirty(strokeStore);
+        r.uploadDirty(l.store);
+        if (l.id === activeId) r.uploadDirty(strokeStore);
       }
     }
-    const t1 = performance.now();
 
     // disegno: bottom sempre (è anche lo sfondo del documento), i piani 2D
     // solo se è cambiato qualcosa (camera, contenuto, tratto live nel gruppo)
@@ -248,6 +322,22 @@ export class Planes {
     c2dIdx = 0;
     for (const g of this.groups) {
       if (g.type === 'text') {
+        // board coperto da un quad proxy (che cuoce anche il testo): piano
+        // SVG e bitmap dell'effetto spenti, zero repaint del browser. Lo
+        // styleDirty NON si consuma: si sincronizza tutto al rientro.
+        if (skip !== null && skip.has(g.layer.id)) {
+          if (!this._hiddenText.has(g.layer.id)) {
+            this._hiddenText.add(g.layer.id);
+            g.layer.svg.style.visibility = 'hidden';
+            g.layer.blockCanvas.style.visibility = 'hidden';
+          }
+          continue;
+        }
+        const unhide = this._hiddenText.delete(g.layer.id);
+        if (unhide) {
+          g.layer.svg.style.visibility = '';
+          g.layer.blockCanvas.style.visibility = '';
+        }
         const wasDirty = g.layer.styleDirty;
         if (wasDirty) { g.layer.styleDirty = false; syncTextSvg(g.layer); }
         if (this._frozen) {
@@ -265,48 +355,92 @@ export class Planes {
             g.layer.svg.setAttribute('viewBox', this._vb);
           }
         }
-        // bitmap dell'effetto: a regime è un confronto e basta
-        refreshBlockBitmap(g.layer, camera, camChanged);
+        // bitmap dell'effetto: a regime è un confronto e basta (al rientro
+        // dal proxy si forza il controllo: la camera può essere cambiata
+        // mentre il piano era spento)
+        refreshBlockBitmap(g.layer, camera, camChanged || unhide);
         // l'ancora del canvas segue camera e spostamenti del testo
-        if (camChanged || wasDirty) syncBlockTransform(g.layer, camera);
+        if (camChanged || wasDirty || unhide) syncBlockTransform(g.layer, camera);
+        // maschera al board (dopo l'eventuale rigenerazione: la chiave
+        // del clip dipende da scala/ancora della bitmap)
+        syncTextClip(g.layer);
+        continue;
+      }
+      if (g.type === 'svg') {
+        if (skip !== null && skip.has(g.layer.id)) {
+          g.layer.svgPlane.style.visibility = 'hidden';
+          continue;
+        }
+        g.layer.svgPlane.style.visibility = '';
+        if (this._frozen) {
+          if (g.layer.svgPlane.getAttribute('viewBox') !== this._fzVb) {
+            g.layer.svgPlane.setAttribute('viewBox', this._fzVb);
+          }
+          if (g.layer.svgPlane.style.transform !== this._fzT) {
+            g.layer.svgPlane.style.transform = this._fzT;
+          }
+        } else {
+          if (g.layer.svgPlane.style.transform) g.layer.svgPlane.style.transform = '';
+          if (camChanged || g.layer.svgPlane.getAttribute('viewBox') !== this._vb) {
+            g.layer.svgPlane.setAttribute('viewBox', this._vb);
+          }
+        }
+        const patternTile = o.patternTile && g.layer.clipBoard &&
+          g.layer.clipBoard.id === o.patternTile.id ? o.patternTile : null;
+        syncSvgLayer(g.layer, patternTile);
+        syncSvgClip(g.layer);
         continue;
       }
       const hasActive = g.layers.some((l) => l.id === activeId);
       const stroke = hasActive ? strokeStore : null;
       const tf = o.transform || null;
+      const fxF = o.fx || null;
+      const tq = o.textQuads || null;
+      const sq = o.svgQuads || null;
       if (!bottomDone) {
         bottomDone = true;
         bottom.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive,
-          o.proxies || null, tf);
+          o.proxies || null, tf, fxF, tq, sq);
       } else {
         const r = this._pool[c2dIdx++];
         const liveHere = stroke && stroke.map.size > 0;
-        // un livello del gruppo è in sessione Sposta/Trasforma: la matrice
-        // può cambiare a ogni frame, il piano va ridipinto
-        const tfHere = tf !== null && g.layers.some((l) => l.id === tf.layerId);
-        if (camChanged || r.uploadsThisFrame > 0 || liveHere || tfHere || this._forceDraw) {
-          r.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive, null, tf);
+        // un livello del gruppo è in sessione Sposta/Trasforma o Effetti:
+        // matrice/sigma possono cambiare a ogni frame, il piano va ridipinto
+        const tfHere = transformTouchesLayers(tf, g.layers);
+        const fxHere = fxF !== null && g.layers.some((l) => l.id === fxF.layerId);
+        if (camChanged || r.uploadsThisFrame > 0 || liveHere || tfHere || fxHere || this._forceDraw) {
+          // i proxy servono anche qui: i layer dei board coperti non si
+          // ridisegnano per-chunk sopra il loro quad (i quad li fa il bottom)
+          r.render(camera, g.layers, activeId, stroke, o.liveOpacity, o.eraserLive,
+            o.proxies || null, tf, fxF, tq, sq);
         }
       }
     }
     // niente gruppi raster: il bottom presenta comunque (pulisce il canvas)
-    if (!bottomDone) bottom.render(camera, [], activeId, null, 1, false, o.proxies || null, null);
+    if (!bottomDone) {
+      bottom.render(camera, [], activeId, null, 1, false, o.proxies || null, null, null,
+        o.textQuads || null, o.svgQuads || null);
+    }
     this._forceDraw = false;
-    const t2 = performance.now();
-
-    return { uploadMs: t1 - t0, drawMs: t2 - t1 };
   }
 
   // Forza il ridisegno dei piani 2D al prossimo frame (undo, visibilità...).
-  invalidate() { this._forceDraw = true; }
+  invalidate() {
+    this._forceDraw = true;
+    if (this.onInvalidate) this.onInvalidate();
+  }
+
+  needsFrame() {
+    return this._frozen || this._hadLoading;
+  }
 
   // Piano dei canvas: un div bianco per canvas (sfondo + bordo) e una
   // etichetta, posizionati in px schermo. Niente scale(): larghezza/altezza
   // in px già moltiplicati per lo zoom, così il bordo resta a spessore
   // costante a qualunque ingrandimento. loading: boardId -> 0..1, mostra
   // barra e percentuale finché il board non ha ricaricato le texture.
-  /** @param {Camera} camera @param {BoardManager} boards @param {Map<number, number>|null} [loading] */
-  _syncBoards(camera, boards, loading = null) {
+  /** @param {Camera} camera @param {BoardManager} boards @param {Map<number, number>|null} [loading] @param {number} [activeBoardId] */
+  _syncBoards(camera, boards, loading = null, activeBoardId = boards.activeId) {
     const z = camera.zoom;
     const seen = new Set();
     for (const b of boards.boards) {
@@ -331,7 +465,7 @@ export class Planes {
       }
       el.root.style.transform = `translate(${sx}px, ${sy}px)`;
       el.label.style.transform = `translate(${sx}px, ${sy - 22}px)`;
-      const active = b.id === boards.activeId;
+      const active = activeBoardId !== 0 && b.id === activeBoardId;
       el.root.classList.toggle('active', active);
       el.label.classList.toggle('active', active);
       const pct = loading !== null ? loading.get(b.id) : undefined;
@@ -351,16 +485,16 @@ export class Planes {
     }
   }
 
-  // Gestisce il freeze dei piani testo durante lo zoom touch. Parte quando
-  // CAMBIA lo zoom (il pan puro resta live: trasla soltanto), tiene fermo il
-  // viewBox della base e mappa base→camera con un transform CSS esatto:
+  // Gestisce il freeze dei piani testo durante pan/zoom. Parte quando cambia
+  // la camera, tiene fermo il viewBox della base e mappa base→camera con un
+  // transform CSS esatto:
   // T(S0(w)) = S(w) per ogni punto mondo w, quindi il testo resta incollato
   // ai raster sottostanti. Dopo FREEZE_SETTLE_FRAMES a camera ferma si
   // scongela: i piani tolgono il transform e riprendono il viewBox vivo.
   /** @param {Camera} camera @param {boolean} camChanged */
   _updateFreeze(camera, camChanged) {
     if (!this._frozen) {
-      if (!(camChanged && Number.isFinite(this._cz) && camera.zoom !== this._cz &&
+      if (!(camChanged && Number.isFinite(this._cz) &&
         camera.w === this._cw && camera.h === this._ch)) return;
       this._frozen = true;
       this._fz.x = this._cx; this._fz.y = this._cy; this._fz.z = this._cz;
@@ -396,22 +530,28 @@ export class Planes {
     st.opacity = String(Math.max(0, Math.min(1, (cell - 7) / 30)) * 0.16);
   }
 
+  // Il renderer 2D del pool che possiede il livello (null = bottom GL o
+  // testo): è lui il proprietario della cache c2d dei suoi chunk.
+  /** @param {number} layerId @returns {Canvas2DRenderer|null} */
+  poolRendererFor(layerId) {
+    const i = this._where.get(layerId);
+    return i !== undefined && i >= 0 ? this._pool[i] || null : null;
+  }
+
   // Eviction dei piani 2D (i loro canvas-chunk sono memoria come le texture).
-  /** @param {Camera} camera */
-  evict(camera) {
+  // covered: store dei board coperti da un quad proxy — non si disegnano,
+  // quindi evictabili anche se dentro la vista.
+  /** @param {Camera} camera @param {Set<ChunkStore>|null} [covered] */
+  evict(camera, covered = null) {
     let bottomDone = false;
     let c2dIdx = 0;
     for (const g of this.groups) {
       if (g.type !== 'raster') continue;
       if (!bottomDone) { bottomDone = true; continue; } // il bottom lo fa l'App
       const r = this._pool[c2dIdx++];
-      r.evict(g.layers.map((l) => l.store), camera, 512);
+      const stores = [];
+      for (const l of g.layers) if (l.store) stores.push(l.store);
+      r.evict(stores, camera, 512, covered);
     }
-  }
-
-  get gpuBytes() {
-    let b = 0;
-    for (const r of this._pool) b += r.gpuBytes;
-    return b;
   }
 }

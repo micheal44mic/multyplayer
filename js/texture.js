@@ -7,7 +7,7 @@
 // Tutto qui è deterministico (seed fisso per la grana di default): i bench
 // differenziali JS/wasm possono confrontare i checksum.
 
-import { clamp, mulberry32 } from './util.js';
+import { clamp, decodeImageSource, mulberry32 } from './util.js';
 
 /**
  * @typedef {Object} BrushTexture
@@ -84,23 +84,7 @@ export function textureFromImageData(name, img) {
  * @returns {Promise<BrushTexture>}
  */
 export async function textureFromFile(file) {
-  /** @type {ImageBitmap|HTMLImageElement} */
-  let src;
-  try {
-    src = await createImageBitmap(file);
-  } catch {
-    // fallback per i formati/browser senza createImageBitmap(file)
-    src = await new Promise((resolve, reject) => {
-      const url = URL.createObjectURL(file);
-      const im = new Image();
-      im.onload = () => { URL.revokeObjectURL(url); resolve(im); };
-      im.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decodifica fallita')); };
-      im.src = url;
-    });
-  }
-  const w = /** @type {any} */ (src).width || /** @type {any} */ (src).naturalWidth;
-  const h = /** @type {any} */ (src).height || /** @type {any} */ (src).naturalHeight;
-  if (!w || !h) throw new Error('immagine vuota');
+  const { src, w, h } = await decodeImageSource(file);
   const cnv = document.createElement('canvas');
   cnv.width = w; cnv.height = h;
   const ctx = cnv.getContext('2d', { willReadFrequently: true });
@@ -109,23 +93,42 @@ export async function textureFromFile(file) {
   return textureFromImageData(file.name.replace(/\.[^.]+$/, ''), ctx.getImageData(0, 0, w, h));
 }
 
-// Grana carta procedurale 128x128 (ricetta mvp4: base chiara, rumore fine,
-// speckle scuri radi). Seed fisso: identica a ogni avvio, benchabile.
+// Grana carta procedurale 256x256: fibre morbide, variazione larga e pori
+// attenuati. Seed fisso: identica a ogni avvio, benchabile.
 /** @returns {BrushTexture} */
 export function defaultGrainTexture() {
-  const size = 128;
+  const size = 256;
   const rng = mulberry32(0xc0ffee);
+  /** @param {number} x @param {number} y */
+  const hash = (x, y) => {
+    const v = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453;
+    return v - Math.floor(v);
+  };
+  /** @param {number} x @param {number} y */
+  const vnoise = (x, y) => {
+    const ix = Math.floor(x), iy = Math.floor(y);
+    const fx = x - ix, fy = y - iy;
+    const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+    const a = hash(ix, iy), b = hash(ix + 1, iy);
+    const c = hash(ix, iy + 1), d = hash(ix + 1, iy + 1);
+    return a + (b - a) * ux + (c - a + (a - b + d - c) * ux) * uy;
+  };
   const lum = new Uint8Array(size * size);
   const rgb = new Uint8Array(size * size * 3);
-  for (let i = 0; i < lum.length; i++) {
-    const rA = rng(), rB = rng();
-    const speckle = rA > 0.86 ? rA * 0.42 : 0;
-    const fine = (rB - 0.5) * 34;
-    const v = Math.round(clamp(224 + fine - speckle * 255, 94, 250));
-    lum[i] = v;
-    rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
+  for (let y = 0, i = 0; y < size; y++) {
+    for (let x = 0; x < size; x++, i++) {
+      const fiberX = vnoise(x / 34, y / 5.5) - 0.5;
+      const fiberY = vnoise((x + y * 0.35) / 8, (y - x * 0.18) / 30) - 0.5;
+      const cloud = vnoise(x / 42 + 19.7, y / 42 - 8.1) - 0.5;
+      const poreRaw = Math.max(0, vnoise(x / 7.5 - 3.2, y / 7.5 + 11.6) - 0.68) / 0.32;
+      const pore = poreRaw * poreRaw;
+      const micro = (rng() + rng() - 1) * 4;
+      const v = Math.round(clamp(226 + fiberX * 24 + fiberY * 12 + cloud * 18 + micro - pore * 34, 118, 250));
+      lum[i] = v;
+      rgb[i * 3] = rgb[i * 3 + 1] = rgb[i * 3 + 2] = v;
+    }
   }
-  return makeBrushTexture('Grana carta', size, size, lum, rgb);
+  return makeBrushTexture('Paper Grain', size, size, lum, rgb);
 }
 
 /**

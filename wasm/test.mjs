@@ -1,7 +1,7 @@
-// Test differenziale del core wasm contro la matematica di js/raster.js.
-// Esecuzione:  node wasm/test.mjs
-// Confronta byte per byte l'output di dab/capsule/commit con un riferimento
-// JS che replica i loop originali, su input casuali (seed fisso).
+// Differential test for the wasm core against the math in js/raster.js.
+// Run with:  node wasm/test.mjs
+// Compares dab/capsule/commit output byte for byte with a JS reference that
+// replicates the original loops on random input (fixed seed).
 
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
@@ -16,7 +16,7 @@ const CHUNK = 256;
 const CHUNK_BYTES = CHUNK * CHUNK * 4;
 const div255 = (v) => ((v + 128) * 257) >> 16;
 
-// PRNG deterministico (mulberry32, come util.js)
+// Deterministic PRNG (mulberry32, like util.js).
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -29,7 +29,7 @@ function mulberry32(seed) {
 const rng = mulberry32(0xfab1e);
 const ri = (n) => (rng() * n) | 0;
 
-// ---- identità div255 vettoriale: ((x+128)+((x+128)>>8))>>8 ----
+// ---- vector div255 identity: ((x+128)+((x+128)>>8))>>8 ----
 for (let v = 0; v <= 65025; v++) {
   const a = v + 128;
   if (((a + (a >> 8)) >> 8) !== div255(v)) {
@@ -37,9 +37,9 @@ for (let v = 0; v <= 65025; v++) {
     process.exit(1);
   }
 }
-console.log('ok  identità div255 (0..65025)');
+console.log('ok  div255 identity (0..65025)');
 
-// ---- memoria: chunk dst/src, maschera, tile fattori, tile RGBX ----
+// ---- memory: dst/src chunks, mask, factor tile, RGBX tile ----
 const base = ex.__heap_base.value;
 const need = base + CHUNK_BYTES * 2 + 65536 + 65536 + CHUNK * CHUNK * 4;
 const pages = Math.ceil((need - ex.memory.buffer.byteLength) / 65536);
@@ -62,7 +62,7 @@ function randomize(m, off, len, sparse) {
   }
 }
 
-// ---- riferimento JS: dab (copia di _dab in raster.js) ----
+// ---- JS reference: dab (copy of _dab in raster.js) ----
 function refDab(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0, a255, cr, cg, cb, buildup) {
   let wrote = false;
   for (let y2 = ly0; y2 <= ly1; y2++) {
@@ -79,7 +79,7 @@ function refDab(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0, a255, cr, cg, 
         d[di + 1] = div255(cg * ma) + div255(d[di + 1] * inv);
         d[di + 2] = div255(cb * ma) + div255(d[di + 2] * inv);
         d[di + 3] = ma + div255(d[di + 3] * inv);
-      } else if (ma >= d[di + 3]) { // wash: a parità vince l'ultimo dab
+      } else if (ma >= d[di + 3]) { // wash: ties go to the latest dab
         d[di] = div255(cr * ma);
         d[di + 1] = div255(cg * ma);
         d[di + 2] = div255(cb * ma);
@@ -91,7 +91,7 @@ function refDab(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0, a255, cr, cg, 
   return wrote ? 1 : 0;
 }
 
-// ---- riferimento JS: capsule (copia di _capsule) ----
+// ---- JS reference: capsule (copy of _capsule) ----
 function falloff(dist, r, h) {
   const core = r * h;
   let w = r - core;
@@ -135,7 +135,7 @@ function refCapsule(d, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a
   return wrote ? 1 : 0;
 }
 
-// ---- riferimento JS: commit (copia di commitChunk, senza store) ----
+// ---- JS reference: commit (copy of commitChunk, without store) ----
 function refCommit(d, s, op255, eraser) {
   for (let o = 0; o < s.length; o += 4) {
     const sa = div255(s[o + 3] * op255);
@@ -165,7 +165,7 @@ function diff(a, b, label) {
 
 let fails = 0;
 
-// ---- dab: 300 casi random ----
+// ---- dab: 300 random cases ----
 for (let it = 0; it < 300; it++) {
   const maskW = 8 + ri(120);
   const maskH = 8 + ri(120);
@@ -195,12 +195,12 @@ for (let it = 0; it < 300; it++) {
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  dab (300 casi, wash+buildup)');
+console.log('ok  dab (300 cases, wash+buildup)');
 
-// ---- dab_tex_tile: 300 casi random ----
-// Riferimento = path JS texturizzato di raster.js: m2 = div255(m*f) col
-// fattore letto dal tile in spazio chunk, poi composito di dab. rgb != null:
-// colori per pixel dal tile RGBX (X=255, contratto del fill in raster.js).
+// ---- dab_tex_tile: 300 random cases ----
+// Reference = textured JS path from raster.js: m2 = div255(m*f), with the
+// factor read from the tile in chunk space, then dab compositing. rgb != null
+// means per-pixel colors from the RGBX tile (X=255, the raster.js fill contract).
 const PTR_TILE = PTR_MASK + 65536;
 const PTR_RGBX = PTR_TILE + 65536;
 
@@ -227,7 +227,7 @@ function refDabTexTile(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0,
         d[di + 1] = div255(g * ma) + div255(d[di + 1] * inv);
         d[di + 2] = div255(b * ma) + div255(d[di + 2] * inv);
         d[di + 3] = ma + div255(d[di + 3] * inv);
-      } else if (ma >= d[di + 3]) { // wash: a parità vince l'ultimo dab
+      } else if (ma >= d[di + 3]) { // wash: ties go to the latest dab
         d[di] = div255(r * ma);
         d[di + 1] = div255(g * ma);
         d[di + 2] = div255(b * ma);
@@ -283,9 +283,9 @@ for (let it = 0; it < 300; it++) {
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  dab_tex_tile (300 casi, wash+buildup, colore fisso+RGBX)');
+console.log('ok  dab_tex_tile (300 cases, wash+buildup, fixed color+RGBX)');
 
-// ---- capsule: 300 casi random ----
+// ---- capsule: 300 random cases ----
 for (let it = 0; it < 300; it++) {
   const lx0 = ri(200), ly0 = ri(200);
   const lx1 = lx0 + 1 + ri(CHUNK - lx0 - 1), ly1 = ly0 + 1 + ri(CHUNK - ly0 - 1);
@@ -312,12 +312,12 @@ for (let it = 0; it < 300; it++) {
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  capsule (300 casi)');
+console.log('ok  capsule (300 cases)');
 
-// ---- capsule_tex: 300 casi random ----
-// Riferimento SENZA scorciatoie (niente bound di riga/pixel): verifica che
-// gli skip SIMD del wasm siano esatti. ma = div255(maBase * f) col fattore
-// dal tile; rgb != null: colori per pixel dal tile RGBX.
+// ---- capsule_tex: 300 random cases ----
+// Reference path without shortcuts (no row/pixel bounds): verifies that the
+// wasm SIMD skips are exact. ma = div255(maBase * f), with the factor read from
+// the tile; rgb != null means per-pixel colors from the RGBX tile.
 function refCapsuleTex(d, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h,
   cr, cg, cb, tile, rgbx) {
   const dx = x1 - x0, dy = y1 - y0;
@@ -397,9 +397,9 @@ for (let it = 0; it < 300; it++) {
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  capsule_tex (300 casi, colore fisso+RGBX)');
+console.log('ok  capsule_tex (300 cases, fixed color+RGBX)');
 
-// ---- commit: 200 casi random ----
+// ---- commit: 200 random cases ----
 for (let it = 0; it < 200; it++) {
   const op255 = it % 3 === 0 ? 255 : 1 + ri(255);
   const eraser = it & 1;
@@ -418,10 +418,10 @@ for (let it = 0; it < 200; it++) {
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  commit (200 casi, over+gomma)');
+console.log('ok  commit (200 cases, over+eraser)');
 
 if (fails) {
   console.error(`${fails} FAIL`);
   process.exit(1);
 }
-console.log('TUTTI I TEST PASSANO');
+console.log('ALL TESTS PASS');
