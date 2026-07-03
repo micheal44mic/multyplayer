@@ -296,24 +296,48 @@ async function runEndPassCase(name, wasm) {
     eng.handle({ t: 'entries', gen: 1, n, buf: s, creations });
   };
   send(live, null);
-  // endpass: il main svuota la punta sul mirror e il worker scarta i binding
-  for (const k of tipKeys) { mirror.remove(k, null); known.delete(k); }
+  // endpass ASINCRONO come il bridge: rebind a slot freschi (i pixel vecchi
+  // restano nel chunk fino allo swap), il worker scarta i binding e il
+  // replay scrive negli slot nuovi; poi lo swap atomico (bridge._trySwap)
+  /** @type {{chunk: any, oldSlot: number, newSlot: number}[]} */
+  const swapItems = [];
+  for (const k of tipKeys) {
+    known.delete(k);
+    const c = mirror.map.get(k);
+    if (!c) continue;
+    const r = mirror.rebindFresh(c);
+    swapItems.push({ chunk: c, oldSlot: r.oldSlot, newSlot: r.newSlot });
+  }
   eng.handle({ t: 'endpass', gen: 1, clip: [...tipKeys] });
   send(replay, tipKeys);
   const drained = Atomics.load(new Int32Array(ctlSab), CTL_DRAINED);
   check(drained === sent, `${name}: drained ${drained}/${sent}`);
+  for (const it of swapItems) {
+    if (it.newSlot >= 0) it.chunk.data = pool.view(it.newSlot);
+    it.chunk.touched = false;
+    if (it.oldSlot >= 0) pool.releaseDeferred(it.oldSlot);
+  }
 
-  const refKeys = [...refStore.map.keys()].sort();
-  const mirKeys = [...mirror.map.keys()].sort();
-  check(refKeys.length === mirKeys.length && refKeys.every((k, i) => k === mirKeys[i]),
-    `${name}: stesso insieme di chunk (${refKeys.length})`);
-  let diffBytes = 0;
+  // il mirror TIENE i chunk della punta non ricoperti dal replay (bianchi,
+  // touched 0: il commit li scarta); il riferimento li ha rimossi — quindi
+  // mirror ⊇ ref, e gli extra devono essere vuoti con flag spento
+  let diffBytes = 0, missing = 0, extraBad = 0;
   for (const [key, rc] of refStore.map) {
     const mc = mirror.map.get(key);
-    if (!mc) continue;
+    if (!mc) { missing++; continue; }
     for (let i = 0; i < rc.data.length; i++) if (rc.data[i] !== mc.data[i]) diffBytes++;
   }
-  check(diffBytes === 0, `${name}: 0 byte diversi dopo endpass (${diffBytes})`);
+  for (const [key, mc] of mirror.map) {
+    if (refStore.map.has(key)) continue;
+    const slot = mirror.slotFor(mc);
+    const flagged = slot >= 0 && pool.touched ? pool.touched[slot] === 1 : false;
+    let blank = true;
+    for (let i = 0; i < mc.data.length; i++) if (mc.data[i] !== 0) { blank = false; break; }
+    if (!blank || flagged) extraBad++;
+  }
+  check(missing === 0, `${name}: nessun chunk del riferimento mancante (${missing})`);
+  check(diffBytes === 0, `${name}: 0 byte diversi dopo endpass+swap (${diffBytes})`);
+  check(extraBad === 0, `${name}: chunk punta non ricoperti = bianchi e non touched (${extraBad})`);
 }
 
 await runEndPassCase('endpass [worker js]', false);

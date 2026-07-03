@@ -1832,10 +1832,14 @@ export class App {
   _endPass() {
     // il live ancora in coda va rasterizzato PRIMA di svuotare i chunk della
     // punta: il replay fuori dal clip viene scartato, e un dab mai disegnato
-    // lascerebbe un buco nel corpo. In modalità worker il flush aspetta che
-    // il worker finisca; da qui in poi il tratto è tutto sul main (curRaster
-    // scrive direttamente negli slot SAB del mirror, il worker resta fermo).
-    this._runQueueSync();
+    // lascerebbe un buco nel corpo. In modalità worker basta l'ORDINE FIFO:
+    // il vivo residuo parte prima dell'endpass, nessuna attesa sul main.
+    const worker = this.rasterMode === 'worker' && this.rasterBridge.usable;
+    if (worker) {
+      if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+    } else {
+      this._runQueueSync();
+    }
     const rect = this.engine.endPassRect();
     /** @type {Set<number>|null} */
     let clip = null;
@@ -1851,23 +1855,26 @@ export class App {
           for (let cx = cx0; cx <= cx1; cx++) {
             const key = chunkKey(cx, cy);
             clip.add(key);
-            this.strokeStore.remove(key, this._disposeTex);
+            // worker: i chunk NON si rimuovono — restano visibili coi pixel
+            // vecchi mentre il worker ridisegna la punta su slot nuovi
+            if (!worker) this.strokeStore.remove(key, this._disposeTex);
           }
         }
       }
-    } else {
+    } else if (!worker) {
       this._dropStrokeBuffer();
     }
     this.curRaster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
-    if (this.rasterMode === 'worker' && this.rasterBridge.usable) {
-      // il replay della punta gira SUL WORKER (kernel wasm, core suo): sul
-      // main il JS puro costava secondi coi pennelli giganti su mobile.
-      // beginStroke qui sopra serve solo allo snap del commit; il worker
-      // tiene lo stato del tratto vivo (stesso snap → stessi byte)
+    if (worker) {
+      // endpass ASINCRONO sul worker (kernel wasm, core suo): il main non
+      // aspetta — sui device veloci lo spin di cortesia mette la punta nello
+      // stesso frame, su quelli lenti appare appena il worker finisce (il
+      // commit tanto attende bridge.idle). beginStroke qui sopra serve solo
+      // allo snap del commit; il worker tiene il suo stato (stessi byte).
       this.rasterBridge.endPassBegin(clip);
       this.engine.replay();
       if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
-      this.rasterBridge.flushSync();
+      this.rasterBridge.finishEndPass(50);
       return;
     }
     this.curRaster.clip = clip;

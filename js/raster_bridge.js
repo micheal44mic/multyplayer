@@ -41,6 +41,11 @@ export class RasterBridge {
     this._sim = null;
     /** @type {{x0:number,y0:number,x1:number,y1:number}|null} */
     this._clip = null;
+    // endpass asincrono in corso: {watermark, items} (vedi endPassBegin)
+    /** @type {{watermark: number, items: {chunk: import('./store.js').Chunk, oldSlot: number, newSlot: number}[]}|null} */
+    this._swap = null;
+    this._ready = false;      // il worker ha valutato il modulo (diagnostica)
+    this._flushMsFrame = 0;
 
     // perché il bridge NON è usable (diagnostica nel pannello perf):
     // no-coi = pagina non isolata (header COOP/COEP assenti o rifiutati),
@@ -57,9 +62,20 @@ export class RasterBridge {
       }
       this.worker = new Worker(new URL('./raster_worker.js', import.meta.url), { type: 'module' });
       this.worker.onerror = (e) => {
-        console.error('[raster_bridge] worker morto, fallback main-thread', e.message || e);
+        // Safari spesso non valorizza message sugli errori di EVAL del
+        // modulo: filename/riga distinguono "script mai partito" da crash
+        const detail = [e.message, e.filename, e.lineno, e.colno]
+          .filter((v) => v !== undefined && v !== null && v !== '').join(' @ ');
+        console.error('[raster_bridge] worker morto, fallback main-thread', detail || e);
         this.usable = false;
-        this.reason = 'worker-error: ' + (e.message || 'unknown');
+        this.reason = 'worker-error: ' + (detail || (this._ready ? 'crash' : 'eval-failed')) +
+          (this._ready ? ' (dopo ready)' : ' (mai partito)');
+      };
+      this.worker.onmessage = (e) => {
+        if (e.data && e.data.t === 'ready') {
+          this._ready = true;
+          if (e.data.err) this.reason = 'wasm: ' + e.data.err; // solo diagnostica: JS resta ok
+        }
       };
       this.ctlSab = new SharedArrayBuffer(16 * 4);
       this.ctl = new Int32Array(this.ctlSab);
@@ -75,7 +91,9 @@ export class RasterBridge {
     return this.ctl ? Atomics.load(this.ctl, CTL_DRAINED) : this.sent;
   }
 
-  get idle() { return this.drained >= this.sent; }
+  // fermo = tutto drenato E nessuno scambio di punta in sospeso (il commit
+  // deve leggere i pixel finali, non i vecchi in attesa di swap)
+  get idle() { return this.drained >= this.sent && !this._swap; }
 
   // Entry inviate e non ancora rasterizzate dal worker: l'arretrato VERO.
   // Se resta stabilmente alto con la penna in movimento, il worker singolo
@@ -181,20 +199,19 @@ export class RasterBridge {
   // rect delle entry già drenate (upload sicuro) e ricicla gli slot quando
   // il worker è fermo.
   tick() {
-    if (this._pending.length === 0) {
-      if (this.idle && this.pool.pendingCount > 0) this.pool.recycle();
-      return;
-    }
     const d = this.drained;
-    let i = 0;
-    for (; i < this._pending.length; i++) {
-      const p = this._pending[i];
-      if (p.idx > d) break;
-      if (p.gen === this.gen && this.store.map.get(p.chunk.key) === p.chunk) {
-        this.store.markDirty(p.chunk, p.lx0, p.ly0, p.lx1, p.ly1);
+    if (this._pending.length > 0) {
+      let i = 0;
+      for (; i < this._pending.length; i++) {
+        const p = this._pending[i];
+        if (p.idx > d) break;
+        if (p.gen === this.gen && this.store.map.get(p.chunk.key) === p.chunk) {
+          this.store.markDirty(p.chunk, p.lx0, p.ly0, p.lx1, p.ly1);
+        }
       }
+      if (i > 0) this._pending.splice(0, i);
     }
-    if (i > 0) this._pending.splice(0, i);
+    this._trySwap(d);
     if (this.idle && this.pool.pendingCount > 0) this.pool.recycle();
   }
 
@@ -231,25 +248,72 @@ export class RasterBridge {
   }
 
   /**
-   * Pass finale del taper SUL WORKER (al passo dei kernel wasm, non JS sul
-   * main): il main ha già svuotato i chunk della punta sul mirror; qui il
-   * worker scarta i binding corrispondenti e le entry successive (il replay
-   * emesso dall'engine) vengono clippate a quei soli chunk — la stessa
-   * semantica di Rasterizer.clip. clipKeys null = tratto rifatto per intero
-   * (il chiamante ha già svuotato tutto il mirror).
+   * Pass finale del taper SUL WORKER, ASINCRONO: i chunk della punta restano
+   * in mappa coi pixel vecchi (visibili: niente buchi né freeze), ma il
+   * protocollo passa a slot NUOVI (rebindFresh) — il worker scarta i suoi
+   * binding ('endpass' viaggia in FIFO DOPO il vivo residuo, quindi arriva
+   * a vivo completato) e ridisegna la punta negli slot nuovi; lo scambio
+   * atomico avviene in _trySwap quando drained raggiunge il watermark.
+   * clipKeys null = tratto rifatto per intero. I byte finali sono identici
+   * al path sincrono: cambia solo QUANDO la punta appare.
    * @param {Set<number>|null} clipKeys
    */
   endPassBegin(clipKeys) {
     if (!this.usable || !this.worker) return;
     this._clipKeys = clipKeys;
-    if (clipKeys) {
-      // i chunk svuotati rinascono con slot nuovi: vanno ri-annunciati
-      for (const k of clipKeys) this._known.delete(k);
-      this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: [...clipKeys] });
-    } else {
-      this._known.clear();
-      this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: null });
+    /** @type {{chunk: import('./store.js').Chunk, oldSlot: number, newSlot: number}[]} */
+    const items = [];
+    const keys = clipKeys || new Set(this.store.map.keys());
+    for (const k of keys) {
+      const c = this.store.map.get(k);
+      this._known.delete(k);
+      if (!c) continue;
+      const r = this.store.rebindFresh(c);
+      items.push({ chunk: c, oldSlot: r.oldSlot, newSlot: r.newSlot });
     }
+    if (!clipKeys) this._known.clear();
+    this._swap = { watermark: -1, items };
+    this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: clipKeys ? [...clipKeys] : null });
+  }
+
+  /**
+   * Chiude l'endpass: fissa il watermark (tutte le entry del replay sono
+   * state inviate) e concede uno spin di cortesia — sui dispositivi veloci
+   * la punta appare nello stesso frame del rilascio, come sempre; oltre il
+   * budget si torna al frame loop e lo swap avverrà in tick().
+   * @param {number} spinMs
+   */
+  finishEndPass(spinMs) {
+    if (!this._swap || !this.ctl) return;
+    this._swap.watermark = this.sent;
+    if (spinMs > 0 && !this.idleDrained) {
+      const t0 = performance.now();
+      while (Atomics.load(this.ctl, CTL_DRAINED) < this.sent &&
+        performance.now() - t0 < spinMs) { /* spin */ }
+      this._flushMsFrame = (this._flushMsFrame || 0) + (performance.now() - t0);
+    }
+    this.tick();
+  }
+
+  get idleDrained() { return this.drained >= this.sent; }
+
+  // Scambio della punta: pixel nuovi al posto dei vecchi, touched azzerato
+  // (lo dirà il flag SAB del worker via syncTouched), slot vecchi al riciclo
+  // differito. Chiamato da tick() quando il worker ha superato il watermark.
+  /** @param {number} drained */
+  _trySwap(drained) {
+    const s = this._swap;
+    if (!s || s.watermark < 0 || drained < s.watermark) return;
+    for (const it of s.items) {
+      const c = it.chunk;
+      if (this.store.map.get(c.key) === c) {
+        if (it.newSlot >= 0) c.data = this.pool.view(it.newSlot);
+        c.touched = false;
+        this.store.markDirty(c);
+      }
+      if (it.oldSlot >= 0) this.pool.releaseDeferred(it.oldSlot);
+    }
+    this._swap = null;
   }
 
   // Annullo/snap: il worker dimentica binding e snap. Gli slot del mirror
@@ -260,6 +324,14 @@ export class RasterBridge {
     this._pending.length = 0;
     this._known.clear();
     this._clipKeys = null;
+    if (this._swap) {
+      // scambio mai avvenuto: gli slot NUOVI li rilascia releaseAll (sono
+      // in slotOf), qui vanno solo i VECCHI rimasti appesi agli item
+      for (const it of this._swap.items) {
+        if (it.oldSlot >= 0) this.pool.releaseDeferred(it.oldSlot);
+      }
+      this._swap = null;
+    }
     this.worker.postMessage({ t: 'reset', gen: this.gen });
   }
 }

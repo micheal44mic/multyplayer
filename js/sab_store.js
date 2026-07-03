@@ -118,6 +118,20 @@ export class SabStrokeStore extends ChunkStore {
     return s === undefined ? -1 : s;
   }
 
+  // Endpass asincrono: il chunk resta in mappa coi PIXEL VECCHI visibili
+  // (data non cambia), ma il protocollo da qui in poi usa uno slot NUOVO —
+  // il worker ridisegna la punta lì, e lo scambio data→slot nuovo avviene
+  // solo a replay finito (bridge._trySwap). Ritorna i due slot per il
+  // rilascio differito del vecchio.
+  /** @param {import('./store.js').Chunk} c */
+  rebindFresh(c) {
+    const old = this.slotOf.get(c);
+    const slot = this.pool.alloc();
+    if (slot >= 0) this.slotOf.set(c, slot);
+    else this.slotOf.delete(c);
+    return { oldSlot: old === undefined ? -1 : old, newSlot: slot };
+  }
+
   // Come la base ma SENZA azzerare i pixel (lo slot può essere ancora sotto
   // scrittura del worker): lo slot va in pendingZero, il chunk-oggetto viene
   // pooled con un buffer staccato vuoto (tiene viva la texture GPU riusabile).
