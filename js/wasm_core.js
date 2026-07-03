@@ -53,6 +53,21 @@ export class WasmHeap {
      *                 cr: number, cg: number, cb: number,
      *                 tilePtr: number, rgbPtr: number) => number,
      *   commit: (dstPtr: number, srcPtr: number, op255: number, eraser: number) => void,
+     *   blur_blend: (pf: number, pi: number, base: number, out: number,
+     *                lx0: number, ly0: number, lx1: number, ly1: number,
+     *                ox: number, oy: number) => number,
+     *   blur_blend_low: (pf: number, pi: number, base: number, out: number,
+     *                    lx0: number, ly0: number, lx1: number, ly1: number,
+     *                    ox: number, oy: number) => number,
+     *   iir_blur: (dataPtr: number, f32Ptr: number, w: number, h: number,
+     *              B: number, c1: number, c2: number, c3: number) => void,
+     *   blur_low_acc: (chunkPtr: number, lx0: number, ly0: number, lx1: number,
+     *                  ly1: number, ox: number, oy: number, accPtr: number,
+     *                  csx: number, csy: number, k: number, q0: number,
+     *                  q1: number, lowW: number) => void,
+     *   blur_low_div: (accPtr: number, outPtr: number, lowN: number) => void,
+     *   blur_pull_low: (srcPtr: number, w: number, h: number, outPtr: number,
+     *                   oCX: number, oCY: number, crX: number, crY: number) => void,
      * }}
      */
     this.exports = /** @type {any} */ (instance.exports);

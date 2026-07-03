@@ -587,3 +587,728 @@ pub unsafe extern "C" fn commit(dst_ptr: u32, src_ptr: u32, op255: u32, eraser: 
         d += 16;
     }
 }
+
+// ===========================================================================
+// PENNELLO BLUR/SFUMINO — kernel del blend, replica di js/blur_brush.js.
+// Contratto: output BYTE PER BYTE uguale al fallback JS — f64 scalare con lo
+// stesso ordine di operazioni (niente SIMD: il loop è dominato da mask e
+// campionamenti f64, e f64x2 su V8 è più lento dello scalare, misurato).
+// I parametri per-dab arrivano in due blocchi scritti da JS (pf: f64,
+// pi: i32) per non esplodere le firme; per chunk passano solo rettangolo,
+// origine e i puntatori base/out. base == out = scrittura in-place (chunk
+// già catturato dall'undo); altrimenti out è un tile scratch: il kernel
+// PRE-COPIA il sub-rect da base (i pixel saltati restano identici) e JS
+// ricopia solo il rettangolo danneggiato. Ritorna il damage locale
+// (dx0<<24 | dy0<<16 | dx1<<8 | dy1) oppure u32::MAX se nulla è cambiato.
+
+// floor scalare via lane SIMD: core (no_std) non ha f64::floor, il wasm sì.
+#[inline(always)]
+fn floor64(x: f64) -> f64 {
+    f64x2_extract_lane::<0>(f64x2_floor(f64x2_splat(x)))
+}
+
+// i255 di blur_brush.js: (v + 0.5) | 0 con clamp (in (0,255) trunc == floor).
+#[inline(always)]
+fn i255b(v: f64) -> i32 {
+    if v <= 0.0 { 0 } else if v >= 255.0 { 255 } else { (v + 0.5) as i32 }
+}
+
+// Store di Uint8ClampedArray: clamp 0..255 e round-half-to-EVEN (spec JS).
+#[inline(always)]
+fn u8cr(v: f64) -> u8 {
+    if v <= 0.0 {
+        return 0;
+    }
+    if v >= 255.0 {
+        return 255;
+    }
+    let f = floor64(v);
+    let d = v - f;
+    let r = if d > 0.5 {
+        f + 1.0
+    } else if d < 0.5 {
+        f
+    } else if (f as i32) & 1 == 0 {
+        f
+    } else {
+        f + 1.0
+    };
+    r as u8
+}
+
+// Replica di _samplePremulInto: bilineare premultiplied dal buffer src;
+// fuori [0..sw-1]x[0..sh-1] = trasparente, bordo con clamp.
+#[inline(always)]
+unsafe fn sample_premul(src: *const u8, sw: i32, sh: i32, fx: f64, fy: f64) -> [f64; 4] {
+    if fx < 0.0 || fy < 0.0 || fx > (sw - 1) as f64 || fy > (sh - 1) as f64 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let x0 = floor64(fx) as i32;
+    let y0 = floor64(fy) as i32;
+    let x1 = (x0 + 1).min(sw - 1);
+    let y1 = (y0 + 1).min(sh - 1);
+    let tx = fx - x0 as f64;
+    let ty = fy - y0 as f64;
+    let i00 = src.offset(((y0 * sw + x0) << 2) as isize);
+    let i10 = src.offset(((y0 * sw + x1) << 2) as isize);
+    let i01 = src.offset(((y1 * sw + x0) << 2) as isize);
+    let i11 = src.offset(((y1 * sw + x1) << 2) as isize);
+    let w00 = (1.0 - tx) * (1.0 - ty);
+    let w10 = tx * (1.0 - ty);
+    let w01 = (1.0 - tx) * ty;
+    let w11 = tx * ty;
+    [
+        *i00 as f64 * w00 + *i10 as f64 * w10 + *i01 as f64 * w01 + *i11 as f64 * w11,
+        *i00.add(1) as f64 * w00 + *i10.add(1) as f64 * w10 + *i01.add(1) as f64 * w01 + *i11.add(1) as f64 * w11,
+        *i00.add(2) as f64 * w00 + *i10.add(2) as f64 * w10 + *i01.add(2) as f64 * w01 + *i11.add(2) as f64 * w11,
+        *i00.add(3) as f64 * w00 + *i10.add(3) as f64 * w10 + *i01.add(3) as f64 * w01 + *i11.add(3) as f64 * w11,
+    ]
+}
+
+// pf: [0]cx [1]cy [2]pressure [3]drag [4]blurOpacity
+//     [5]ffCore [6]ffCore2 [7]ffCut2 [8]ffW
+//     [9..12]cW00,cW10,cW01,cW11 [13..16]aW.. [17..20]bW..
+//     [21]oCX [22]oCY [23]crossX [24]crossY
+// pi: [0]srcPtr [1]sx [2]sy [3]sw [4]sh [5]blurPtr(0=off) [6]hasSmudge
+//     [7]cD [8]aD [9]bD [10..13]fwx0,fwx1,fwy0,fwy1
+//     [14]selPtr(0=off) [15]selX [16]selY [17]selW [18]selH
+//     [19]stampPtr(0=off) [20]stampSize [21]stampIx [22]stampIy
+#[no_mangle]
+pub unsafe extern "C" fn blur_blend(
+    pf_ptr: u32, pi_ptr: u32, base_ptr: u32, out_ptr: u32,
+    lx0: u32, ly0: u32, lx1: u32, ly1: u32, ox: i32, oy: i32,
+) -> u32 {
+    let pf = pf_ptr as usize as *const f64;
+    let pi = pi_ptr as usize as *const i32;
+    let cx = *pf;
+    let cy = *pf.add(1);
+    let pressure = *pf.add(2);
+    let drag = *pf.add(3);
+    let blur_op = *pf.add(4);
+    let ff_core = *pf.add(5);
+    let ff_core2 = *pf.add(6);
+    let ff_cut2 = *pf.add(7);
+    let ff_w = *pf.add(8);
+    let cw00 = *pf.add(9); let cw10 = *pf.add(10); let cw01 = *pf.add(11); let cw11 = *pf.add(12);
+    let aw00 = *pf.add(13); let aw10 = *pf.add(14); let aw01 = *pf.add(15); let aw11 = *pf.add(16);
+    let bw00 = *pf.add(17); let bw10 = *pf.add(18); let bw01 = *pf.add(19); let bw11 = *pf.add(20);
+    let ocx = *pf.add(21); let ocy = *pf.add(22);
+    let crx = *pf.add(23); let cry = *pf.add(24);
+    let src = *pi as u32 as usize as *const u8;
+    let sx = *pi.add(1); let sy = *pi.add(2);
+    let sw = *pi.add(3); let sh = *pi.add(4);
+    let blur_p = *pi.add(5);
+    let blur = blur_p as u32 as usize as *const u8;
+    let has_blur = blur_p != 0;
+    let has_smudge = *pi.add(6) != 0;
+    let c_d = *pi.add(7) as isize; let a_d = *pi.add(8) as isize; let b_d = *pi.add(9) as isize;
+    let fwx0 = *pi.add(10); let fwx1 = *pi.add(11); let fwy0 = *pi.add(12); let fwy1 = *pi.add(13);
+    let sel_p = *pi.add(14);
+    let sel = sel_p as u32 as usize as *const u8;
+    let sel_x = *pi.add(15); let sel_y = *pi.add(16); let sel_w = *pi.add(17); let sel_h = *pi.add(18);
+    let stamp_p = *pi.add(19);
+    let stamp = stamp_p as u32 as usize as *const u8;
+    let stamp_size = *pi.add(20); let stamp_ix = *pi.add(21); let stamp_iy = *pi.add(22);
+    let sw4 = (sw as isize) << 2;
+
+    let base = base_ptr as usize as *const u8;
+    let out = out_ptr as usize as *mut u8;
+    if out_ptr != base_ptr {
+        let w4 = (((lx1 - lx0 + 1) as usize) << 2) as usize;
+        for ly in ly0..=ly1 {
+            let o = (((ly as usize) << CHUNK_SHIFT) + lx0 as usize) << 2;
+            core::ptr::copy_nonoverlapping(base.add(o), out.add(o), w4);
+        }
+    }
+
+    let mut dx0 = 256i32; let mut dy0 = 256i32;
+    let mut dx1 = -1i32; let mut dy1 = -1i32;
+    for ly in ly0 as i32..=ly1 as i32 {
+        let wy = oy + ly;
+        let ddy = wy as f64 + 0.5 - cy;
+        let dy2 = ddy * ddy;
+        let row_d = ((ly as usize) << CHUNK_SHIFT) << 2;
+        let si_row = ((wy - sy) * sw + (ox - sx)) as isize;
+        let row_fast = has_smudge && wy >= fwy0 && wy <= fwy1;
+        for lx in lx0 as i32..=lx1 as i32 {
+            let wx = ox + lx;
+            let mask: f64;
+            if stamp_p != 0 {
+                let mx = wx - stamp_ix;
+                let my = wy - stamp_iy;
+                if mx < 0 || my < 0 || mx >= stamp_size || my >= stamp_size { continue; }
+                let mut bm = *stamp.add((my * stamp_size + mx) as usize) as f64 / 255.0;
+                if bm <= 0.0 { continue; }
+                if sel_p != 0 {
+                    let smx = wx - sel_x;
+                    let smy = wy - sel_y;
+                    if smx < 0 || smy < 0 || smx >= sel_w || smy >= sel_h { continue; }
+                    let sm = *sel.add((smy * sel_w + smx) as usize) as f64 / 255.0;
+                    if sm <= 0.0 { continue; }
+                    bm = sm * bm;
+                }
+                mask = bm * pressure;
+            } else {
+                let ddx = wx as f64 + 0.5 - cx;
+                let d2 = ddx * ddx + dy2;
+                if d2 >= ff_cut2 { continue; }
+                let mut bm = if d2 <= ff_core2 {
+                    1.0
+                } else {
+                    let t = (sqrt64(d2) - ff_core) / ff_w;
+                    1.0 - t * t * (3.0 - 2.0 * t)
+                };
+                if sel_p != 0 {
+                    let smx = wx - sel_x;
+                    let smy = wy - sel_y;
+                    if smx < 0 || smy < 0 || smx >= sel_w || smy >= sel_h { continue; }
+                    let sm = *sel.add((smy * sel_w + smx) as usize) as f64 / 255.0;
+                    if sm <= 0.0 { continue; }
+                    bm = sm * bm;
+                }
+                mask = bm * pressure;
+            }
+            if mask <= 0.0001 { continue; }
+
+            let di = row_d + ((lx as usize) << 2);
+            let si = (si_row + lx as isize) << 2;
+            let sp = src.offset(si);
+            let sa = *sp.add(3) as i32;
+            let mut na = sa;
+            let mut nr = *sp as i32;
+            let mut ng = *sp.add(1) as i32;
+            let mut nb = *sp.add(2) as i32;
+            if has_blur {
+                let bp = blur.offset(si);
+                let ba = *bp.add(3) as i32;
+                let blur_mask = mask * blur_op * (1.0 - drag);
+                if sa != 0 || ba != 0 {
+                    na = i255b(na as f64 + (ba - na) as f64 * blur_mask);
+                    nr = i255b(nr as f64 + (*bp as i32 - nr) as f64 * blur_mask).min(na);
+                    ng = i255b(ng as f64 + (*bp.add(1) as i32 - ng) as f64 * blur_mask).min(na);
+                    nb = i255b(nb as f64 + (*bp.add(2) as i32 - nb) as f64 * blur_mask).min(na);
+                }
+            }
+            if has_smudge {
+                let drag_mask = drag * mask;
+                if drag_mask > 0.0001 {
+                    let tr: f64; let tg: f64; let tb: f64; let ta: f64;
+                    if row_fast && wx >= fwx0 && wx <= fwx1 {
+                        // path fast: 3 tap bilineari fusi a indici/pesi costanti,
+                        // stessa associatività del JS: ((C*w)+..)*0.6 + (..)*0.2 + (..)*0.2
+                        let ic = src.offset(si + c_d);
+                        let ia = src.offset(si + a_d);
+                        let ib = src.offset(si + b_d);
+                        tr = (*ic as f64 * cw00 + *ic.offset(4) as f64 * cw10 + *ic.offset(sw4) as f64 * cw01 + *ic.offset(sw4 + 4) as f64 * cw11) * 0.6
+                            + (*ia as f64 * aw00 + *ia.offset(4) as f64 * aw10 + *ia.offset(sw4) as f64 * aw01 + *ia.offset(sw4 + 4) as f64 * aw11) * 0.2
+                            + (*ib as f64 * bw00 + *ib.offset(4) as f64 * bw10 + *ib.offset(sw4) as f64 * bw01 + *ib.offset(sw4 + 4) as f64 * bw11) * 0.2;
+                        tg = (*ic.offset(1) as f64 * cw00 + *ic.offset(5) as f64 * cw10 + *ic.offset(sw4 + 1) as f64 * cw01 + *ic.offset(sw4 + 5) as f64 * cw11) * 0.6
+                            + (*ia.offset(1) as f64 * aw00 + *ia.offset(5) as f64 * aw10 + *ia.offset(sw4 + 1) as f64 * aw01 + *ia.offset(sw4 + 5) as f64 * aw11) * 0.2
+                            + (*ib.offset(1) as f64 * bw00 + *ib.offset(5) as f64 * bw10 + *ib.offset(sw4 + 1) as f64 * bw01 + *ib.offset(sw4 + 5) as f64 * bw11) * 0.2;
+                        tb = (*ic.offset(2) as f64 * cw00 + *ic.offset(6) as f64 * cw10 + *ic.offset(sw4 + 2) as f64 * cw01 + *ic.offset(sw4 + 6) as f64 * cw11) * 0.6
+                            + (*ia.offset(2) as f64 * aw00 + *ia.offset(6) as f64 * aw10 + *ia.offset(sw4 + 2) as f64 * aw01 + *ia.offset(sw4 + 6) as f64 * aw11) * 0.2
+                            + (*ib.offset(2) as f64 * bw00 + *ib.offset(6) as f64 * bw10 + *ib.offset(sw4 + 2) as f64 * bw01 + *ib.offset(sw4 + 6) as f64 * bw11) * 0.2;
+                        ta = (*ic.offset(3) as f64 * cw00 + *ic.offset(7) as f64 * cw10 + *ic.offset(sw4 + 3) as f64 * cw01 + *ic.offset(sw4 + 7) as f64 * cw11) * 0.6
+                            + (*ia.offset(3) as f64 * aw00 + *ia.offset(7) as f64 * aw10 + *ia.offset(sw4 + 3) as f64 * aw01 + *ia.offset(sw4 + 7) as f64 * aw11) * 0.2
+                            + (*ib.offset(3) as f64 * bw00 + *ib.offset(7) as f64 * bw10 + *ib.offset(sw4 + 3) as f64 * bw01 + *ib.offset(sw4 + 7) as f64 * bw11) * 0.2;
+                    } else {
+                        // bordo dello snapshot: campionatore generico, stessi
+                        // ordini di _blendResult (sourceX = (wx+0.5) + oCX ecc.)
+                        let s_x = wx as f64 + 0.5 + ocx;
+                        let s_y = wy as f64 + 0.5 + ocy;
+                        let sxf = sx as f64;
+                        let syf = sy as f64;
+                        let p = sample_premul(src, sw, sh, s_x - sxf - 0.5, s_y - syf - 0.5);
+                        let pa = sample_premul(src, sw, sh, (s_x + crx) - sxf - 0.5, (s_y + cry) - syf - 0.5);
+                        let pb = sample_premul(src, sw, sh, (s_x - crx) - sxf - 0.5, (s_y - cry) - syf - 0.5);
+                        tr = p[0] * 0.6 + pa[0] * 0.2 + pb[0] * 0.2;
+                        tg = p[1] * 0.6 + pa[1] * 0.2 + pb[1] * 0.2;
+                        tb = p[2] * 0.6 + pa[2] * 0.2 + pb[2] * 0.2;
+                        ta = p[3] * 0.6 + pa[3] * 0.2 + pb[3] * 0.2;
+                    }
+                    if sa == 0 && ta <= 0.0001 && !has_blur { continue; }
+                    nr = i255b(nr as f64 + (tr - nr as f64) * drag_mask);
+                    ng = i255b(ng as f64 + (tg - ng as f64) * drag_mask);
+                    nb = i255b(nb as f64 + (tb - nb as f64) * drag_mask);
+                    na = i255b(na as f64 + (ta - na as f64) * drag_mask);
+                    nr = nr.min(na);
+                    ng = ng.min(na);
+                    nb = nb.min(na);
+                }
+            }
+            let cp = base.add(di);
+            let cr = *cp as i32;
+            let cg = *cp.add(1) as i32;
+            let cb = *cp.add(2) as i32;
+            let ca = *cp.add(3) as i32;
+            if nr == cr && ng == cg && nb == cb && na == ca { continue; }
+            let op = out.add(di);
+            *op = nr as u8;
+            *op.add(1) = ng as u8;
+            *op.add(2) = nb as u8;
+            *op.add(3) = na as u8;
+            if lx < dx0 { dx0 = lx; }
+            if lx > dx1 { dx1 = lx; }
+            if ly < dy0 { dy0 = ly; }
+            if ly > dy1 { dy1 = ly; }
+        }
+    }
+    if dx1 < 0 { return u32::MAX; }
+    ((dx0 as u32) << 24) | ((dy0 as u32) << 16) | ((dx1 as u32) << 8) | (dy1 as u32)
+}
+
+// Variante low-res (replica di _blendUp): base = pixel del chunk, blur/pull
+// campionati bilineare dai buffer low con upsampling fuso. Stesso protocollo
+// base/out/damage di blur_blend.
+// pf: [0..8] come sopra (mask); pi: [0]lowPullPtr(0=off) [1]csx [2]csy
+//     [3]lowW [4]lowH [5]lowBlurPtr(0=off) [6]k
+//     [14..18]sel [19..22]stamp
+#[no_mangle]
+pub unsafe extern "C" fn blur_blend_low(
+    pf_ptr: u32, pi_ptr: u32, base_ptr: u32, out_ptr: u32,
+    lx0: u32, ly0: u32, lx1: u32, ly1: u32, ox: i32, oy: i32,
+) -> u32 {
+    let pf = pf_ptr as usize as *const f64;
+    let pi = pi_ptr as usize as *const i32;
+    let cx = *pf;
+    let cy = *pf.add(1);
+    let pressure = *pf.add(2);
+    let drag = *pf.add(3);
+    let blur_op = *pf.add(4);
+    let ff_core = *pf.add(5);
+    let ff_core2 = *pf.add(6);
+    let ff_cut2 = *pf.add(7);
+    let ff_w = *pf.add(8);
+    let pull_p = *pi;
+    let pull = pull_p as u32 as usize as *const u8;
+    let csx = *pi.add(1);
+    let csy = *pi.add(2);
+    let low_w = *pi.add(3);
+    let low_h = *pi.add(4);
+    let blur_p = *pi.add(5);
+    let lblur = blur_p as u32 as usize as *const u8;
+    let k = *pi.add(6);
+    let sel_p = *pi.add(14);
+    let sel = sel_p as u32 as usize as *const u8;
+    let sel_x = *pi.add(15); let sel_y = *pi.add(16); let sel_w = *pi.add(17); let sel_h = *pi.add(18);
+    let stamp_p = *pi.add(19);
+    let stamp = stamp_p as u32 as usize as *const u8;
+    let stamp_size = *pi.add(20); let stamp_ix = *pi.add(21); let stamp_iy = *pi.add(22);
+    let inv_k = 1.0 / k as f64;
+    let lw4 = (low_w << 2) as isize;
+
+    let base = base_ptr as usize as *const u8;
+    let out = out_ptr as usize as *mut u8;
+    if out_ptr != base_ptr {
+        let w4 = (((lx1 - lx0 + 1) as usize) << 2) as usize;
+        for ly in ly0..=ly1 {
+            let o = (((ly as usize) << CHUNK_SHIFT) + lx0 as usize) << 2;
+            core::ptr::copy_nonoverlapping(base.add(o), out.add(o), w4);
+        }
+    }
+
+    let mut dx0 = 256i32; let mut dy0 = 256i32;
+    let mut dx1 = -1i32; let mut dy1 = -1i32;
+    for ly in ly0 as i32..=ly1 as i32 {
+        let wy = oy + ly;
+        let ddy = wy as f64 + 0.5 - cy;
+        let dy2 = ddy * ddy;
+        // riga bilineare del reticolo low (clamp come nel JS: ty resta
+        // quello pre-clamp, i pesi degeneri sommano al valore esatto)
+        let fy = (wy - csy) as f64 + 0.5;
+        let fy = fy * inv_k - 0.5;
+        let mut iy0 = floor64(fy) as i32;
+        let ty = fy - iy0 as f64;
+        let mut iy1 = iy0 + 1;
+        if iy0 < 0 {
+            iy0 = 0;
+            iy1 = 0;
+        } else if iy1 >= low_h {
+            iy1 = low_h - 1;
+        }
+        let row_a = iy0 as isize * lw4;
+        let row_b = iy1 as isize * lw4;
+        let wy_a = 1.0 - ty;
+        let wy_b = ty;
+        let row_d = ((ly as usize) << CHUNK_SHIFT) << 2;
+        for lx in lx0 as i32..=lx1 as i32 {
+            let wx = ox + lx;
+            let mask: f64;
+            if stamp_p != 0 {
+                let mx = wx - stamp_ix;
+                let my = wy - stamp_iy;
+                if mx < 0 || my < 0 || mx >= stamp_size || my >= stamp_size { continue; }
+                let mut bm = *stamp.add((my * stamp_size + mx) as usize) as f64 / 255.0;
+                if bm <= 0.0 { continue; }
+                if sel_p != 0 {
+                    let smx = wx - sel_x;
+                    let smy = wy - sel_y;
+                    if smx < 0 || smy < 0 || smx >= sel_w || smy >= sel_h { continue; }
+                    let sm = *sel.add((smy * sel_w + smx) as usize) as f64 / 255.0;
+                    if sm <= 0.0 { continue; }
+                    bm = sm * bm;
+                }
+                mask = bm * pressure;
+            } else {
+                let ddx = wx as f64 + 0.5 - cx;
+                let d2 = ddx * ddx + dy2;
+                if d2 >= ff_cut2 { continue; }
+                let mut bm = if d2 <= ff_core2 {
+                    1.0
+                } else {
+                    let t = (sqrt64(d2) - ff_core) / ff_w;
+                    1.0 - t * t * (3.0 - 2.0 * t)
+                };
+                if sel_p != 0 {
+                    let smx = wx - sel_x;
+                    let smy = wy - sel_y;
+                    if smx < 0 || smy < 0 || smx >= sel_w || smy >= sel_h { continue; }
+                    let sm = *sel.add((smy * sel_w + smx) as usize) as f64 / 255.0;
+                    if sm <= 0.0 { continue; }
+                    bm = sm * bm;
+                }
+                mask = bm * pressure;
+            }
+            if mask <= 0.0001 { continue; }
+
+            // pesi bilineari del reticolo low per questo pixel (condivisi
+            // da blur e pull) — identici a _blendUp
+            let fx = (wx - csx) as f64 + 0.5;
+            let fx = fx * inv_k - 0.5;
+            let mut ix0 = floor64(fx) as i32;
+            let tx = fx - ix0 as f64;
+            let mut ix1 = ix0 + 1;
+            if ix0 < 0 {
+                ix0 = 0;
+                ix1 = 0;
+            } else if ix1 >= low_w {
+                ix1 = low_w - 1;
+            }
+            let w00 = (1.0 - tx) * wy_a;
+            let w10 = tx * wy_a;
+            let w01 = (1.0 - tx) * wy_b;
+            let w11 = tx * wy_b;
+            let a0 = (row_a + ((ix0 as isize) << 2)) as usize;
+            let a1 = (row_a + ((ix1 as isize) << 2)) as usize;
+            let b0 = (row_b + ((ix0 as isize) << 2)) as usize;
+            let b1 = (row_b + ((ix1 as isize) << 2)) as usize;
+
+            let di = row_d + ((lx as usize) << 2);
+            let cp = base.add(di);
+            let cr = *cp as i32;
+            let cg = *cp.add(1) as i32;
+            let cb = *cp.add(2) as i32;
+            let ca = *cp.add(3) as i32;
+            let mut nr = cr;
+            let mut ng = cg;
+            let mut nb = cb;
+            let mut na = ca;
+            if blur_p != 0 {
+                let ba = *lblur.add(a0 + 3) as f64 * w00 + *lblur.add(a1 + 3) as f64 * w10
+                    + *lblur.add(b0 + 3) as f64 * w01 + *lblur.add(b1 + 3) as f64 * w11;
+                let blur_mask = mask * blur_op * (1.0 - drag);
+                if na != 0 || ba > 0.0001 {
+                    let br = *lblur.add(a0) as f64 * w00 + *lblur.add(a1) as f64 * w10
+                        + *lblur.add(b0) as f64 * w01 + *lblur.add(b1) as f64 * w11;
+                    let bg = *lblur.add(a0 + 1) as f64 * w00 + *lblur.add(a1 + 1) as f64 * w10
+                        + *lblur.add(b0 + 1) as f64 * w01 + *lblur.add(b1 + 1) as f64 * w11;
+                    let bb = *lblur.add(a0 + 2) as f64 * w00 + *lblur.add(a1 + 2) as f64 * w10
+                        + *lblur.add(b0 + 2) as f64 * w01 + *lblur.add(b1 + 2) as f64 * w11;
+                    na = i255b(na as f64 + (ba - na as f64) * blur_mask);
+                    nr = i255b(nr as f64 + (br - nr as f64) * blur_mask).min(na);
+                    ng = i255b(ng as f64 + (bg - ng as f64) * blur_mask).min(na);
+                    nb = i255b(nb as f64 + (bb - nb as f64) * blur_mask).min(na);
+                }
+            }
+            if pull_p != 0 {
+                let drag_mask = drag * mask;
+                if drag_mask > 0.0001 {
+                    let ta = *pull.add(a0 + 3) as f64 * w00 + *pull.add(a1 + 3) as f64 * w10
+                        + *pull.add(b0 + 3) as f64 * w01 + *pull.add(b1 + 3) as f64 * w11;
+                    if ca == 0 && ta <= 0.0001 && blur_p == 0 { continue; }
+                    let tr = *pull.add(a0) as f64 * w00 + *pull.add(a1) as f64 * w10
+                        + *pull.add(b0) as f64 * w01 + *pull.add(b1) as f64 * w11;
+                    let tg = *pull.add(a0 + 1) as f64 * w00 + *pull.add(a1 + 1) as f64 * w10
+                        + *pull.add(b0 + 1) as f64 * w01 + *pull.add(b1 + 1) as f64 * w11;
+                    let tb = *pull.add(a0 + 2) as f64 * w00 + *pull.add(a1 + 2) as f64 * w10
+                        + *pull.add(b0 + 2) as f64 * w01 + *pull.add(b1 + 2) as f64 * w11;
+                    nr = i255b(nr as f64 + (tr - nr as f64) * drag_mask);
+                    ng = i255b(ng as f64 + (tg - ng as f64) * drag_mask);
+                    nb = i255b(nb as f64 + (tb - nb as f64) * drag_mask);
+                    na = i255b(na as f64 + (ta - na as f64) * drag_mask);
+                    nr = nr.min(na);
+                    ng = ng.min(na);
+                    nb = nb.min(na);
+                }
+            }
+            if nr == cr && ng == cg && nb == cb && na == ca { continue; }
+            let op = out.add(di);
+            *op = nr as u8;
+            *op.add(1) = ng as u8;
+            *op.add(2) = nb as u8;
+            *op.add(3) = na as u8;
+            if lx < dx0 { dx0 = lx; }
+            if lx > dx1 { dx1 = lx; }
+            if ly < dy0 { dy0 = ly; }
+            if ly > dy1 { dy1 = ly; }
+        }
+    }
+    if dx1 < 0 { return u32::MAX; }
+    ((dx0 as u32) << 24) | ((dy0 as u32) << 16) | ((dx1 as u32) << 8) | (dy1 as u32)
+}
+
+// Accumulo dello snapshot low-res (replica del loop row-wise di _dabLow):
+// 4 campioni stratificati per cella — righe/colonne congruenti a q0/q1
+// (mod k) — sommati nel buffer acc u32. Aritmetica intera: esatta ovunque.
+#[no_mangle]
+pub unsafe extern "C" fn blur_low_acc(
+    chunk_ptr: u32, lx0: u32, ly0: u32, lx1: u32, ly1: u32, ox: i32, oy: i32,
+    acc_ptr: u32, csx: i32, csy: i32, k: i32, q0: i32, q1: i32, low_w: i32,
+) {
+    let data = chunk_ptr as usize as *const u8;
+    let acc = acc_ptr as usize as *mut u32;
+    let wxe = ox + lx1 as i32;
+    for ly in ly0 as i32..=ly1 as i32 {
+        let wy = oy + ly;
+        let ry = (wy - csy) % k;
+        if ry != q0 && ry != q1 {
+            continue;
+        }
+        let my_row = ((wy - csy - ry) / k) * low_w;
+        for s in 0..2 {
+            let sox = if s == 0 { q0 } else { q1 };
+            let mut wx0 = ox + lx0 as i32;
+            let rx = (wx0 - csx - sox) % k;
+            if rx != 0 {
+                wx0 += if rx < 0 { -rx } else { k - rx };
+            }
+            if wx0 > wxe {
+                continue;
+            }
+            let mut o = (((ly as usize) << CHUNK_SHIFT) + (wx0 - ox) as usize) << 2;
+            let mut ci = (((my_row + (wx0 - csx - sox) / k) as usize) << 2) as usize;
+            let mut wx = wx0;
+            while wx <= wxe {
+                *acc.add(ci) += *data.add(o) as u32;
+                *acc.add(ci + 1) += *data.add(o + 1) as u32;
+                *acc.add(ci + 2) += *data.add(o + 2) as u32;
+                *acc.add(ci + 3) += *data.add(o + 3) as u32;
+                wx += k;
+                o += (k as usize) << 2;
+                ci += 4;
+            }
+        }
+    }
+}
+
+// Media dei 4 campioni accumulati col vincolo premultiplied r,g,b <= a.
+#[no_mangle]
+pub unsafe extern "C" fn blur_low_div(acc_ptr: u32, out_ptr: u32, low_n: u32) {
+    let acc = acc_ptr as usize as *const u32;
+    let out = out_ptr as usize as *mut u8;
+    let mut o = 0usize;
+    while o < low_n as usize {
+        let a = (*acc.add(o + 3) + 2) >> 2;
+        let r = (*acc.add(o) + 2) >> 2;
+        let g = (*acc.add(o + 1) + 2) >> 2;
+        let b = (*acc.add(o + 2) + 2) >> 2;
+        *out.add(o) = if r > a { a as u8 } else { r as u8 };
+        *out.add(o + 1) = if g > a { a as u8 } else { g as u8 };
+        *out.add(o + 2) = if b > a { a as u8 } else { b as u8 };
+        *out.add(o + 3) = a as u8;
+        o += 4;
+    }
+}
+
+// Pull dello smudge sulla griglia low (replica di _pullLow): 3 tap bilineari
+// fusi a offset costante; scrittura u8 con round-half-to-even (semantica
+// Uint8ClampedArray del JS). Il bordo ricade sul campionatore generico.
+#[no_mangle]
+pub unsafe extern "C" fn blur_pull_low(
+    src_ptr: u32, w: i32, h: i32, out_ptr: u32,
+    ocx: f64, ocy: f64, crx: f64, cry: f64,
+) {
+    let src = src_ptr as usize as *const u8;
+    let out = out_ptr as usize as *mut u8;
+    let oax = ocx + crx;
+    let oay = ocy + cry;
+    let obx = ocx - crx;
+    let oby = ocy - cry;
+    let xc = floor64(ocx) as i32; let yc = floor64(ocy) as i32;
+    let xa = floor64(oax) as i32; let ya = floor64(oay) as i32;
+    let xb = floor64(obx) as i32; let yb = floor64(oby) as i32;
+    let txc = ocx - xc as f64; let tyc = ocy - yc as f64;
+    let txa = oax - xa as f64; let tya = oay - ya as f64;
+    let txb = obx - xb as f64; let tyb = oby - yb as f64;
+    let w4 = (w as isize) << 2;
+    let cd = ((yc * w + xc) << 2) as isize;
+    let ad = ((ya * w + xa) << 2) as isize;
+    let bd = ((yb * w + xb) << 2) as isize;
+    let cw00 = (1.0 - txc) * (1.0 - tyc); let cw10 = txc * (1.0 - tyc);
+    let cw01 = (1.0 - txc) * tyc; let cw11 = txc * tyc;
+    let aw00 = (1.0 - txa) * (1.0 - tya); let aw10 = txa * (1.0 - tya);
+    let aw01 = (1.0 - txa) * tya; let aw11 = txa * tya;
+    let bw00 = (1.0 - txb) * (1.0 - tyb); let bw10 = txb * (1.0 - tyb);
+    let bw01 = (1.0 - txb) * tyb; let bw11 = txb * tyb;
+    let fx0 = (-xc).max(-xa).max(-xb);
+    let fx1 = w - 2 - xc.max(xa).max(xb);
+    let fy0 = (-yc).max(-ya).max(-yb);
+    let fy1 = h - 2 - yc.max(ya).max(yb);
+    for iy in 0..h {
+        let row_ok = iy >= fy0 && iy <= fy1;
+        let mut o = ((iy * w) << 2) as usize;
+        for ix in 0..w {
+            if row_ok && ix >= fx0 && ix <= fx1 {
+                let sp = src.add(o);
+                let ic = sp.offset(cd);
+                let ia = sp.offset(ad);
+                let ib = sp.offset(bd);
+                *out.add(o) = u8cr((*ic as f64 * cw00 + *ic.offset(4) as f64 * cw10 + *ic.offset(w4) as f64 * cw01 + *ic.offset(w4 + 4) as f64 * cw11) * 0.6
+                    + (*ia as f64 * aw00 + *ia.offset(4) as f64 * aw10 + *ia.offset(w4) as f64 * aw01 + *ia.offset(w4 + 4) as f64 * aw11) * 0.2
+                    + (*ib as f64 * bw00 + *ib.offset(4) as f64 * bw10 + *ib.offset(w4) as f64 * bw01 + *ib.offset(w4 + 4) as f64 * bw11) * 0.2);
+                *out.add(o + 1) = u8cr((*ic.offset(1) as f64 * cw00 + *ic.offset(5) as f64 * cw10 + *ic.offset(w4 + 1) as f64 * cw01 + *ic.offset(w4 + 5) as f64 * cw11) * 0.6
+                    + (*ia.offset(1) as f64 * aw00 + *ia.offset(5) as f64 * aw10 + *ia.offset(w4 + 1) as f64 * aw01 + *ia.offset(w4 + 5) as f64 * aw11) * 0.2
+                    + (*ib.offset(1) as f64 * bw00 + *ib.offset(5) as f64 * bw10 + *ib.offset(w4 + 1) as f64 * bw01 + *ib.offset(w4 + 5) as f64 * bw11) * 0.2);
+                *out.add(o + 2) = u8cr((*ic.offset(2) as f64 * cw00 + *ic.offset(6) as f64 * cw10 + *ic.offset(w4 + 2) as f64 * cw01 + *ic.offset(w4 + 6) as f64 * cw11) * 0.6
+                    + (*ia.offset(2) as f64 * aw00 + *ia.offset(6) as f64 * aw10 + *ia.offset(w4 + 2) as f64 * aw01 + *ia.offset(w4 + 6) as f64 * aw11) * 0.2
+                    + (*ib.offset(2) as f64 * bw00 + *ib.offset(6) as f64 * bw10 + *ib.offset(w4 + 2) as f64 * bw01 + *ib.offset(w4 + 6) as f64 * bw11) * 0.2);
+                *out.add(o + 3) = u8cr((*ic.offset(3) as f64 * cw00 + *ic.offset(7) as f64 * cw10 + *ic.offset(w4 + 3) as f64 * cw01 + *ic.offset(w4 + 7) as f64 * cw11) * 0.6
+                    + (*ia.offset(3) as f64 * aw00 + *ia.offset(7) as f64 * aw10 + *ia.offset(w4 + 3) as f64 * aw01 + *ia.offset(w4 + 7) as f64 * aw11) * 0.2
+                    + (*ib.offset(3) as f64 * bw00 + *ib.offset(7) as f64 * bw10 + *ib.offset(w4 + 3) as f64 * bw01 + *ib.offset(w4 + 7) as f64 * bw11) * 0.2);
+            } else {
+                let p = sample_premul(src, w, h, ix as f64 + ocx, iy as f64 + ocy);
+                let pa = sample_premul(src, w, h, ix as f64 + oax, iy as f64 + oay);
+                let pb = sample_premul(src, w, h, ix as f64 + obx, iy as f64 + oby);
+                *out.add(o) = u8cr(p[0] * 0.6 + pa[0] * 0.2 + pb[0] * 0.2);
+                *out.add(o + 1) = u8cr(p[1] * 0.6 + pa[1] * 0.2 + pb[1] * 0.2);
+                *out.add(o + 2) = u8cr(p[2] * 0.6 + pa[2] * 0.2 + pb[2] * 0.2);
+                *out.add(o + 3) = u8cr(p[3] * 0.6 + pa[3] * 0.2 + pb[3] * 0.2);
+            }
+            o += 4;
+        }
+    }
+}
+
+// Gaussiana ricorsiva Young–van Vliet, replica di gaussianBlurBuffer in
+// js/fx_blur.js: accumulo f32 con intermedi f64 (come fa V8 sui Float32Array),
+// coefficienti calcolati in JS e passati qui, riscrittura u8 con round-half-
+// to-even (semantica Uint8ClampedArray) e vincolo premultiplied r,g,b <= a.
+// f_ptr: scratch f32 da w*h*4 lane (allocato da JS, nessuno stato).
+#[no_mangle]
+pub unsafe extern "C" fn iir_blur(
+    data_ptr: u32, f_ptr: u32, w: u32, h: u32,
+    b: f64, c1: f64, c2: f64, c3: f64,
+) {
+    let n = (w * h * 4) as usize;
+    let data = data_ptr as usize as *mut u8;
+    let f = f_ptr as usize as *mut f32;
+    for i in 0..n {
+        *f.add(i) = *data.add(i) as f32;
+    }
+    let w4 = (w * 4) as usize;
+    let h = h as usize;
+    // hPass: ricorsione per riga, avanti e indietro, 4 canali in parallelo
+    for y in 0..h {
+        let row = y * w4;
+        let mut r1 = 0f64; let mut r2 = 0f64; let mut r3 = 0f64;
+        let mut g1 = 0f64; let mut g2 = 0f64; let mut g3 = 0f64;
+        let mut b1 = 0f64; let mut b2 = 0f64; let mut b3 = 0f64;
+        let mut a1 = 0f64; let mut a2 = 0f64; let mut a3 = 0f64;
+        let mut o = row;
+        let end = row + w4;
+        while o < end {
+            let r = b * *f.add(o) as f64 + c1 * r1 + c2 * r2 + c3 * r3;
+            *f.add(o) = r as f32; r3 = r2; r2 = r1; r1 = r;
+            let g = b * *f.add(o + 1) as f64 + c1 * g1 + c2 * g2 + c3 * g3;
+            *f.add(o + 1) = g as f32; g3 = g2; g2 = g1; g1 = g;
+            let bb = b * *f.add(o + 2) as f64 + c1 * b1 + c2 * b2 + c3 * b3;
+            *f.add(o + 2) = bb as f32; b3 = b2; b2 = b1; b1 = bb;
+            let a = b * *f.add(o + 3) as f64 + c1 * a1 + c2 * a2 + c3 * a3;
+            *f.add(o + 3) = a as f32; a3 = a2; a2 = a1; a1 = a;
+            o += 4;
+        }
+        r1 = 0.0; r2 = 0.0; r3 = 0.0; g1 = 0.0; g2 = 0.0; g3 = 0.0;
+        b1 = 0.0; b2 = 0.0; b3 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0;
+        let mut o = (row + w4 - 4) as isize;
+        while o >= row as isize {
+            let ou = o as usize;
+            let r = b * *f.add(ou) as f64 + c1 * r1 + c2 * r2 + c3 * r3;
+            *f.add(ou) = r as f32; r3 = r2; r2 = r1; r1 = r;
+            let g = b * *f.add(ou + 1) as f64 + c1 * g1 + c2 * g2 + c3 * g3;
+            *f.add(ou + 1) = g as f32; g3 = g2; g2 = g1; g1 = g;
+            let bb = b * *f.add(ou + 2) as f64 + c1 * b1 + c2 * b2 + c3 * b3;
+            *f.add(ou + 2) = bb as f32; b3 = b2; b2 = b1; b1 = bb;
+            let a = b * *f.add(ou + 3) as f64 + c1 * a1 + c2 * a2 + c3 * a3;
+            *f.add(ou + 3) = a as f32; a3 = a2; a2 = a1; a1 = a;
+            o -= 4;
+        }
+    }
+    // vPass: avanti con innesco a zero (prime 3 righe dedicate), poi indietro
+    for y in 0..h {
+        let o0 = y * w4;
+        if y >= 3 {
+            for i in 0..w4 {
+                let o = o0 + i;
+                *f.add(o) = (b * *f.add(o) as f64 + c1 * *f.add(o - w4) as f64
+                    + c2 * *f.add(o - 2 * w4) as f64 + c3 * *f.add(o - 3 * w4) as f64) as f32;
+            }
+        } else if y == 2 {
+            for i in 0..w4 {
+                let o = o0 + i;
+                *f.add(o) = (b * *f.add(o) as f64 + c1 * *f.add(o - w4) as f64
+                    + c2 * *f.add(o - 2 * w4) as f64) as f32;
+            }
+        } else if y == 1 {
+            for i in 0..w4 {
+                let o = o0 + i;
+                *f.add(o) = (b * *f.add(o) as f64 + c1 * *f.add(o - w4) as f64) as f32;
+            }
+        } else {
+            for i in 0..w4 {
+                *f.add(o0 + i) = (b * *f.add(o0 + i) as f64) as f32;
+            }
+        }
+    }
+    let mut y = h as isize - 1;
+    while y >= 0 {
+        let yu = y as usize;
+        let o0 = yu * w4;
+        if yu + 4 <= h {
+            for i in 0..w4 {
+                let o = o0 + i;
+                *f.add(o) = (b * *f.add(o) as f64 + c1 * *f.add(o + w4) as f64
+                    + c2 * *f.add(o + 2 * w4) as f64 + c3 * *f.add(o + 3 * w4) as f64) as f32;
+            }
+        } else if yu + 3 == h {
+            for i in 0..w4 {
+                let o = o0 + i;
+                *f.add(o) = (b * *f.add(o) as f64 + c1 * *f.add(o + w4) as f64
+                    + c2 * *f.add(o + 2 * w4) as f64) as f32;
+            }
+        } else if yu + 2 == h {
+            for i in 0..w4 {
+                let o = o0 + i;
+                *f.add(o) = (b * *f.add(o) as f64 + c1 * *f.add(o + w4) as f64) as f32;
+            }
+        } else {
+            for i in 0..w4 {
+                *f.add(o0 + i) = (b * *f.add(o0 + i) as f64) as f32;
+            }
+        }
+        y -= 1;
+    }
+    // riscrittura: alpha prima, canali col vincolo premultiplied
+    let mut i = 0usize;
+    while i < n {
+        let a = u8cr(*f.add(i + 3) as f64);
+        *data.add(i + 3) = a;
+        let af = a as f64;
+        let r = *f.add(i) as f64;
+        *data.add(i) = u8cr(if r < af { r } else { af });
+        let g = *f.add(i + 1) as f64;
+        *data.add(i + 1) = u8cr(if g < af { g } else { af });
+        let bl = *f.add(i + 2) as f64;
+        *data.add(i + 2) = u8cr(if bl < af { bl } else { af });
+        i += 4;
+    }
+}

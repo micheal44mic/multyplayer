@@ -139,6 +139,10 @@ export class App {
     this.rasterMode = 'main';
     // blocco scratch wasm per il commit dei chunk SAB (vedi _runCommit)
     this._commitScratch = 0;
+    // budget dello sfumino CPU (ms/frame), adattivo: sforo -> si stringe,
+    // arretrato con frame leggeri -> si riallarga (vedi _pumpBlur)
+    this.blurBudgetMs = 3.5;
+    this._lastFrameMs = 0;
 
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
     // può far lampeggiare il tratto (frame presentati fuori sincrono).
@@ -2152,7 +2156,7 @@ export class App {
       else rasterPx = this.raster.run(this.queue, this.budgetPx);
     }
     if (this.rasterSab) this.rasterBridge.tick();
-    if (this.blurSession) this._pumpBlur(3.5);
+    if (this.blurSession) this._pumpBlur(this.blurBudgetMs);
     if (this.liquifySession) this._pumpLiquify(5.5);
     const t2 = performance.now();
     const strokePriority = this._strokePriorityActive();
@@ -2236,6 +2240,10 @@ export class App {
       fxFrame = this.fx.frame() || this.layerStyle.frame();
       this._lastFxFrame = fxFrame;
     }
+    // sfumino GPU: il suo stato viaggia nello slot fx (sessioni esclusive:
+    // iniziare il tratto ha già annullato Effetti/Stile) e DEVE passare
+    // anche con strokePriority — è il tratto vivo
+    if (this.blurSession && this.blurSession.gpu) fxFrame = this.blurSession.gpu;
     const tTransform1 = performance.now();
     const tPlanes0 = performance.now();
     this.planes.render({
@@ -2365,6 +2373,7 @@ export class App {
       frameSample.proxies = null;
     }
     this._lastFrameWall = tEnd;
+    this._lastFrameMs = tEnd - t0;
     this._completeFrame(this._frameShouldContinue(frameSample, proxyStats, proxies, textBakes, svgBakes));
   }
 
@@ -2372,7 +2381,16 @@ export class App {
   _pumpBlur(maxMs) {
     const s = this.blurSession;
     if (!s) return;
-    if (s.process(maxMs)) {
+    const t0 = performance.now();
+    const done = s.process(maxMs);
+    const ms = performance.now() - t0;
+    // adattivo col pattern del raster: sforo grosso -> stringi; arretrato
+    // con frame leggeri -> allarga fino al tetto
+    if (ms > 7) this.blurBudgetMs = Math.max(2, this.blurBudgetMs * 0.85);
+    else if (!done && s.dabs.length > s.dabRead && this._lastFrameMs < 11) {
+      this.blurBudgetMs = Math.min(8, this.blurBudgetMs * 1.15);
+    }
+    if (done) {
       this.blurSession = null;
       this.strokeLive = false;
     }

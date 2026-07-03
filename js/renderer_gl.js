@@ -264,6 +264,133 @@ void main() {
   gl_FragColor = acc / wsum;
 }`;
 
+// Dab dello sfumino GPU: campiona la copia pre-dab (uTex, rect a 0,0 dello
+// scratch) e la sua versione sfocata (uBlurT), mixa con la mask radiale
+// smoothstep (stessa banda core/w del motore CPU) e col pull a 3 tap
+// (0.6 centro + 0.2 per lato, offset costante del dab). Scrittura diretta
+// senza blending: fuori dalla mask riscrive la base identica.
+const FS_SMUDGE = FS_PREC + `
+uniform sampler2D uTex;
+uniform sampler2D uBlurT;
+uniform vec2 uRectOrigin;
+uniform vec2 uRectSize;
+uniform vec2 uUvScale;
+uniform vec2 uCenter;
+uniform float uCore;
+uniform float uWW;
+uniform float uPressure;
+uniform float uBlurK;
+uniform float uDragK;
+uniform vec2 uOff;
+uniform vec2 uOffA;
+uniform vec2 uOffB;
+varying vec2 vUv;
+void main() {
+  vec2 suv = vUv * uUvScale;
+  vec4 col = texture2D(uTex, suv);
+  vec2 pos = uRectOrigin + vUv * uRectSize;
+  float t = clamp((distance(pos, uCenter) - uCore) / uWW, 0.0, 1.0);
+  float mask = (1.0 - t * t * (3.0 - 2.0 * t)) * uPressure;
+  col = mix(col, texture2D(uBlurT, suv), mask * uBlurK);
+  vec4 pulled = texture2D(uTex, suv + uOff) * 0.6
+    + texture2D(uTex, suv + uOffA) * 0.2
+    + texture2D(uTex, suv + uOffB) * 0.2;
+  gl_FragColor = mix(col, pulled, mask * uDragK);
+}`;
+
+// Stamp del liquify GPU: aggiorna il CAMPO DI SPOSTAMENTO (RG = offset
+// sorgente in px) sul rect del dab. Composizione corretta dei warp:
+// D_new(p) = w(p) + D_old(p + w(p)) — il vecchio campo si campiona alla
+// posizione warpata (uTex = copia pre-dab del campo, rect+pad a 0,0 dello
+// scratch). Le formule dei modi replicano _liquifyPixel del motore CPU,
+// col noise smussato al posto dell'hash a blocchi.
+const FS_LIQ_STAMP = FS_PREC + `
+uniform sampler2D uTex;
+uniform vec2 uRectOrigin;
+uniform vec2 uRectSize;
+uniform vec2 uScrOrigin;
+uniform float uScrS;
+uniform vec2 uCenter;
+uniform float uCore;
+uniform float uWW;
+uniform float uPressure;
+uniform float uRadius;
+uniform float uChaos;
+uniform float uSeedF;
+uniform vec2 uDXY;
+uniform int uMode;
+varying vec2 vUv;
+float hashL(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)) + uSeedF * 731.7) * 43758.5453); }
+float noiseL(vec2 p) {
+  vec2 i = floor(p); vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hashL(i), hashL(i + vec2(1.0, 0.0)), u.x),
+             mix(hashL(i + vec2(0.0, 1.0)), hashL(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+void main() {
+  vec2 pos = uRectOrigin + vUv * uRectSize;
+  vec2 v = pos - uCenter;
+  float t = clamp((length(v) - uCore) / uWW, 0.0, 1.0);
+  float mask = (1.0 - t * t * (3.0 - 2.0 * t)) * uPressure;
+  vec2 w = vec2(0.0);
+  if (uMode == 0) {
+    vec2 d = uDXY;
+    if (uChaos > 0.001) {
+      float n = noiseL(pos / 14.0) * 2.0 - 1.0;
+      vec2 pp = vec2(-d.y, d.x);
+      float pl = max(length(pp), 1e-6);
+      d += pp / pl * (n * uChaos * uRadius * 0.08 * mask);
+    }
+    w = -d * ((0.9 + uChaos * 0.25) * mask);
+  } else if (uMode == 1 || uMode == 2) {
+    float sgn = uMode == 1 ? 1.0 : -1.0;
+    float extra = uChaos * (noiseL(pos / 18.0) - 0.5);
+    float a = -sgn * (0.78 + uChaos * 0.72) * mask * (1.0 + extra);
+    float ca = cos(a); float sa = sin(a);
+    vec2 rv = vec2(v.x * ca - v.y * sa, v.x * sa + v.y * ca);
+    w = length(v) < 1.0 ? vec2(0.0) : rv - v;
+  } else if (uMode == 3 || uMode == 4) {
+    float sgn = uMode == 3 ? 1.0 : -1.0;
+    w = v * (sgn * (0.46 + uChaos * 0.24) * mask);
+  } else if (uMode == 5) {
+    float ang = atan(v.y, v.x);
+    float sectors = max(7.0, floor(10.0 + uChaos * 18.0 + 0.5));
+    float q = floor(ang / 6.2831853 * sectors + 0.5);
+    float qa = q / sectors * 6.2831853;
+    float n = hashL(vec2(q, floor(length(v) / max(6.0, uRadius * 0.13))));
+    float jag = (0.34 + uChaos * 0.38) * uRadius * mask * (0.45 + n);
+    w = -vec2(cos(qa), sin(qa)) * jag;
+  } else {
+    vec2 u2 = uDXY;
+    float ul = length(u2);
+    u2 = ul < 0.01 ? vec2(1.0, 0.0) : u2 / ul;
+    vec2 n2 = vec2(-u2.y, u2.x);
+    float side = dot(v, n2);
+    float s01 = clamp(abs(side) / max(1.0, uRadius), 0.0, 1.0);
+    s01 = s01 * s01 * (3.0 - 2.0 * s01);
+    float pull = (side >= 0.0 ? 1.0 : -1.0) * (0.54 + uChaos * 0.16) * uRadius * mask * s01;
+    w = n2 * pull;
+  }
+  vec2 suv = (pos + w - uScrOrigin) / uScrS;
+  gl_FragColor = vec4(w + texture2D(uTex, suv).xy, 0.0, 1.0);
+}`;
+
+// Resolve del liquify: UN solo ri-campionamento della base attraverso il
+// campo totale — niente impasto progressivo (bilinear su bilinear) del
+// motore CPU iterativo. Gira solo sul rect del dab (il campo cambia lì).
+const FS_LIQ_RESOLVE = FS_PREC + `
+uniform sampler2D uTex;
+uniform sampler2D uDispT;
+uniform vec2 uTexSize;
+uniform vec2 uRectOrigin;
+uniform vec2 uRectSize;
+varying vec2 vUv;
+void main() {
+  vec2 pos = uRectOrigin + vUv * uRectSize;
+  vec2 d = texture2D(uDispT, pos / uTexSize).xy;
+  gl_FragColor = texture2D(uTex, (pos + d) / uTexSize);
+}`;
+
 // Blur di movimento: media uniforme (box) lungo la direzione, un solo pass.
 // uStep = un tap lungo (cosθ, sinθ), già in spazio uv.
 const FS_MOTION = FS_PREC + `
@@ -970,10 +1097,11 @@ function link(gl, vs, fs) {
  * 'tint' = sostituzione del colore con alpha intatta (strokeR/G/B);
  * 'bevelEmboss' = smusso/rilievo rasterizzato al commit (bevel).
  * I pixel CPU non si toccano mai: il commit avviene al ✓ (fxReadback = lo
- * stesso risultato).
+ * stesso risultato). kind 'smudge' = sessione sfumino GPU: la texture di
+ * stato la mantengono i dab (smudgeDab), qui passa solo il quad live.
  * @typedef {Object} FxFrame
  * @property {number} id timbro di sessione: cambia = texture da ricostruire
- * @property {'gauss'|'motion'|'zoom'|'noise'|'grain'|'thresh'|'halftone'|'stroke'|'tint'|'bevelEmboss'} kind
+ * @property {'gauss'|'motion'|'zoom'|'noise'|'grain'|'thresh'|'halftone'|'stroke'|'tint'|'bevelEmboss'|'smudge'|'liquify'} kind
  * @property {number} layerId
  * @property {import('./store.js').ChunkStore} store
  * @property {number} x @property {number} y origine mondo della texture
@@ -1119,7 +1247,7 @@ export class GLRenderer {
     // appartiene al contesto, al restore si dimentica e rinasce on-demand
     /** @type {WebGLTexture|null} */
     this._tfTex = null;
-    /** @type {number} */
+    /** @type {string|number} id del frame (numero, o 'stamp:layerId' in multi-selezione) */
     this._tfId = 0;
     this._tfMat = new Float32Array(9);
     // mesh della sessione Warp: stessa vita della texture piatta (al
@@ -1180,6 +1308,40 @@ export class GLRenderer {
     this._fxProgs = {};
     /** @type {Record<string, Record<string, WebGLUniformLocation>>} */
     this._fxUni = {};
+
+    // sessione sfumino GPU (vedi smudgeBegin): stato + scratch dei dab.
+    // Stesso ciclo di vita delle risorse fx: al restore si dimenticano.
+    /** @type {WebGLTexture|null} */
+    this._smState = null;
+    /** @type {WebGLTexture|null} */
+    this._smScratch = null;
+    /** @type {WebGLTexture|null} */
+    this._smBlur = null;
+    /** @type {WebGLTexture|null} */
+    this._smPing = null;
+    /** @type {WebGLFramebuffer|null} */
+    this._smFbo = null;
+    this._smW = 0; this._smH = 0; this._smX = 0; this._smY = 0;
+    this._smS = 0; this._smPad = 0; this._smMaxOff = 0;
+    /** @type {{radius:number, hardness:number, sigma:number, drag:number, blurOpacity:number, useBlur:boolean}|null} */
+    this._smP = null;
+
+    // sessione liquify GPU (vedi liquifyBegin): base + campo di spostamento
+    // RGBA16F + resolved. Stesso ciclo di vita: al restore si dimenticano.
+    /** @type {WebGLTexture|null} */
+    this._lqBase = null;
+    /** @type {WebGLTexture|null} */
+    this._lqDisp = null;
+    /** @type {WebGLTexture|null} */
+    this._lqScratch = null;
+    /** @type {WebGLTexture|null} */
+    this._lqResolved = null;
+    /** @type {WebGLFramebuffer|null} */
+    this._lqFbo = null;
+    this._lqW = 0; this._lqH = 0; this._lqX = 0; this._lqY = 0;
+    this._lqS = 0; this._lqPad = 0;
+    /** @type {{radius:number, chaos:number, seed:number}|null} */
+    this._lqP = null;
 
     /** @type {Map<number, any>} cache layerId -> texture styled */
     this._styleCache = new Map();
@@ -1380,7 +1542,7 @@ export class GLRenderer {
    * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
    * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
    * @param {import('./board_proxy.js').ProxyFrame|null} [proxies]
-   * @param {TransformFrame|null} [transform]
+   * @param {TransformFrameSet} [transform] frame singolo o array (multi-selezione)
    * @param {FxFrame|null} [fx]
    * @param {import('./text_quad.js').TextQuadCache|null} [textQuads]
    * @param {import('./svg_quad.js').SvgQuadCache|null} [svgQuads]
@@ -1409,10 +1571,12 @@ export class GLRenderer {
     if (this._tfTex && transform === null) {
       this._freeTransformTex();
     }
-    if (this._fxSrc && (fx === null || fx.id !== this._fxId)) this._freeFxTex();
+    const fxLive = fx !== null && (fx.kind === 'smudge' || fx.kind === 'liquify');
+    if (this._fxSrc && (fx === null || fxLive || fx.id !== this._fxId)) this._freeFxTex();
     // blur su FBO propri PRIMA del present (viewport/blend/program suoi);
-    // no-op se sigma non è cambiato dall'ultimo frame
-    if (fx !== null) this._ensureFxBlur(fx);
+    // no-op se sigma non è cambiato dall'ultimo frame. I kind 'smudge' e
+    // 'liquify' NON cuociono nulla qui: le loro texture le mantengono i dab.
+    if (fx !== null && !fxLive) this._ensureFxBlur(fx);
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     // piano trasparente: la griglia CSS (e i piani sotto) restano visibili
     gl.clearColor(0, 0, 0, 0);
@@ -1520,7 +1684,7 @@ export class GLRenderer {
    * testo: quei frame devono aggiornare il contenuto reale prima di cacheare.
    * @param {ChunkStore|null} strokeStore
    * @param {import('./board_proxy.js').ProxyFrame|null} proxies
-   * @param {TransformFrame|null} transform
+   * @param {TransformFrameSet} transform
    * @param {FxFrame|null} fx
    * @param {import('./text_quad.js').TextQuadCache|null} textQuads
    * @param {import('./svg_quad.js').SvgQuadCache|null} svgQuads
@@ -1615,12 +1779,14 @@ export class GLRenderer {
   // bake (caricata/ricaricata qui, premoltiplicata all'upload come il testo
   // del proxy), scissor sul board del livello — lo stesso clip dell'SVG.
   // Presuppone progChunk legato; lascia lo stato dei chunk com'era.
+  /** @typedef {{canvas: HTMLCanvasElement, tex: WebGLTexture|null, texGen: number, texDirty: boolean, x: number, y: number, w: number, h: number}} VectorQuad */
+
   /** @param {Camera} camera @param {Layer} layer @param {import('./text_quad.js').TextQuadEntry} q */
   _drawTextQuad(camera, layer, q) {
     this._drawVectorQuad(camera, layer, q);
   }
 
-  /** @param {Camera} camera @param {Layer} layer @param {{canvas: HTMLCanvasElement, tex: WebGLTexture|null, texGen: number, texDirty: boolean, x: number, y: number, w: number, h: number}} q */
+  /** @param {Camera} camera @param {Layer} layer @param {VectorQuad} q */
   _drawVectorQuad(camera, layer, q) {
     const gl = this.gl;
     this._ensureTextQuadTex(q);
@@ -1650,7 +1816,7 @@ export class GLRenderer {
   // WebGL2 le mipmap coprono il transitorio dello zoom prima della
   // ricottura (su WebGL1 il bake è NPOT: niente mip, LINEAR basta perché
   // la scala cotta segue lo zoom assestato).
-  /** @param {import('./text_quad.js').TextQuadEntry} q */
+  /** @param {VectorQuad} q bake testo o SVG (stessi campi texture) */
   _ensureTextQuadTex(q) {
     const gl = this.gl;
     if (q.tex && q.texGen === this.ctxGen && !q.texDirty) return;
@@ -1682,7 +1848,8 @@ export class GLRenderer {
   /**
    * @param {Camera} camera @param {Layer} layer @param {number} activeId
    * @param {ChunkStore|null} strokeStore @param {number} strokeOpacity @param {boolean} eraserLive
-   * @param {TransformFrameSet} transform @param {FxFrame|null} fx
+   * @param {TransformFrame|null} transform frame del SOLO layer (narrowed dal chiamante via transformForLayer)
+   * @param {FxFrame|null} fx
    * @param {number} cx0 @param {number} cy0 @param {number} cx1 @param {number} cy1
    */
   _drawLayer(camera, layer, activeId, strokeStore, strokeOpacity, eraserLive, transform, fx, cx0, cy0, cx1, cy1) {
@@ -1728,7 +1895,23 @@ export class GLRenderer {
       gl.disable(gl.SCISSOR_TEST);
       return;
     }
-    if (fx !== null && fx.layerId === layer.id && this._fxOut) {
+    if (fx !== null && (fx.kind === 'smudge' || fx.kind === 'liquify') && fx.layerId === layer.id) {
+      // sessione sfumino/liquify GPU: il livello è la texture di sessione,
+      // clippata al board (i dab l'hanno già aggiornata in questo frame)
+      const tex = fx.kind === 'smudge' ? this._smState : this._lqResolved;
+      if (tex) {
+        this._scissorClip(camera, fx.clip);
+        gl.uniform1f(this.uAlpha, layer.opacity);
+        gl.uniform2f(this.uSize, fx.w, fx.h);
+        gl.uniform2f(this.uOrigin, fx.x, fx.y);
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        gl.uniform2f(this.uSize, CHUNK, CHUNK);
+        gl.disable(gl.SCISSOR_TEST);
+        return;
+      }
+    }
+    if (fx !== null && fx.kind !== 'smudge' && fx.kind !== 'liquify' && fx.layerId === layer.id && this._fxOut) {
       // sessione Effetti: il livello è il quad cotto, clippato al board
       this._scissorClip(camera, fx.clip);
       gl.uniform1f(this.uAlpha, layer.opacity);
@@ -1774,7 +1957,7 @@ export class GLRenderer {
    * @param {number} baseIdx @param {number} endIdx
    * @param {number} activeId @param {ChunkStore|null} strokeStore
    * @param {number} strokeOpacity @param {boolean} eraserLive
-   * @param {TransformFrame|null} transform @param {FxFrame|null} fx
+   * @param {TransformFrameSet} transform @param {FxFrame|null} fx
    * @param {number} cx0 @param {number} cy0 @param {number} cx1 @param {number} cy1
    */
   _renderClipGroup(camera, layers, baseIdx, endIdx, activeId, strokeStore, strokeOpacity, eraserLive, transform, fx, cx0, cy0, cx1, cy1) {
@@ -2110,7 +2293,8 @@ export class GLRenderer {
         gauss: FS_BLUR, motion: FS_MOTION, zoom: FS_ZOOM, noise: FS_NOISE,
         grain: FS_GRAIN, thresh: FS_THRESH, halftone: FS_HALFTONE,
         strokeDist: FS_DIST_V, stroke: FS_STROKE,
-        tint: FS_TINT,
+        tint: FS_TINT, smudge: FS_SMUDGE,
+        liqStamp: FS_LIQ_STAMP, liqResolve: FS_LIQ_RESOLVE,
       };
       prog = link(gl, VS_BLIT, sources[name]);
       this._fxProgs[name] = prog;
@@ -2118,7 +2302,10 @@ export class GLRenderer {
       const u = {};
       for (const uname of ['uTex', 'uStep', 'uSigma', 'uR', 'uCenter', 'uK',
         'uAmount', 'uColor', 'uSize', 'uRoughness', 'uSeed', 'uTexSize', 'uThresh',
-        'uRadius', 'uSpacing', 'uAngle', 'uOrigin', 'uSrc', 'uW', 'uPos']) {
+        'uRadius', 'uSpacing', 'uAngle', 'uOrigin', 'uSrc', 'uW', 'uPos',
+        'uBlurT', 'uRectOrigin', 'uRectSize', 'uUvScale', 'uCore', 'uWW',
+        'uPressure', 'uBlurK', 'uDragK', 'uOff', 'uOffA', 'uOffB',
+        'uDispT', 'uScrOrigin', 'uScrS', 'uChaos', 'uSeedF', 'uDXY', 'uMode']) {
         const loc = gl.getUniformLocation(prog, uname);
         if (loc) u[uname] = loc;
       }
@@ -2309,11 +2496,379 @@ export class GLRenderer {
     return { x: fx.x, y: fx.y, w: fx.w, h: fx.h, data: out };
   }
 
+  // ---- sfumino GPU: copy+stamp su una texture di stato ----
+
+  /**
+   * Avvia la sessione sfumino GPU: lo stato del livello vive in UNA texture
+   * (riga 0 = mondo in alto, come le sessioni fx), i dab sono draw call
+   * (smudgeDab), il live e' il quad nello slot fx di _drawLayer (kind
+   * 'smudge'), il commit e' smudgeReadback del rettangolo toccato. null =
+   * niente GPU (contesto perso o board oltre MAX_TEXTURE_SIZE): il
+   * chiamante resta sul motore CPU wasm/JS.
+   * @param {number} layerId @param {ChunkStore} store
+   * @param {{x0:number,y0:number,x1:number,y1:number}} clip
+   * @param {{radius:number, hardness:number, sigma:number, drag:number, blurOpacity:number, useBlur:boolean}} p
+   * @returns {FxFrame|null}
+   */
+  smudgeBegin(layerId, store, clip, p) {
+    if (!this.ok || this.contextLost) return null;
+    const gl = this.gl;
+    const w = clip.x1 - clip.x0 + 1;
+    const h = clip.y1 - clip.y0 + 1;
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    if (w > maxTex || h > maxTex) return null;
+    this.smudgeEnd();
+    // stato = chunk affiancati (stessa costruzione della sorgente fx)
+    this._smState = this._newFxTex(w, h);
+    gl.bindTexture(gl.TEXTURE_2D, this._smState);
+    for (const c of store.map.values()) {
+      const ox = c.cx * CHUNK - clip.x0, oy = c.cy * CHUNK - clip.y0;
+      if (ox < 0 || oy < 0 || ox + CHUNK > w || oy + CHUNK > h) continue;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, ox, oy, CHUNK, CHUNK, gl.RGBA, gl.UNSIGNED_BYTE,
+        new Uint8Array(c.data.buffer, c.data.byteOffset, c.data.length));
+    }
+    // scratch della copia pre-dab, dimensionato sul dab massimo; il pull
+    // oltre mezzo raggio si clampa (solo catch-up estremo, non si vede)
+    const maxOff = Math.max(2, p.radius * 0.5);
+    const pad = Math.ceil(Math.max(p.sigma * 3 + 2, maxOff + p.radius * 0.07 + 2));
+    const S = Math.min(Math.max(w, h), Math.ceil(p.radius) * 2 + pad * 2 + 2);
+    this._smScratch = this._newFxTex(S, S);
+    if (p.useBlur) {
+      this._smBlur = this._newFxTex(S, S);
+      this._smPing = this._newFxTex(S, S);
+    }
+    this._smFbo = gl.createFramebuffer();
+    this._smW = w; this._smH = h;
+    this._smX = clip.x0; this._smY = clip.y0;
+    this._smS = S;
+    this._smPad = pad;
+    this._smMaxOff = maxOff;
+    this._smP = p;
+    return {
+      id: -1, kind: 'smudge', layerId, store,
+      x: clip.x0, y: clip.y0, w, h, clip,
+      sigma: 0, radius: 0, spacing: 0, angle: 0, dist: 0, k: 0, cx: 0, cy: 0,
+      amount: 0, colorMix: 0, grainSize: 0, roughness: 0, seed: 0, thresh: 0,
+      strokeW: 0, strokePos: 0, strokeR: 0, strokeG: 0, strokeB: 0,
+    };
+  }
+
+  /**
+   * Un dab: azzera lo scratch (i margini oltre il rect clampato = mondo
+   * trasparente, come nel motore CPU), copia il rect pre-dab dallo stato,
+   * blur separabile opzionale, stamp sul rect. Lo stato GL che tocca viene
+   * ripristinato in fondo: i dab girano FUORI da render().
+   * @param {number} cx @param {number} cy centro del dab (mondo)
+   * @param {number} pressure
+   * @param {number} dirX @param {number} dirY @param {number} dragOffset
+   * @param {number} dragK drag se il dab trascina, 0 altrimenti
+   * @param {number} blurK blurOpacity*(1-drag) se sfoca, 0 altrimenti
+   */
+  smudgeDab(cx, cy, pressure, dirX, dirY, dragOffset, dragK, blurK) {
+    if (!this._smState || this.contextLost) return;
+    const gl = this.gl;
+    const p = /** @type {NonNullable<typeof this._smP>} */ (this._smP);
+    if (dragOffset > this._smMaxOff) dragOffset = this._smMaxOff;
+    const S = this._smS;
+    const r = p.radius;
+    const pad = this._smPad;
+    const sx = cx - this._smX, sy = cy - this._smY; // coordinate stato
+    let rx0 = Math.floor(sx - r) - pad;
+    let ry0 = Math.floor(sy - r) - pad;
+    let rx1 = Math.ceil(sx + r) + pad;
+    let ry1 = Math.ceil(sy + r) + pad;
+    if (rx0 < 0) rx0 = 0;
+    if (ry0 < 0) ry0 = 0;
+    if (rx1 > this._smW - 1) rx1 = this._smW - 1;
+    if (ry1 > this._smH - 1) ry1 = this._smH - 1;
+    const rw = Math.min(rx1 - rx0 + 1, S), rh = Math.min(ry1 - ry0 + 1, S);
+    if (rw <= 0 || rh <= 0) return;
+
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._smFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smScratch, 0);
+    gl.viewport(0, 0, S, S);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smState, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this._smScratch);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, rx0, ry0, rw, rh);
+    if (blurK > 0 && this._smBlur && this._smPing) {
+      const u = this._bindFxProg('gauss');
+      gl.uniform1f(u.uSigma, p.sigma);
+      gl.uniform1i(u.uR, Math.min(FX_MAX_R, Math.max(1, Math.ceil(3 * p.sigma))));
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smPing, 0);
+      gl.bindTexture(gl.TEXTURE_2D, this._smScratch);
+      gl.uniform2f(u.uStep, 1 / S, 0);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smBlur, 0);
+      gl.bindTexture(gl.TEXTURE_2D, this._smPing);
+      gl.uniform2f(u.uStep, 0, 1 / S);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+    const u = this._bindFxProg('smudge');
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smState, 0);
+    gl.viewport(rx0, ry0, rw, rh);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, blurK > 0 && this._smBlur ? this._smBlur : this._smScratch);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._smScratch);
+    gl.uniform1i(u.uBlurT, 1);
+    gl.uniform2f(u.uRectOrigin, rx0, ry0);
+    gl.uniform2f(u.uRectSize, rw, rh);
+    gl.uniform2f(u.uUvScale, rw / S, rh / S);
+    gl.uniform2f(u.uCenter, sx, sy);
+    const core = r * p.hardness;
+    gl.uniform1f(u.uCore, core);
+    gl.uniform1f(u.uWW, Math.max(1, r - core));
+    gl.uniform1f(u.uPressure, pressure);
+    gl.uniform1f(u.uBlurK, blurK);
+    gl.uniform1f(u.uDragK, dragK);
+    const offX = -dirX * dragOffset, offY = -dirY * dragOffset;
+    const cs = Math.max(0.5, r * 0.07);
+    const crX = -dirY * cs, crY = dirX * cs;
+    gl.uniform2f(u.uOff, offX / S, offY / S);
+    gl.uniform2f(u.uOffA, (offX + crX) / S, (offY + crY) / S);
+    gl.uniform2f(u.uOffB, (offX - crX) / S, (offY - crY) / S);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // ripristino per il flusso di render
+    gl.disableVertexAttribArray(gl.getAttribLocation(this._fxProgs.smudge, 'aPos'));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+  }
+
+  /**
+   * Pixel correnti dello stato nel rettangolo mondo dato, premultiplied
+   * riparato come fxReadback. null a contesto perso (il tratto si perde:
+   * i chunk CPU restano allo stato pre-tratto, coerente col restore).
+   * @param {{x0:number, y0:number, x1:number, y1:number}} rect mondo
+   * @returns {{x:number, y:number, w:number, h:number, data:Uint8ClampedArray}|null}
+   */
+  smudgeReadback(rect) {
+    if (!this._smState || this.contextLost) return null;
+    const gl = this.gl;
+    const x0 = Math.max(rect.x0 - this._smX, 0), y0 = Math.max(rect.y0 - this._smY, 0);
+    const x1 = Math.min(rect.x1 - this._smX, this._smW - 1);
+    const y1 = Math.min(rect.y1 - this._smY, this._smH - 1);
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (w <= 0 || h <= 0) return null;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._smFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._smState, 0);
+    const out = new Uint8ClampedArray(w * h * 4);
+    gl.readPixels(x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(out.buffer));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    for (let i = 0; i < out.length; i += 4) {
+      const a = out[i + 3];
+      if (out[i] > a) out[i] = a;
+      if (out[i + 1] > a) out[i + 1] = a;
+      if (out[i + 2] > a) out[i + 2] = a;
+    }
+    return { x: this._smX + x0, y: this._smY + y0, w, h, data: out };
+  }
+
+  smudgeEnd() {
+    const gl = this.gl;
+    if (this._smState) { gl.deleteTexture(this._smState); this._smState = null; }
+    if (this._smScratch) { gl.deleteTexture(this._smScratch); this._smScratch = null; }
+    if (this._smBlur) { gl.deleteTexture(this._smBlur); this._smBlur = null; }
+    if (this._smPing) { gl.deleteTexture(this._smPing); this._smPing = null; }
+    if (this._smFbo) { gl.deleteFramebuffer(this._smFbo); this._smFbo = null; }
+    this._smP = null;
+  }
+
+  // ---- liquify GPU: campo di spostamento accumulato ----
+
+  /**
+   * Avvia la sessione liquify GPU: base del livello in una texture RGBA8,
+   * campo di spostamento RGBA16F (RG = offset sorgente in px, zero-init
+   * garantito da WebGL), resolved RGBA8 presentato nello slot fx (kind
+   * 'liquify'). Serve WebGL2 + EXT_color_buffer_float: senza, null e il
+   * chiamante resta sul motore CPU.
+   * @param {number} layerId @param {ChunkStore} store
+   * @param {{x0:number,y0:number,x1:number,y1:number}} clip
+   * @param {{radius:number, chaos:number, seed:number}} p
+   * @returns {FxFrame|null}
+   */
+  liquifyBegin(layerId, store, clip, p) {
+    if (!this.ok || this.contextLost || !this.isGL2) return null;
+    const gl = /** @type {WebGL2RenderingContext} */ (this.gl);
+    if (!gl.getExtension('EXT_color_buffer_float')) return null;
+    const w = clip.x1 - clip.x0 + 1;
+    const h = clip.y1 - clip.y0 + 1;
+    if (w > gl.getParameter(gl.MAX_TEXTURE_SIZE) || h > gl.getParameter(gl.MAX_TEXTURE_SIZE)) return null;
+    this.liquifyEnd();
+    this._lqBase = this._newFxTex(w, h);
+    gl.bindTexture(gl.TEXTURE_2D, this._lqBase);
+    for (const c of store.map.values()) {
+      const ox = c.cx * CHUNK - clip.x0, oy = c.cy * CHUNK - clip.y0;
+      if (ox < 0 || oy < 0 || ox + CHUNK > w || oy + CHUNK > h) continue;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, ox, oy, CHUNK, CHUNK, gl.RGBA, gl.UNSIGNED_BYTE,
+        new Uint8Array(c.data.buffer, c.data.byteOffset, c.data.length));
+    }
+    /** @param {number} tw @param {number} th */
+    const newF = (tw, th) => {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, tw, th, 0, gl.RGBA, gl.HALF_FLOAT, null);
+      return tex;
+    };
+    this._lqDisp = newF(w, h);
+    // scratch della copia pre-dab del campo: il vecchio campo si campiona a
+    // pos+w, quindi il pad copre lo spostamento massimo (~1.5r, tappato)
+    const pad = Math.min(Math.ceil(p.radius * 1.5) + 4, 768);
+    const S = Math.min(Math.max(w, h), Math.ceil(p.radius) * 2 + pad * 2 + 2);
+    this._lqScratch = newF(S, S);
+    this._lqResolved = this._newFxTex(w, h);
+    this._lqFbo = gl.createFramebuffer();
+    // resolved parte come copia della base (campo nullo = identita')
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._lqFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._lqBase, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this._lqResolved);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, w, h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this._lqW = w; this._lqH = h;
+    this._lqX = clip.x0; this._lqY = clip.y0;
+    this._lqS = S;
+    this._lqPad = pad;
+    this._lqP = p;
+    return {
+      id: -1, kind: 'liquify', layerId, store,
+      x: clip.x0, y: clip.y0, w, h, clip,
+      sigma: 0, radius: 0, spacing: 0, angle: 0, dist: 0, k: 0, cx: 0, cy: 0,
+      amount: 0, colorMix: 0, grainSize: 0, roughness: 0, seed: 0, thresh: 0,
+      strokeW: 0, strokePos: 0, strokeR: 0, strokeG: 0, strokeB: 0,
+    };
+  }
+
+  /**
+   * Un dab: copia del campo (rect+pad) nello scratch, stamp del modo sul
+   * campo (composizione D_new(p) = w(p) + D_old(p+w(p))), resolve del rect
+   * dalla base attraverso il campo totale. Stato GL ripristinato in coda.
+   * @param {number} mode 0=push 1=twirlR 2=twirlL 3=pinch 4=expand 5=crystals 6=edge
+   * @param {number} cx @param {number} cy centro (mondo)
+   * @param {number} dx @param {number} dy spinta del dab (px, gia' clampata)
+   * @param {number} strength pressione x forza (0..1)
+   */
+  liquifyDab(mode, cx, cy, dx, dy, strength) {
+    if (!this._lqDisp || this.contextLost) return;
+    const gl = this.gl;
+    const p = /** @type {NonNullable<typeof this._lqP>} */ (this._lqP);
+    const r = p.radius;
+    const pad = this._lqPad;
+    const S = this._lqS;
+    const sx = cx - this._lqX, sy = cy - this._lqY;
+    let rx0 = Math.max(Math.floor(sx - r), 0);
+    let ry0 = Math.max(Math.floor(sy - r), 0);
+    let rx1 = Math.min(Math.ceil(sx + r), this._lqW - 1);
+    let ry1 = Math.min(Math.ceil(sy + r), this._lqH - 1);
+    const rw = rx1 - rx0 + 1, rh = ry1 - ry0 + 1;
+    if (rw <= 0 || rh <= 0) return;
+    // scratch: copia del campo attorno al rect (clamp ai bordi dello stato)
+    const scx0 = Math.max(rx0 - pad, 0), scy0 = Math.max(ry0 - pad, 0);
+    const scw = Math.min(Math.min(rx1 + pad, this._lqW - 1) - scx0 + 1, S);
+    const sch = Math.min(Math.min(ry1 + pad, this._lqH - 1) - scy0 + 1, S);
+
+    gl.disable(gl.BLEND);
+    gl.disable(gl.SCISSOR_TEST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._lqFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._lqScratch, 0);
+    gl.viewport(0, 0, S, S);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._lqDisp, 0);
+    gl.bindTexture(gl.TEXTURE_2D, this._lqScratch);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, scx0, scy0, scw, sch);
+    // stamp sul campo
+    let u = this._bindFxProg('liqStamp');
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._lqDisp, 0);
+    gl.viewport(rx0, ry0, rw, rh);
+    gl.bindTexture(gl.TEXTURE_2D, this._lqScratch);
+    gl.uniform2f(u.uRectOrigin, rx0, ry0);
+    gl.uniform2f(u.uRectSize, rw, rh);
+    gl.uniform2f(u.uScrOrigin, scx0, scy0);
+    gl.uniform1f(u.uScrS, S);
+    gl.uniform2f(u.uCenter, sx, sy);
+    const core = r * 0.18; // stessa durezza del falloff CPU (_maskAt)
+    gl.uniform1f(u.uCore, core);
+    gl.uniform1f(u.uWW, Math.max(1, r - core));
+    gl.uniform1f(u.uPressure, strength);
+    gl.uniform1f(u.uRadius, r);
+    gl.uniform1f(u.uChaos, p.chaos);
+    gl.uniform1f(u.uSeedF, p.seed);
+    gl.uniform2f(u.uDXY, dx, dy);
+    gl.uniform1i(u.uMode, mode);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // resolve del rect: base -> resolved attraverso il campo
+    u = this._bindFxProg('liqResolve');
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._lqResolved, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this._lqDisp);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._lqBase);
+    gl.uniform1i(u.uDispT, 1);
+    gl.uniform2f(u.uTexSize, this._lqW, this._lqH);
+    gl.uniform2f(u.uRectOrigin, rx0, ry0);
+    gl.uniform2f(u.uRectSize, rw, rh);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    // ripristino per il flusso di render (i dab girano FUORI da render())
+    gl.disableVertexAttribArray(gl.getAttribLocation(this._fxProgs.liqResolve, 'aPos'));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+  }
+
+  /**
+   * Pixel correnti del resolved nel rettangolo mondo dato (premultiplied
+   * riparato come fxReadback). null a contesto perso.
+   * @param {{x0:number, y0:number, x1:number, y1:number}} rect mondo
+   * @returns {{x:number, y:number, w:number, h:number, data:Uint8ClampedArray}|null}
+   */
+  liquifyReadback(rect) {
+    if (!this._lqResolved || this.contextLost) return null;
+    const gl = this.gl;
+    const x0 = Math.max(rect.x0 - this._lqX, 0), y0 = Math.max(rect.y0 - this._lqY, 0);
+    const x1 = Math.min(rect.x1 - this._lqX, this._lqW - 1);
+    const y1 = Math.min(rect.y1 - this._lqY, this._lqH - 1);
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (w <= 0 || h <= 0) return null;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._lqFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._lqResolved, 0);
+    const out = new Uint8ClampedArray(w * h * 4);
+    gl.readPixels(x0, y0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(out.buffer));
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    for (let i = 0; i < out.length; i += 4) {
+      const a = out[i + 3];
+      if (out[i] > a) out[i] = a;
+      if (out[i + 1] > a) out[i + 1] = a;
+      if (out[i + 2] > a) out[i + 2] = a;
+    }
+    return { x: this._lqX + x0, y: this._lqY + y0, w, h, data: out };
+  }
+
+  liquifyEnd() {
+    const gl = this.gl;
+    if (this._lqBase) { gl.deleteTexture(this._lqBase); this._lqBase = null; }
+    if (this._lqDisp) { gl.deleteTexture(this._lqDisp); this._lqDisp = null; }
+    if (this._lqScratch) { gl.deleteTexture(this._lqScratch); this._lqScratch = null; }
+    if (this._lqResolved) { gl.deleteTexture(this._lqResolved); this._lqResolved = null; }
+    if (this._lqFbo) { gl.deleteFramebuffer(this._lqFbo); this._lqFbo = null; }
+    this._lqP = null;
+  }
+
   /** @param {string} name */
   _bindStyleProg(name) {
     const gl = this.gl;
     let prog = this._styleProgs[name];
     if (!prog) {
+      /** @type {Record<string, string>} */
       const sources = {
         jfaInit: FS_JFA_INIT,
         jfaStep: FS_JFA_STEP,

@@ -46,7 +46,7 @@ export function snapshotRect(store, x, y, w, h) {
 // y[n] = B·x[n] + c1·y[n-1] + c2·y[n-2] + c3·y[n-3], stesso filtro
 // all'indietro. Validi da sigma ~0.5 in su.
 /** @param {number} sigma */
-function iirCoeffs(sigma) {
+export function iirCoeffs(sigma) {
   const s = Math.max(0.5, sigma);
   const q = s >= 2.5
     ? 0.98711 * s - 0.96330
@@ -146,11 +146,16 @@ function vPass(f, w, h, B, c1, c2, c3) {
 // standard sigma in px). Accumulo in Float32, riscrittura u8 con il vincolo
 // premultiplied r,g,b <= a (l'arrotondamento indipendente dei canali
 // potrebbe violarlo di 1).
-/** @param {Uint8ClampedArray} data @param {number} w @param {number} h @param {number} sigma */
-export function gaussianBlurBuffer(data, w, h, sigma) {
+/**
+ * @param {Uint8ClampedArray} data @param {number} w @param {number} h
+ * @param {number} sigma @param {Float32Array|null} [f32] scratch >= w*h*4
+ */
+export function gaussianBlurBuffer(data, w, h, sigma, f32 = null) {
   if (sigma <= 0 || w <= 0 || h <= 0) return;
   const n = w * h * 4;
-  const f = new Float32Array(n);
+  // scratch riusabile dal chiamante (pennello blur: un dab per volta, il
+  // buffer per-dab diventerebbe churn GC continuo durante il tratto)
+  const f = f32 !== null && f32.length >= n ? f32 : new Float32Array(n);
   for (let i = 0; i < n; i++) f[i] = data[i];
   const { B, c1, c2, c3 } = iirCoeffs(sigma);
   hPass(f, w, h, B, c1, c2, c3);
