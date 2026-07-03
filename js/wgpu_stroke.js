@@ -1,0 +1,694 @@
+// STROKE BUFFER WEBGPU — fase 1 del piano (docs/webgpu-engine-plan.md).
+// Il tratto VIVO rasterizza su GPU: i descrittori diventano dispatch compute
+// su un'arena di chunk 256² GPU-residenti; i pixel tornano allo store
+// specchio via mapAsync (MAI readback sincrono) e da lì rendering, commit,
+// undo e collab restano quelli di sempre. Stesso contratto del raster
+// worker: main = autorità sulla struttura (chunk creati qui), pixel che
+// atterrano in ritardo di 1-2 frame (l'ink overlay copre il volo tramite
+// gli stessi contatori sent/tickDrained/inkRing del bridge).
+// La matematica è quella sigillata dai test: dab = maschere CPU + interi
+// (wgpu_dab.js), capsule v2 (capsule_int.js) — bit-exact col CPU per
+// costruzione, quindi la collab non si accorge di chi ha rasterizzato.
+// Endpass della punta = replay INTERO da zero (la GPU se lo può permettere):
+// niente pool di slot da scambiare, i pixel vecchi restano visibili finché
+// il replay non atterra, i chunk scoperti si azzerano a fine atterraggio.
+// Flush sincrono (raro: pen-down nella finestra di commit) = il chiamante
+// ributta il tratto sul CPU — stessi byte.
+
+import { ChunkStore, CHUNK, CHUNK_SHIFT, chunkKey } from './store.js';
+import { T_DAB, STRIDE } from './stroke.js';
+import { CAP_STRIDE_I32, CAP_FP, FALLOFF_LUT, quantHardness, capsuleIntParams } from './capsule_int.js';
+
+const REC_U32 = 12;          // record kernel: [tipo, ...campi], vedi WGSL
+const SLOT_WORDS = CHUNK * CHUNK; // 65536 u32 = 256KB per chunk
+const ARENA_START = 96;      // slot iniziali (24MB), cresce ×2
+const ATLAS_START = 4 << 20; // atlas maschere iniziale (4MB)
+const INK_RING = 2048;
+
+export const WGSL_STROKE = /* wgsl */ `
+struct Params {
+  chunkOX: i32,
+  chunkOY: i32,
+  slotBase: u32,
+  recCount: u32,
+  clipX0: i32,
+  clipY0: i32,
+  clipX1: i32,
+  clipY1: i32,
+  hq: i32,
+  buildup: u32,
+  capR: u32,
+  capG: u32,
+  capB: u32,
+  pad0: u32,
+  pad1: u32,
+  pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> arena: array<u32>;
+@group(0) @binding(1) var<storage, read> masks: array<u32>;
+@group(0) @binding(2) var<storage, read> lut: array<u32>;
+@group(0) @binding(3) var<storage, read> recs: array<u32>;
+@group(0) @binding(4) var<uniform> P: Params;
+
+fn div255(x: u32) -> u32 {
+  let t = x + 128u;
+  return (t + (t >> 8u)) >> 8u;
+}
+fn maskByte(off: u32) -> u32 {
+  return (masks[off >> 2u] >> (8u * (off & 3u))) & 0xffu;
+}
+fn lut16(i: u32) -> u32 {
+  return (lut[i >> 1u] >> (16u * (i & 1u))) & 0xffffu;
+}
+fn mul64(a: u32, b: u32) -> vec2<u32> {
+  let a0 = a & 0xffffu; let a1 = a >> 16u;
+  let b0 = b & 0xffffu; let b1 = b >> 16u;
+  let ll = a0 * b0;
+  let lh = a0 * b1;
+  let hl = a1 * b0;
+  let mid = lh + hl;
+  let carry = select(0u, 0x10000u, mid < lh);
+  let lo = ll + (mid << 16u);
+  let c2 = select(0u, 1u, lo < ll);
+  let hi = a1 * b1 + (mid >> 16u) + carry + c2;
+  return vec2<u32>(hi, lo);
+}
+fn le64(a: vec2<u32>, b: vec2<u32>) -> bool {
+  return a.x < b.x || (a.x == b.x && a.y <= b.y);
+}
+fn divT(num: u32, den: u32) -> u32 {
+  let lo0 = num << 16u;
+  let lo = lo0 + (den >> 1u);
+  let n64 = vec2<u32>((num >> 16u) + select(0u, 1u, lo < lo0), lo);
+  var q = u32(clamp(f32(num) * 65536.0 / f32(den) + 0.5, 0.0, 65536.0));
+  for (var k = 0u; k < 8u; k = k + 1u) {
+    if (!le64(mul64(q, den), n64)) { q = q - 1u; }
+    else if (le64(mul64(q + 1u, den), n64)) { q = q + 1u; }
+    else { break; }
+  }
+  return q;
+}
+fn isqrtRound(n: u32) -> u32 {
+  var s = min(u32(sqrt(f32(n))), 46340u);
+  for (var k = 0u; k < 4u; k = k + 1u) {
+    if (s * s > n) { s = s - 1u; }
+    else if ((s + 1u) * (s + 1u) <= n) { s = s + 1u; }
+    else { break; }
+  }
+  if (n > s * s + s) { s = s + 1u; }
+  return s;
+}
+
+// capsule v2 (speculare a capsuleIntMa)
+fn capsuleMa(o: u32, px: i32, py: i32) -> u32 {
+  let rx = px - bitcast<i32>(recs[o + 1u]);
+  let ry = py - bitcast<i32>(recs[o + 2u]);
+  let dx = bitcast<i32>(recs[o + 3u]);
+  let dy = bitcast<i32>(recs[o + 4u]);
+  let r0 = bitcast<i32>(recs[o + 6u]);
+  let dr = bitcast<i32>(recs[o + 7u]);
+  let rmax = max(r0, r0 + dr);
+  let pad = rmax + 32;
+  if (rx < min(0, dx) - pad || rx > max(0, dx) + pad ||
+      ry < min(0, dy) - pad || ry > max(0, dy) + pad) { return 0u; }
+  let den = recs[o + 5u];
+  let num = rx * dx + ry * dy;
+  var tq: u32;
+  if (den == 0u || num <= 0) { tq = 0u; }
+  else if (num >= bitcast<i32>(den)) { tq = 65536u; }
+  else { tq = divT(u32(num), den); }
+  let ti = i32(tq);
+  let qx = rx - ((dx * ti) >> 16u);
+  let qy = ry - ((dy * ti) >> 16u);
+  let rT = r0 + ((dr * ti) >> 16u);
+  let lim = rT + 32;
+  if (lim <= 0) { return 0u; }
+  let d2 = u32(qx * qx) + u32(qy * qy);
+  let ulim = u32(lim);
+  if (d2 >= ulim * ulim) { return 0u; }
+  let aT = bitcast<i32>(recs[o + 8u]) + ((bitcast<i32>(recs[o + 9u]) * (ti >> 4u)) >> 12u);
+  if (aT <= 0) { return 0u; }
+  let core = (rT * P.hq) >> 12u;
+  let w = u32(max(rT - core, 32));
+  let d = i32(isqrtRound(d2));
+  var u: u32 = 0u;
+  if (d > core) { u = (u32((d - core) * 1024) + (w >> 1u)) / w; }
+  if (u >= 1024u) { return 0u; }
+  return (lut16(u) * u32(aT) + (1u << 22u)) >> 23u;
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let gx = P.chunkOX + i32(gid.x);
+  let gy = P.chunkOY + i32(gid.y);
+  if (gx < P.clipX0 || gx > P.clipX1 || gy < P.clipY0 || gy > P.clipY1) { return; }
+  let pi = P.slotBase + (gid.y << 8u) + gid.x;
+  let p = arena[pi];
+  var pr = p & 0xffu;
+  var pg = (p >> 8u) & 0xffu;
+  var pb = (p >> 16u) & 0xffu;
+  var pa = (p >> 24u) & 0xffu;
+  var wrote = false;
+  for (var i = 0u; i < P.recCount; i = i + 1u) {
+    let o = i * 12u;
+    if (recs[o] == 0u) {
+      // dab: maschera CPU + interi (wash >= / buildup), come wgpu_dab.js
+      let mx = gx - bitcast<i32>(recs[o + 1u]);
+      let my = gy - bitcast<i32>(recs[o + 2u]);
+      let size = recs[o + 3u];
+      if (mx < 0 || my < 0 || mx >= i32(size) || my >= i32(size)) { continue; }
+      let m = maskByte(recs[o + 4u] + u32(my) * size + u32(mx));
+      if (m == 0u) { continue; }
+      let ma = div255(m * recs[o + 5u]);
+      if (ma == 0u) { continue; }
+      if (P.buildup != 0u) {
+        let inv = 255u - ma;
+        pr = div255(recs[o + 6u] * ma) + div255(pr * inv);
+        pg = div255(recs[o + 7u] * ma) + div255(pg * inv);
+        pb = div255(recs[o + 8u] * ma) + div255(pb * inv);
+        pa = ma + div255(pa * inv);
+        wrote = true;
+      } else if (ma >= pa) {
+        pr = div255(recs[o + 6u] * ma);
+        pg = div255(recs[o + 7u] * ma);
+        pb = div255(recs[o + 8u] * ma);
+        pa = ma;
+        wrote = true;
+      }
+    } else {
+      // capsule v2: sempre wash, tie al primo (>)
+      let ma = capsuleMa(o, gx * 32 + 16, gy * 32 + 16);
+      if (ma > pa) {
+        pr = div255(P.capR * ma);
+        pg = div255(P.capG * ma);
+        pb = div255(P.capB * ma);
+        pa = ma;
+        wrote = true;
+      }
+    }
+  }
+  if (wrote) {
+    arena[pi] = pr | (pg << 8u) | (pb << 16u) | (pa << 24u);
+  }
+}
+`;
+
+export class WgpuStrokeBridge {
+  /** Feature-detect a runtime; null se WebGPU non c'è. @param {() => void} requestFrame */
+  static async create(requestFrame) {
+    const gpu = /** @type {any} */ (navigator).gpu;
+    if (!gpu) return null;
+    try {
+      const adapter = await gpu.requestAdapter();
+      if (!adapter) return null;
+      const device = await adapter.requestDevice();
+      const b = new WgpuStrokeBridge(device, requestFrame);
+      await b._init();
+      return b;
+    } catch (err) {
+      console.warn('[wgpu_stroke] init fallita, fallback worker/CPU:', err);
+      return null;
+    }
+  }
+
+  /** @param {any} device @param {() => void} requestFrame */
+  constructor(device, requestFrame) {
+    /** @type {any} */ this.device = device;
+    this._requestFrame = requestFrame;
+    /** @type {any} */ this.pipeline = null;
+    /** @type {any} */ this._lutBuf = null;
+    /** @type {any} */ this._arena = null;
+    this._arenaSlots = 0;
+    /** @type {number[]} */ this._freeSlots = [];
+    /** @type {Map<number, number>} chiave chunk -> slot */
+    this._slotOf = new Map();
+    /** @type {Set<number>} slot da azzerare al prossimo encode */
+    this._needClear = new Set();
+    /** @type {any} */ this._atlas = null;
+    this._atlasCap = ATLAS_START;
+    this._atlasUsed = 0;
+    /** @type {Map<object, number>} stamp -> offset atlas */
+    this._atlasOff = new Map();
+    /** @type {{off: number, mask: Uint8Array}[]} */
+    this._maskWrites = [];
+    // store specchio: i chunk CPU dove atterrano i readback (il renderer e
+    // il commit leggono da qui, come per il worker)
+    this.store = new ChunkStore('gpu-stroke', null);
+    this.usable = false;
+    // stato per-tratto
+    /** @type {import('./stroke.js').Snap|null} */
+    this._snap = null;
+    /** @type {{x0:number,y0:number,x1:number,y1:number}|null} */
+    this._clip = null;
+    /** @type {import('./brush.js').StampCache|null} */
+    this._cache = null;
+    this._hq = 0;
+    // batch del frame: record + chunk toccati + rect sporco per chunk
+    /** @type {number[]} */
+    this._recs = [];
+    /** @type {Set<number>} */
+    this._chunks = new Set();
+    /** @type {Map<number, {x0: number, y0: number, x1: number, y1: number}>} */
+    this._dirty = new Map();     // rect locale al chunk: readback a banda + markDirty preciso
+    // buffer PERSISTENTI (niente crea-e-distruggi per frame: era una fonte
+    // di scatti) + pool di staging con flag busy (mai riusare un buffer mappato)
+    /** @type {any} */ this._recBuf = null;
+    this._recCap = 0;
+    /** @type {any} */ this._uniBuf = null;
+    this._uniCap = 0;
+    /** @type {any} */ this._bind = null; // bind group cache: cade quando un buffer si ricrea
+    /** @type {{buf: any, size: number, busy: boolean}[]} */
+    this._stagingPool = [];
+    // misure per il pannello perf
+    this.statBytes = 0;          // byte riletti nel tratto corrente
+    this.statBatches = 0;        // batch sottomessi nel tratto
+    this.statLandMs = 0;         // ultimo submit->atterraggio (ms)
+    this._inflight = 0;          // batch sottomessi non ancora atterrati
+    this.gen = 0;                // bump = i readback in volo si scartano
+    /** @type {Set<number>|null} chiavi da azzerare a fine endpass se scoperte */
+    this._endpassZero = null;
+    // contatori/ring per l'ink overlay (stesso contratto del raster bridge)
+    this.sent = 0;
+    this.tickDrained = 0;
+    this.inkRing = new Float32Array(INK_RING * 8);
+  }
+
+  async _init() {
+    const dev = this.device;
+    const module = dev.createShaderModule({ code: WGSL_STROKE });
+    // layout ESPLICITO: il binding 4 usa offset dinamici (un uniform per
+    // chunk a fette di 256B) e 'auto' non li abiliterebbe
+    this._bgl = dev.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: 4, buffer: { type: 'storage' } },
+        { binding: 1, visibility: 4, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: 4, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: 4, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: 4, buffer: { type: 'uniform', hasDynamicOffset: true } },
+      ],
+    });
+    this.pipeline = await dev.createComputePipelineAsync({
+      layout: dev.createPipelineLayout({ bindGroupLayouts: [this._bgl] }),
+      compute: { module, entryPoint: 'main' },
+    });
+    this._lutBuf = dev.createBuffer({ size: 2052, usage: 0x80 | 0x8 });
+    // writeBuffer vuole multipli di 4 byte: LUT (2050) in copia paddata
+    const lutBytes = new Uint8Array(2052);
+    lutBytes.set(new Uint8Array(FALLOFF_LUT.buffer, 0, FALLOFF_LUT.length * 2));
+    dev.queue.writeBuffer(this._lutBuf, 0, lutBytes);
+    this._growArena(ARENA_START);
+    this._atlas = dev.createBuffer({ size: this._atlasCap, usage: 0x80 | 0x8 });
+    this.usable = true;
+  }
+
+  /** @param {number} slots */
+  _growArena(slots) {
+    const dev = this.device;
+    const nb = dev.createBuffer({ size: slots * SLOT_WORDS * 4, usage: 0x80 | 0x8 | 0x4 });
+    if (this._arena) {
+      const enc = dev.createCommandEncoder();
+      enc.copyBufferToBuffer(this._arena, 0, nb, 0, this._arenaSlots * SLOT_WORDS * 4);
+      dev.queue.submit([enc.finish()]);
+      this._arena.destroy();
+    }
+    for (let i = this._arenaSlots; i < slots; i++) this._freeSlots.push(i);
+    this._arena = nb;
+    this._arenaSlots = slots;
+    this._bind = null; // il bind group referenzia l'arena vecchia
+  }
+
+  get idle() {
+    return this.sent === this.tickDrained && this._recs.length === 0 && this._inflight === 0;
+  }
+
+  get backlog() { return Math.max(0, this.sent - this.tickDrained); }
+
+  /**
+   * Gate per-tratto (come il bridge worker): niente aqua/texture/selezione.
+   * @param {import('./stroke.js').Snap} snap
+   * @param {{x0:number,y0:number,x1:number,y1:number}} clip
+   * @param {object|null} sel
+   * @param {import('./brush.js').StampCache} cache
+   */
+  beginStroke(snap, clip, sel, cache) {
+    if (!this.usable || sel !== null || snap.aqua || snap.tex) return false;
+    this._snap = snap;
+    this._clip = { ...clip };
+    this._cache = cache;
+    this._hq = quantHardness(snap.hardness);
+    this._resetGpuState();
+    this._endpassZero = null;
+    this.statBytes = 0;
+    this.statBatches = 0;
+    return true;
+  }
+
+  _resetGpuState() {
+    // slot tutti liberi (i nuovi alloc partono azzerati), atlas per-tratto
+    this._slotOf.clear();
+    this._needClear.clear();
+    this._freeSlots.length = 0;
+    for (let i = 0; i < this._arenaSlots; i++) this._freeSlots.push(i);
+    this._atlasOff.clear();
+    this._atlasUsed = 0;
+    this._maskWrites.length = 0;
+    this._recs.length = 0;
+    this._chunks.clear();
+    this._dirty.clear();
+  }
+
+  /** Annullo/fine tratto: i readback in volo si scartano. */
+  reset() {
+    this.gen++;
+    this._inflight = 0;
+    this._resetGpuState();
+    this.tickDrained = this.sent;
+    this._endpassZero = null;
+    this._snap = null;
+  }
+
+  /**
+   * Endpass della punta: replay INTERO da zero. I chunk noti restano
+   * visibili coi pixel vecchi; a replay atterrato quelli non ricoperti
+   * si azzerano (punta rastremata).
+   */
+  endPassBegin() {
+    this._endpassZero = new Set(this.store.map.keys());
+    this._slotOf.clear();
+    this._needClear.clear();
+    this._freeSlots.length = 0;
+    for (let i = 0; i < this._arenaSlots; i++) this._freeSlots.push(i);
+    this._recs.length = 0;
+    this._chunks.clear();
+    this._dirty.clear();
+  }
+
+  /** @param {object} stamp @param {Uint8Array} mask */
+  _atlasFor(stamp, mask) {
+    let off = this._atlasOff.get(stamp);
+    if (off !== undefined) return off;
+    const len = (mask.length + 3) & ~3;
+    if (this._atlasUsed + len > this._atlasCap) {
+      // atlas pieno: si raddoppia (le maschere già caricate si ricaricano
+      // alla prossima richiesta — reset della mappa)
+      this._atlasCap *= 2;
+      this._atlas.destroy();
+      this._atlas = this.device.createBuffer({ size: this._atlasCap, usage: 0x80 | 0x8 });
+      this._atlasOff.clear();
+      this._atlasUsed = 0;
+      this._bind = null;
+    }
+    off = this._atlasUsed;
+    this._atlasUsed += len;
+    this._atlasOff.set(stamp, off);
+    this._maskWrites.push({ off, mask });
+    return off;
+  }
+
+  /**
+   * Drena la coda dell'App (specchio/pattern già espansi): record del kernel
+   * + chunk toccati + ring per l'ink overlay. Stessa firma del bridge worker.
+   * @param {import('./stroke.js').DabQueue} queue
+   */
+  sendEntries(queue) {
+    const snap = /** @type {NonNullable<typeof this._snap>} */ (this._snap);
+    const cache = /** @type {NonNullable<typeof this._cache>} */ (this._cache);
+    const clip = /** @type {NonNullable<typeof this._clip>} */ (this._clip);
+    const n = queue.count;
+    for (let i = 0; i < n; i++) {
+      const q = queue.buf;
+      const o = queue.peekOffset();
+      const type = q[o];
+      const idx = ++this.sent;
+      const rb = (idx & (INK_RING - 1)) * 8;
+      this.inkRing[rb] = type;
+      this.inkRing[rb + 1] = q[o + 1]; this.inkRing[rb + 2] = q[o + 2];
+      this.inkRing[rb + 3] = q[o + 3];
+      this.inkRing[rb + 4] = q[o + 5]; this.inkRing[rb + 5] = q[o + 6];
+      this.inkRing[rb + 6] = q[o + 7];
+      if (type === T_DAB) {
+        const x = q[o + 1], y = q[o + 2], r = q[o + 3], a = q[o + 4];
+        const angle = q[o + 5];
+        const a255 = Math.min(255, (a * 255 + 0.5) | 0);
+        if (a255 > 0) {
+          const stamp = cache.getStamp(r, snap.hardness, snap.roundness, angle,
+            snap.shape, snap.shapeInvert);
+          const ix = Math.round(x - stamp.half);
+          const iy = Math.round(y - stamp.half);
+          const off = this._atlasFor(stamp, stamp.mask);
+          this._recs.push(0, ix, iy, stamp.size, off, a255,
+            q[o + 6], q[o + 7], q[o + 8], 0, 0, 0);
+          this._touch(ix, iy, ix + stamp.size - 1, iy + stamp.size - 1, clip);
+        }
+      } else {
+        const s0 = this._recs.length;
+        const tmp = /** @type {number[]} */ ([]);
+        capsuleIntParams(q[o + 1], q[o + 2], q[o + 3], q[o + 4],
+          q[o + 5], q[o + 6], q[o + 7], q[o + 8], tmp);
+        for (let t = 0; t < tmp.length; t += CAP_STRIDE_I32) {
+          this._recs.push(1, tmp[t], tmp[t + 1], tmp[t + 2], tmp[t + 3], tmp[t + 4],
+            tmp[t + 5], tmp[t + 6], tmp[t + 7], tmp[t + 8], 0, 0);
+          const rMax = tmp[t + 6] > 0 ? tmp[t + 5] + tmp[t + 6] : tmp[t + 5];
+          const mR = rMax / CAP_FP + 1;
+          const xLo = Math.min(tmp[t], tmp[t] + tmp[t + 2]) / CAP_FP;
+          const xHi = Math.max(tmp[t], tmp[t] + tmp[t + 2]) / CAP_FP;
+          const yLo = Math.min(tmp[t + 1], tmp[t + 1] + tmp[t + 3]) / CAP_FP;
+          const yHi = Math.max(tmp[t + 1], tmp[t + 1] + tmp[t + 3]) / CAP_FP;
+          this._touch(Math.floor(xLo - mR), Math.floor(yLo - mR),
+            Math.ceil(xHi + mR), Math.ceil(yHi + mR), clip);
+        }
+        if (this._recs.length === s0) { /* niente record: fuori clip */ }
+      }
+      queue.pop();
+    }
+  }
+
+  /** bbox mondo -> chunk creati nello store + slot GPU + batch
+   * @param {number} x0 @param {number} y0 @param {number} x1 @param {number} y1
+   * @param {{x0:number,y0:number,x1:number,y1:number}} clip */
+  _touch(x0, y0, x1, y1, clip) {
+    x0 = Math.max(x0, clip.x0); y0 = Math.max(y0, clip.y0);
+    x1 = Math.min(x1, clip.x1); y1 = Math.min(y1, clip.y1);
+    if (x0 > x1 || y0 > y1) return;
+    const cx0 = x0 >> CHUNK_SHIFT, cy0 = y0 >> CHUNK_SHIFT;
+    const cx1 = x1 >> CHUNK_SHIFT, cy1 = y1 >> CHUNK_SHIFT;
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const key = chunkKey(cx, cy);
+        if (!this._slotOf.has(key)) {
+          if (this._freeSlots.length === 0) this._growArena(this._arenaSlots * 2);
+          const slot = /** @type {number} */ (this._freeSlots.pop());
+          this._slotOf.set(key, slot);
+          this._needClear.add(slot);
+          // slot fresco su un chunk CPU preesistente (endpass): la copia CPU
+          // è stantia rispetto al GPU azzerato — la prima rilettura dev'essere
+          // il chunk INTERO, o le righe fuori banda terrebbero pixel vecchi
+          if (this.store.getByKey(key)) {
+            this._dirty.set(key, { x0: 0, y0: 0, x1: CHUNK - 1, y1: CHUNK - 1 });
+          }
+        }
+        this.store.getOrCreate(cx, cy);
+        this._chunks.add(key);
+        // rect sporco locale al chunk (banda di readback + markDirty preciso)
+        const bx = cx << CHUNK_SHIFT, by = cy << CHUNK_SHIFT;
+        const lx0 = Math.max(0, x0 - bx), ly0 = Math.max(0, y0 - by);
+        const lx1 = Math.min(CHUNK - 1, x1 - bx), ly1 = Math.min(CHUNK - 1, y1 - by);
+        const d = this._dirty.get(key);
+        if (d === undefined) {
+          this._dirty.set(key, { x0: lx0, y0: ly0, x1: lx1, y1: ly1 });
+        } else {
+          if (lx0 < d.x0) d.x0 = lx0;
+          if (ly0 < d.y0) d.y0 = ly0;
+          if (lx1 > d.x1) d.x1 = lx1;
+          if (ly1 > d.y1) d.y1 = ly1;
+        }
+      }
+    }
+  }
+
+  /**
+   * Una volta per frame: incoda il batch (un command buffer), avvia il
+   * readback dei chunk toccati, applica allo store quando atterra.
+   */
+  tick() {
+    if (this._recs.length === 0 || this._chunks.size === 0) return;
+    if (this._inflight >= 2) return; // backpressure: max 2 batch in volo
+    const dev = this.device;
+    const snap = /** @type {NonNullable<typeof this._snap>} */ (this._snap);
+    const clip = /** @type {NonNullable<typeof this._clip>} */ (this._clip);
+    const recs = new Uint32Array(this._recs.length);
+    const recsI = new Int32Array(recs.buffer);
+    for (let i = 0; i < this._recs.length; i++) recsI[i] = this._recs[i];
+    const recCount = this._recs.length / REC_U32;
+    const chunkKeys = [...this._chunks];
+    this._recs.length = 0;
+    this._chunks.clear();
+
+    for (const w of this._maskWrites) {
+      // multipli di 4: parte allineata diretta, coda paddata
+      const aligned = w.mask.length & ~3;
+      if (aligned > 0) dev.queue.writeBuffer(this._atlas, w.off, w.mask, 0, aligned);
+      if (aligned < w.mask.length) {
+        const tail = new Uint8Array(4);
+        tail.set(w.mask.subarray(aligned));
+        dev.queue.writeBuffer(this._atlas, w.off + aligned, tail);
+      }
+    }
+    this._maskWrites.length = 0;
+
+    // buffer PERSISTENTI: si riallocano solo alla crescita (i destroy sono
+    // differiti dal driver a GPU-idle; i writeBuffer sono ordinati sulla
+    // coda, quindi i batch in volo leggono ancora i contenuti vecchi)
+    if (recs.byteLength > this._recCap) {
+      if (this._recBuf) this._recBuf.destroy();
+      this._recCap = Math.max(65536, recs.byteLength * 2);
+      this._recBuf = dev.createBuffer({ size: this._recCap, usage: 0x80 | 0x8 });
+      this._bind = null;
+    }
+    dev.queue.writeBuffer(this._recBuf, 0, recs);
+
+    // uniform per chunk a offset dinamici (allineati a 256B)
+    const uni = new ArrayBuffer(chunkKeys.length * 256);
+    for (let i = 0; i < chunkKeys.length; i++) {
+      const key = chunkKeys[i];
+      const chunk = /** @type {NonNullable<ReturnType<typeof this.store.getByKey>>} */ (this.store.getByKey(key));
+      const slot = /** @type {number} */ (this._slotOf.get(key));
+      const pi = new Int32Array(uni, i * 256, 16);
+      const pu = new Uint32Array(uni, i * 256, 16);
+      pi[0] = chunk.cx * CHUNK; pi[1] = chunk.cy * CHUNK;
+      pu[2] = slot * SLOT_WORDS; pu[3] = recCount;
+      pi[4] = clip.x0; pi[5] = clip.y0; pi[6] = clip.x1; pi[7] = clip.y1;
+      pi[8] = this._hq;
+      pu[9] = snap.buildup ? 1 : 0;
+      pu[10] = snap.colR; pu[11] = snap.colG; pu[12] = snap.colB;
+    }
+    if (uni.byteLength > this._uniCap) {
+      if (this._uniBuf) this._uniBuf.destroy();
+      this._uniCap = Math.max(16 * 256, uni.byteLength * 2);
+      this._uniBuf = dev.createBuffer({ size: this._uniCap, usage: 0x40 | 0x8 });
+      this._bind = null;
+    }
+    dev.queue.writeBuffer(this._uniBuf, 0, uni);
+
+    if (!this._bind) {
+      this._bind = dev.createBindGroup({
+        layout: this._bgl,
+        entries: [
+          { binding: 0, resource: { buffer: this._arena } },
+          { binding: 1, resource: { buffer: this._atlas } },
+          { binding: 2, resource: { buffer: this._lutBuf } },
+          { binding: 3, resource: { buffer: this._recBuf } },
+          { binding: 4, resource: { buffer: this._uniBuf, size: 64 } },
+        ],
+      });
+    }
+    const bind = this._bind;
+
+    // bande di righe sporche per chunk: si copia e rilegge SOLO quelle
+    // (righe contigue in memoria: un dab da 30px = ~30KB, non 256KB)
+    /** @type {{key: number, ry0: number, ry1: number, x0: number, x1: number, off: number}[]} */
+    const bands = [];
+    let stagingBytes = 0;
+    for (const key of chunkKeys) {
+      const d = /** @type {NonNullable<ReturnType<typeof this._dirty.get>>} */ (this._dirty.get(key));
+      bands.push({ key, ry0: d.y0, ry1: d.y1, x0: d.x0, x1: d.x1, off: stagingBytes });
+      stagingBytes += (d.y1 - d.y0 + 1) * CHUNK * 4;
+    }
+    this._dirty.clear();
+
+    // pool di staging: mai riusare un buffer mappato (flag busy)
+    /** @type {{buf: any, size: number, busy: boolean}|null} */
+    let sb = null;
+    for (const s of this._stagingPool) {
+      if (!s.busy && s.size >= stagingBytes) { sb = s; break; }
+    }
+    if (!sb) {
+      let size = 262144;
+      while (size < stagingBytes) size *= 2;
+      sb = { buf: dev.createBuffer({ size, usage: /* MAP_READ|COPY_DST */ 0x1 | 0x8 }), size, busy: false };
+      this._stagingPool.push(sb);
+      // pota i liberi in eccesso (tiene al più 4 buffer)
+      while (this._stagingPool.length > 4) {
+        const i = this._stagingPool.findIndex((s) => !s.busy && s !== sb);
+        if (i < 0) break;
+        this._stagingPool.splice(i, 1)[0].buf.destroy();
+      }
+    }
+    sb.busy = true;
+
+    const enc = dev.createCommandEncoder();
+    for (const slot of this._needClear) {
+      enc.clearBuffer(this._arena, slot * SLOT_WORDS * 4, SLOT_WORDS * 4);
+    }
+    this._needClear.clear();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipeline);
+    for (let i = 0; i < chunkKeys.length; i++) {
+      pass.setBindGroup(0, bind, [i * 256]);
+      pass.dispatchWorkgroups(CHUNK / 8, CHUNK / 8);
+    }
+    pass.end();
+    for (const b of bands) {
+      const slot = /** @type {number} */ (this._slotOf.get(b.key));
+      enc.copyBufferToBuffer(this._arena, slot * SLOT_WORDS * 4 + b.ry0 * CHUNK * 4,
+        sb.buf, b.off, (b.ry1 - b.ry0 + 1) * CHUNK * 4);
+    }
+    dev.queue.submit([enc.finish()]);
+    this.statBatches++;
+    this.statBytes += stagingBytes;
+
+    const gen = this.gen;
+    const drainedTo = this.sent;
+    const tSubmit = performance.now();
+    this._inflight++;
+    sb.buf.mapAsync(1, 0, stagingBytes).then(() => {
+      if (gen === this.gen) {
+        const bytes = new Uint8Array(sb.buf.getMappedRange(0, stagingBytes));
+        for (const b of bands) {
+          const chunk = this.store.getByKey(b.key);
+          if (!chunk) continue;
+          const len = (b.ry1 - b.ry0 + 1) * CHUNK * 4;
+          chunk.data.set(bytes.subarray(b.off, b.off + len), b.ry0 * CHUNK * 4);
+          this.store.markDirty(chunk, b.x0, b.ry0, b.x1, b.ry1);
+          if (!chunk.touched) chunk.touched = this._bandHasInk(chunk.data, b.ry0, b.ry1);
+        }
+        this.statLandMs = performance.now() - tSubmit;
+        this.tickDrained = Math.max(this.tickDrained, drainedTo);
+        this._inflight--;
+        this._maybeFinishEndpass();
+        this._requestFrame();
+      }
+      sb.buf.unmap();
+      sb.busy = false;
+    }).catch(() => {
+      sb.busy = false;
+      if (gen === this.gen) this._inflight--;
+    });
+  }
+
+  /** ink nella banda di righe [ry0, ry1]? (skip se il chunk è già touched)
+   * @param {Uint8ClampedArray|Uint8Array} data @param {number} ry0 @param {number} ry1 */
+  _bandHasInk(data, ry0, ry1) {
+    const w = new Uint32Array(data.buffer, data.byteOffset + ry0 * CHUNK * 4,
+      (ry1 - ry0 + 1) * CHUNK);
+    for (let i = 0; i < w.length; i++) if (w[i] !== 0) return true;
+    return false;
+  }
+
+  // a fine atterraggio dell'endpass: i chunk noti che il replay NON ha
+  // ricoperto si azzerano (la punta rastremata li ha lasciati)
+  _maybeFinishEndpass() {
+    if (!this._endpassZero || this.sent !== this.tickDrained ||
+      this._recs.length > 0 || this._inflight > 0) return;
+    for (const key of this._endpassZero) {
+      if (this._slotOf.has(key)) continue; // ricoperto dal replay
+      const chunk = this.store.getByKey(key);
+      if (!chunk) continue;
+      chunk.data.fill(0);
+      chunk.touched = false;
+      this.store.markDirty(chunk, 0, 0, CHUNK - 1, CHUNK - 1);
+    }
+    this._endpassZero = null;
+  }
+}

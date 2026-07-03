@@ -33,6 +33,7 @@ import { STRIDE, T_DAB } from './stroke.js';
  * @property {boolean} strokeLive
  * @property {string} rasterMode
  * @property {RasterBridge} rasterBridge
+ * @property {{inkRing: Float32Array, sent: number, tickDrained: number}|null} gpuStroke
  * @property {object|null} _strokeSel
  * @property {{x0: number, y0: number, x1: number, y1: number}|null} _strokeClip
  */
@@ -176,9 +177,11 @@ export class InkOverlay {
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
-    // 1. descrittori in volo (geometria esatta ancora da rasterizzare)
+    // 1. descrittori in volo (geometria esatta ancora da rasterizzare):
+    // worker e GPU espongono lo stesso contratto sent/tickDrained/inkRing
     this._chainN = 0;
     if (app.rasterMode === 'worker') this._inFlightWorker(ctx, app.rasterBridge, cam);
+    else if (app.rasterMode === 'gpu' && app.gpuStroke) this._inFlightWorker(ctx, app.gpuStroke, cam);
     else this._inFlightQueue(ctx, app.queue, cam);
     this._flushChains(ctx, cam);
 
@@ -306,10 +309,12 @@ export class InkOverlay {
   }
 
   /**
-   * Entry mandate al worker ma non ancora drenate: (tickDrained, sent] nel
-   * ring del bridge (tickDrained = drained fotografato al tick, cioè fin dove
-   * i pixel sono davvero arrivati allo store specchio in questo frame).
-   * @param {CanvasRenderingContext2D} ctx @param {RasterBridge} bridge @param {Camera} cam
+   * Entry mandate al worker/GPU ma non ancora drenate: (tickDrained, sent]
+   * nel ring (tickDrained = fin dove i pixel sono davvero arrivati allo
+   * store specchio; il valore live può essere oltre l'upload del frame).
+   * @param {CanvasRenderingContext2D} ctx
+   * @param {{inkRing: Float32Array, sent: number, tickDrained: number}} bridge
+   * @param {Camera} cam
    */
   _inFlightWorker(ctx, bridge, cam) {
     const ring = bridge.inkRing;

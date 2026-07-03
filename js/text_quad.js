@@ -81,7 +81,7 @@ export class TextQuadCache {
   // board coperti da un quad proxy (il proxy cuoce anche i loro testi).
   // Ritorna il numero di bake fatti (per invalidare i piani 2D del pool).
   /**
-   * @param {import('./renderer_gl.js').GLRenderer | import('./renderer_2d.js').Canvas2DRenderer} renderer
+   * @param {import('./renderer_gl.js').GLRenderer | import('./renderer_2d.js').Canvas2DRenderer | import('./renderer_wgpu.js').WgpuRenderer} renderer
    * @param {BoardManager} boards
    * @param {Camera} camera
    * @param {number} liveTextId testo in editing (SVG vivo): mai cotto qui; -1 = tutti i testi sono SVG

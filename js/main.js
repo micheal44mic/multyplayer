@@ -36,6 +36,8 @@ import { vectorizeDebug, vectorizeRasterLayer as traceRasterLayer } from './vect
 import { normalSourceFromBackdrop, renderLayerStackToCanvas } from './layer_composite.js';
 import { SelectionManager, SelectionOverlay } from './selection.js';
 import { InkOverlay } from './ink_overlay.js';
+import { WgpuStrokeBridge } from './wgpu_stroke.js';
+import { WgpuRenderer } from './renderer_wgpu.js';
 import { aiLayerName, aiResultToImageData, prepareAiFillPayload, requestAiFill } from './ai_fill.js';
 import { Collab } from './collab.js';
 import { BlurBrushSession } from './blur_brush.js';
@@ -136,7 +138,7 @@ export class App {
     if (this.rasterBridge.usable) this._allStores.add(this.rasterBridge.store);
     this._strokeStoreMain = this.strokeStore;
     this.curRaster = this.raster;       // il Rasterizer autorevole del tratto corrente
-    /** @type {'main'|'worker'} */
+    /** @type {'main'|'worker'|'gpu'} */
     this.rasterMode = 'main';
     // blocco scratch wasm per il commit dei chunk SAB (vedi _runCommit)
     this._commitScratch = 0;
@@ -152,7 +154,7 @@ export class App {
     try { desync = localStorage.getItem('fable-paint.desync') === '1'; } catch { /* storage negato */ }
     this.desync = desync;
 
-    /** @type {GLRenderer | Canvas2DRenderer} */
+    /** @type {GLRenderer | Canvas2DRenderer | WgpuRenderer} */
     const renderer = this._createRenderer(this.canvas, desync);
     this.renderer = renderer;
     renderer.trackStores(() => [...this._allStores]);
@@ -284,6 +286,12 @@ export class App {
     // ink overlay: punta provvisoria raw+predizione sopra i piani (fase 0
     // del piano WebGPU) — fuori da #planes come la selezione
     this.ink = new InkOverlay();
+
+    // stroke buffer WebGPU (fase 1): agganciato in fondo a main.js dopo
+    // l'init asincrono; null = si resta su worker/main
+    /** @type {import('./wgpu_stroke.js').WgpuStrokeBridge|null} */
+    this.gpuStroke = null;
+    this._gpuStrokeLogged = false;
 
     // Specchio verticale: i descrittori in coda vengono duplicati riflessi
     // sull'asse a metà del canvas attivo (queue.mirrorX, fotografato al
@@ -444,9 +452,20 @@ export class App {
   /**
    * @param {HTMLCanvasElement} canvas
    * @param {boolean} desynchronized
-   * @returns {GLRenderer | Canvas2DRenderer}
+   * @returns {GLRenderer | Canvas2DRenderer | WgpuRenderer}
    */
   _createRenderer(canvas, desynchronized) {
+    // fase 2 (flag): present WebGPU — richiede WgpuRenderer.preinit()
+    // già awaitata in fondo a main.js prima di new App. Flag anche in
+    // localStorage (fable-paint.renderer='wgpu'): la query viene riscritta
+    // dalla home e sui telefoni è scomoda.
+    if (wantsWgpuRenderer() && WgpuRenderer.available) {
+      const wr = new WgpuRenderer(canvas);
+      if (wr.ok) {
+        console.info('[renderer_wgpu] present WebGPU attivo (flag ?renderer=wgpu)');
+        return wr;
+      }
+    }
     if (this.isAndroid && ANDROID_FORCE_CANVAS2D) return new Canvas2DRenderer(canvas);
     let renderer = new GLRenderer(canvas, { desynchronized });
     if (!renderer.ok) renderer = new Canvas2DRenderer(canvas);
@@ -1638,11 +1657,27 @@ export class App {
     }
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
     this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom, direct);
+    // stroke buffer WebGPU (fase 1): il tratto vivo rasterizza su GPU coi
+    // kernel sigillati bit-exact; i pixel atterrano async nello store
+    // specchio (l'ink overlay copre il volo). Gate per-tratto: niente
+    // aqua/texture/selezione — fallback worker, poi main.
+    const snap = /** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap);
+    if (this.gpuStroke &&
+      this.gpuStroke.beginStroke(snap, this._strokeClip, this._strokeSel, this.raster.cache)) {
+      this.rasterMode = 'gpu';
+      this.strokeStore = this.gpuStroke.store;
+      this.curRaster = this.raster;
+      // lo snap serve sul main (live opacity, endPass, commit)
+      this.raster.beginStroke(snap, this._strokeClip, this._strokeSel, target.store);
+      if (!this._gpuStrokeLogged) {
+        this._gpuStrokeLogged = true;
+        console.info('[wgpu_stroke] stroke buffer WebGPU attivo: il tratto vivo rasterizza su GPU');
+      }
+    } else
     // raster worker per i tratti locali: pixel su un altro thread, output
     // bit-exact (stesso Rasterizer JS). Gate: bridge usable, niente aqua
     // (campiona il layer documento, che vive sul main). Fallback = path
     // di sempre. La replay collab non passa di qui (usa this.raster).
-    const snap = /** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap);
     if (this.rasterSab && !snap.aqua &&
       this.rasterBridge.beginStroke(snap, this._strokeClip, this._strokeSel)) {
       this.rasterMode = 'worker';
@@ -1698,13 +1733,30 @@ export class App {
       this.rasterBridge.flushSync();
       return;
     }
+    if (this.rasterMode === 'gpu' && this.gpuStroke) {
+      // il GPU non si può attendere in sincrono (mapAsync vuole l'event
+      // loop): si ributta il TRATTO INTERO sul CPU — stessi byte, la v2 è
+      // ovunque. Caso raro: pen-down dentro la finestra di commit.
+      this.gpuStroke.reset();
+      this._dropStrokeBuffer();
+      this.rasterMode = 'main';
+      this.strokeStore = this._strokeStoreMain;
+      this.curRaster = this.raster;
+      this.queue.clear();
+      this.raster.beginStroke(/** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap),
+        this._strokeClip, this._strokeSel, this._strokeSampleStore());
+      this.engine.replay();
+      this.raster.run(this.queue, Infinity);
+      return;
+    }
     if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
   }
 
   // Fine vita di un tratto worker (commit chiuso/annullo): lo store attivo
   // torna quello main, la collab e il prossimo tratto ripartono da lì.
   _restoreMainStroke() {
-    if (this.rasterMode !== 'worker') return;
+    if (this.rasterMode !== 'worker' && this.rasterMode !== 'gpu') return;
+    if (this.rasterMode === 'gpu' && this.gpuStroke) this.gpuStroke.reset();
     this.rasterMode = 'main';
     this.strokeStore = this._strokeStoreMain;
     this.curRaster = this.raster;
@@ -1727,6 +1779,7 @@ export class App {
     this.ink.strokeEnd();
     this.queue.clear();
     if (this.rasterMode === 'worker') this.rasterBridge.reset();
+    else if (this.rasterMode === 'gpu' && this.gpuStroke) this.gpuStroke.reset();
     this._dropStrokeBuffer();
     this._restoreMainStroke();
     this.strokeLive = false;
@@ -1834,6 +1887,11 @@ export class App {
       this.rasterBridge.reset();
       this._dropStrokeBuffer();
       this._restoreMainStroke();
+    } else if (this.rasterMode === 'gpu' && this.gpuStroke) {
+      // idem per il GPU: i readback in volo si scartano (gen bump)
+      this.gpuStroke.reset();
+      this._dropStrokeBuffer();
+      this._restoreMainStroke();
     } else {
       this._dropStrokeBuffer();
     }
@@ -1853,10 +1911,26 @@ export class App {
     // lascerebbe un buco nel corpo. In modalità worker basta l'ORDINE FIFO:
     // il vivo residuo parte prima dell'endpass, nessuna attesa sul main.
     const worker = this.rasterMode === 'worker' && this.rasterBridge.usable;
+    const gpu = this.rasterMode === 'gpu' && this.gpuStroke !== null;
     if (worker) {
       if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+    } else if (gpu) {
+      if (this.queue.count > 0) /** @type {NonNullable<typeof this.gpuStroke>} */ (this.gpuStroke).sendEntries(this.queue);
     } else {
       this._runQueueSync();
+    }
+    if (gpu) {
+      // endpass GPU = replay INTERO da zero (la GPU se lo può permettere:
+      // niente clip per-chunk né pool da scambiare). I pixel vecchi restano
+      // visibili finché il replay non atterra; i chunk che la punta
+      // rastremata scopre si azzerano a fine atterraggio. Il commit tanto
+      // attende gpuStroke.idle.
+      const gs = /** @type {NonNullable<typeof this.gpuStroke>} */ (this.gpuStroke);
+      this.curRaster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
+      gs.endPassBegin();
+      this.engine.replay();
+      if (this.queue.count > 0) gs.sendEntries(this.queue);
+      return;
     }
     const rect = this.engine.endPassRect();
     /** @type {Set<number>|null} */
@@ -1968,12 +2042,13 @@ export class App {
       return;
     }
     this.undoMgr.captureBegin(layer.id);
-    // heap: i chunk SAB non sono memoria wasm — il commit va col path JS
-    // (bit-exact per contratto, spalmato sui frame come sempre)
+    // heap: i chunk SAB/GPU non sono memoria wasm (ptr=0) — heap null qui e
+    // _runCommit li copia nello scratch wasm (bit-exact per contratto,
+    // spalmato sui frame come sempre)
     this.commitJob = {
       chunks: touched, index: 0, snap: this.curRaster.snap,
       store: layer.store, layerId: layer.id,
-      heap: this.rasterMode === 'worker' ? null : this.heap,
+      heap: this.rasterMode === 'worker' || this.rasterMode === 'gpu' ? null : this.heap,
     };
   }
 
@@ -2165,9 +2240,11 @@ export class App {
     let rasterPx = 0;
     if (this.queue.count > 0) {
       if (this.rasterMode === 'worker') this.rasterBridge.sendEntries(this.queue);
+      else if (this.rasterMode === 'gpu' && this.gpuStroke) this.gpuStroke.sendEntries(this.queue);
       else rasterPx = this.raster.run(this.queue, this.budgetPx);
     }
     if (this.rasterSab) this.rasterBridge.tick();
+    if (this.gpuStroke) this.gpuStroke.tick();
     if (this.blurSession) this._pumpBlur(this.blurBudgetMs);
     if (this.liquifySession) this._pumpLiquify(5.5);
     const t2 = performance.now();
@@ -2179,7 +2256,8 @@ export class App {
     // commit differito: parte quando il catch-up è finito, poi procede
     // a fette per non produrre un frame da centinaia di ms
     if (this.pendingCommit && this.queue.count === 0 && !this.engine.active &&
-      (this.rasterMode !== 'worker' || this.rasterBridge.idle)) {
+      (this.rasterMode !== 'worker' || this.rasterBridge.idle) &&
+      (this.rasterMode !== 'gpu' || !this.gpuStroke || this.gpuStroke.idle)) {
       this._beginCommit();
     }
     if (this.commitJob) this._runCommit(this.COMMIT_CHUNKS_PER_FRAME);
@@ -2380,6 +2458,13 @@ export class App {
       workerRaster: this.rasterMode === 'worker',
       workerBacklog: this.rasterSab ? this.rasterBridge.backlog : 0,
       workerFlushMs: this.rasterSab ? this.rasterBridge.takeFlushMs() : 0,
+      // ponte GPU (wgpu_stroke): arretrato, ms dell'ultimo atterraggio e MB
+      // riletti nel tratto — la riga 'GPU tratto' del pannello perf
+      gpuRaster: this.rasterMode === 'gpu',
+      gpuBacklog: this.gpuStroke ? this.gpuStroke.backlog : 0,
+      gpuLandMs: this.gpuStroke ? this.gpuStroke.statLandMs : 0,
+      gpuReadBytes: this.gpuStroke ? this.gpuStroke.statBytes : 0,
+      gpuBatches: this.gpuStroke ? this.gpuStroke.statBatches : 0,
     };
     this.stressTest.sampleFrame(frameSample);
     if (this.perfDebug.active) {
@@ -2430,7 +2515,21 @@ installTelemetry();
 wireFeedbackLinks();
 const forceJs = new URLSearchParams(location.search).get('engine') === 'js';
 const heap = forceJs ? null : await WasmHeap.load(new URL('./raster_core.wasm', import.meta.url));
+// present WebGPU (fase 2, flag): il device va inizializzato PRIMA del
+// costruttore dell'App perché la scelta del renderer è sincrona
+function wantsWgpuRenderer() {
+  if (new URLSearchParams(location.search).get('renderer') === 'wgpu') return true;
+  try { return localStorage.getItem('fable-paint.renderer') === 'wgpu'; } catch { return false; }
+}
+if (wantsWgpuRenderer()) {
+  await WgpuRenderer.preinit();
+}
 const app = new App(heap);
+// stroke buffer WebGPU (fase 1): feature-detect a runtime, aggancio quando
+// pronto (i tratti partiti prima restano su worker/main); ?gpu=off lo esclude
+if (new URLSearchParams(location.search).get('gpu') !== 'off') {
+  WgpuStrokeBridge.create(() => app.requestFrame()).then((bridge) => { app.gpuStroke = bridge; });
+}
 const projects = new ProjectHub(app);
 app.projects = projects;
 track('app_ready', { engine: heap ? 'wasm' : 'js' });

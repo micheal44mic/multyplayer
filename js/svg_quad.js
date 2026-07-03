@@ -60,7 +60,7 @@ export class SvgQuadCache {
   }
 
   /**
-   * @param {import('./renderer_gl.js').GLRenderer | import('./renderer_2d.js').Canvas2DRenderer} renderer
+   * @param {import('./renderer_gl.js').GLRenderer | import('./renderer_2d.js').Canvas2DRenderer | import('./renderer_wgpu.js').WgpuRenderer} renderer
    * @param {BoardManager} boards
    * @param {Camera} camera
    * @param {number} liveSvgId SVG in editing: mai cotto qui; -1 = tutti SVG vivi

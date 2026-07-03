@@ -107,6 +107,7 @@ export class PerfDebugConsole {
       ['wasm', 'WASM'],
       ['cpu', 'CPU px'],
       ['worker', 'Worker'],
+      ['gpustroke', 'GPU tratto'],
       ['gpu', 'GPU est'],
       ['canvas', 'Canvas'],
       ['renderer', 'Renderer'],
@@ -258,6 +259,11 @@ export class PerfDebugConsole {
       workerRaster: !!frame.workerRaster,
       workerBacklog: Math.round(frame.workerBacklog || 0),
       workerFlushMs: round(frame.workerFlushMs || 0),
+      gpuRaster: !!frame.gpuRaster,
+      gpuBacklog: Math.round(frame.gpuBacklog || 0),
+      gpuLandMs: round(frame.gpuLandMs || 0),
+      gpuReadBytes: frame.gpuReadBytes || 0,
+      gpuBatches: frame.gpuBatches || 0,
       screenCacheHit: !!frame.screenCacheHit,
       textBakes: frame.textBakes || 0,
       textBakeMs: round(frame.textBakeMs),
@@ -644,6 +650,11 @@ export class PerfDebugConsole {
       // fps DURANTE i tratti worker: la domanda vera (resta fluido mentre disegni?)
       avgFpsWorker: round(avg('fps', frames.filter((x) => x.workerRaster)), 1),
       avgFrameMsWorker: round(avg('frameMs', frames.filter((x) => x.workerRaster))),
+      // ponte GPU: stessi indicatori per i tratti in modalità gpu
+      gpuFrames: frames.filter((x) => x.gpuRaster).length,
+      avgGpuBacklog: round(avg('gpuBacklog', frames.filter((x) => x.gpuRaster)), 1),
+      maxGpuLandMs: round(frames.reduce((m, x) => Math.max(m, x.gpuLandMs || 0), 0)),
+      avgFpsGpu: round(avg('fps', frames.filter((x) => x.gpuRaster)), 1),
       lastMemory: this._memorySummary(frames[frames.length - 1] || null),
       maxFrame: maxBy('frameMs'),
       slowBuckets: buckets,
@@ -714,6 +725,21 @@ export class PerfDebugConsole {
       const fMax = max('workerFlushMs');
       this.metrics.worker.textContent =
         `backlog ${Math.round(bAvg)} avg · ${bMax} max · flush max ${fmtMs(fMax)}`;
+    }
+    // ponte GPU del tratto: come per il worker, contano solo i frame gpu
+    const gFrames = frames.filter((x) => x.gpuRaster);
+    if (!this.app.gpuStroke) {
+      this.metrics.gpustroke.textContent = 'off (niente WebGPU)';
+    } else if (!gFrames.length) {
+      this.metrics.gpustroke.textContent = frames.length ? 'idle (nessun tratto gpu)' : '-';
+    } else {
+      const gAvg = gFrames.reduce((s, x) => s + (x.gpuBacklog || 0), 0) / gFrames.length;
+      const gMax = gFrames.reduce((m, x) => Math.max(m, x.gpuBacklog || 0), 0);
+      const landMax = gFrames.reduce((m, x) => Math.max(m, x.gpuLandMs || 0), 0);
+      const last = gFrames[gFrames.length - 1];
+      this.metrics.gpustroke.textContent =
+        `backlog ${Math.round(gAvg)} avg · ${gMax} max · land max ${fmtMs(landMax)} · ` +
+        `${fmtBytes(last.gpuReadBytes || 0)} in ${last.gpuBatches || 0} batch`;
     }
     this.metrics.gpu.textContent = gpu
       ? `${fmtBytes(gpu)} est · tex ${diag.rendererTextures || 0}`
