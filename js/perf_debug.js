@@ -81,7 +81,16 @@ export class PerfDebugConsole {
     copy.title = 'Copy chronological debug log';
     copy.disabled = true;
 
-    controls.append(start, copy);
+    // riassunto compatto: poche righe incollabili in chat (il log intero a
+    // 60fps sono megabyte e si tronca)
+    const sum = document.createElement('button');
+    sum.type = 'button';
+    sum.id = 'perf-debug-sum';
+    sum.textContent = 'Sum';
+    sum.title = 'Copy compact summary (snapshot + aggregates)';
+    sum.disabled = true;
+
+    controls.append(start, copy, sum);
 
     const metrics = document.createElement('div');
     metrics.id = 'perf-debug-metrics';
@@ -121,12 +130,14 @@ export class PerfDebugConsole {
     this.dock = dock;
     this.startBtn = start;
     this.copyBtn = copy;
+    this.sumBtn = sum;
 
     start.addEventListener('click', () => {
       if (this.active) this.stop();
       else this.start();
     });
     copy.addEventListener('click', () => this.copy());
+    sum.addEventListener('click', () => this.copySummary());
     this._syncDock();
   }
 
@@ -179,6 +190,30 @@ export class PerfDebugConsole {
       setTimeout(() => this._syncDock(), 900);
     }
     console.log('[perf-debug] copied records', this.logs.length);
+  }
+
+  // Riassunto compatto: snapshot ambiente + aggregati della sessione.
+  // Poche centinaia di byte: pensato per essere incollato in una chat.
+  async copySummary() {
+    if (!this.logs.length) return;
+    const text = JSON.stringify({ snapshot: this._snapshot(), summary: this._summary() }, null, 1);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    if (this.sumBtn) {
+      this.sumBtn.textContent = 'Copied';
+      setTimeout(() => this._syncDock(true), 900);
+    }
+    console.log('[perf-debug] copied summary');
   }
 
   /** @param {Record<string, any>} frame */
@@ -570,6 +605,10 @@ export class PerfDebugConsole {
       gpuMaxTextureSize: diag.gpuMaxTextureSize,
       androidLite: document.body.classList.contains('android-perf-mode'),
       bodyClass: document.body.className,
+      // raster worker: se false, i tratti girano sul main (manca SAB o
+      // COOP/COEP, o il worker è morto) e il backlog resterà 0 per definizione
+      workerAvailable: !!this.app.rasterSab && !!this.app.rasterBridge?.usable,
+      cores: navigator.hardwareConcurrency || 0,
     };
   }
 
@@ -599,6 +638,9 @@ export class PerfDebugConsole {
       maxWorkerBacklog: frames.reduce((m, x) => Math.max(m, x.workerBacklog || 0), 0),
       maxWorkerFlushMs: round(frames.reduce((m, x) => Math.max(m, x.workerFlushMs || 0), 0)),
       totWorkerFlushMs: round(frames.reduce((s, x) => s + (x.workerFlushMs || 0), 0)),
+      // fps DURANTE i tratti worker: la domanda vera (resta fluido mentre disegni?)
+      avgFpsWorker: round(avg('fps', frames.filter((x) => x.workerRaster)), 1),
+      avgFrameMsWorker: round(avg('frameMs', frames.filter((x) => x.workerRaster))),
       lastMemory: this._memorySummary(frames[frames.length - 1] || null),
       maxFrame: maxBy('frameMs'),
       slowBuckets: buckets,
@@ -615,6 +657,10 @@ export class PerfDebugConsole {
     this.startBtn.classList.toggle('active', this.active);
     this.copyBtn.disabled = this.logs.length === 0;
     if (this.copyBtn.textContent !== 'Copied') this.copyBtn.textContent = 'Copy';
+    if (this.sumBtn) {
+      this.sumBtn.disabled = this.logs.length === 0;
+      if (this.sumBtn.textContent !== 'Copied') this.sumBtn.textContent = 'Sum';
+    }
     this._renderDockMetrics();
     this.dock.title = this.active
       ? `Perf debug running: ${this.logs.length} records`
