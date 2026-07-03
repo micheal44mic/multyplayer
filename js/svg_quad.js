@@ -217,6 +217,11 @@ export class SvgQuadCache {
       const gone = !boards.layerById(id);
       if (!gone && this._frame - e.lastUse <= EVICT_FRAMES) continue;
       if (e.tex && this._gl && e.texGen === this._gen) this._gl.deleteTexture(e.tex);
+      // renderer WebGPU: la texture (GPUTexture nel campo condiviso) si
+      // libera esplicitamente — il GC non è deterministico sulla VRAM
+      else if (e.tex && typeof (/** @type {any} */ (e.tex)).destroy === 'function') {
+        /** @type {any} */ (e.tex).destroy();
+      }
       this._map.delete(id);
       removed = true;
     }

@@ -85,14 +85,40 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   v0); ?renderer=wgpu ora SI PERSISTE in localStorage (?renderer=gl
   spegne) — sul telefono non c'è console e la home riscrive la query.
 
+- **Parità renderer, prima tranche (FATTA 03/07 sera, tutto verificato al
+  pixel nel preview)**: (a) MIPMAP in minificazione — pipeline blit WGSL
+  (media 2×2 per livello, = generateMipmap GL), texture chunk con catena
+  completa (9 livelli, +RENDER_ATTACHMENT), rigenerata pigramente per i
+  chunk cambiati quando zoom<1, sampler trilinear; i chunk vivi in direct
+  rigenerano dopo la copia arena; view cache _viewsOf (full+per livello).
+  (b) QUAD TESTO/SVG — quadFor dalla cache condivisa, upload
+  copyExternalImageToTexture premultiplied (dest vuole COPY_DST+
+  RENDER_ATTACHMENT), mip NPOT proprie generate all'upload, scissor al
+  board (setScissorRect per draw, ripristino), LINEAR sempre; sweep delle
+  cache patchata per destroy() delle GPUTexture. (c) GRUPPI DI RITAGLIO —
+  il frame diventa SEGMENTI di render pass (canvas load/clear ↔ gruppo):
+  base+figli in texture canvas-size (figli con blend dst-alpha/
+  one-minus-src-alpha = colore sostituito, forma della base), blit 1:1
+  NEAREST alla posizione in pila, col modo della base applicato al blit.
+  (d) BLEND MODE — screen/add come pipeline fixed-function esatte sul
+  premultiplied; i 6 modi shader (multiply/overlay/softlight/darken/
+  lighten/difference) con copyTextureToTexture canvas→backdrop (solo bbox
+  dei chunk visibili) e formula W3C in fsBlend (textureLoad, blending
+  SPENTO, srcPx riusa i mode 0-3: tratto/gomma live inclusi gratis).
+  Verifica: testo a zoom 1 e 0.3 (pixel presenti), clip group a 3 punti
+  campione (dentro=colore figlio, sbordo=trasparente, base=rossa), gli 8
+  modi con valori attesi ESATTI (multiply 78/59/39, overlay 188/118/78,
+  softlight 191/111/86, screen 222/191/211, add clampato…). TRAPPOLA
+  PAGATA: GPUTextureUsage ≠ GPUBufferUsage — COPY_SRC texture = 0x1 (0x4 è
+  TEXTURE_BINDING): il configure del canvas col flag sbagliato invalidava
+  il command buffer INTERO (canvas nero) solo nei frame col backdrop.
+
 ## PROSSIMI PASSI (in ordine)
 
-1. **Parità di feature del renderer** per togliere il flag: quad testo/svg
-   (copyExternalImageToTexture dai canvas cotti), blend modes (screen/add
-   fixed-function come GL, gli altri col backdrop per bbox), clip group
-   (base+figli in texture di gruppo), sessioni Trasforma/Effetti (quad da
-   canvas), proxy zoom-out o equivalente, mip/downscale per zoom<1
-   (v0 usa solo linear: minificazione sgranata).
+1. **Parità renderer, seconda tranche** per togliere il flag: sessioni
+   Trasforma/Effetti (quad da canvas/texture di sessione), proxy zoom-out o
+   equivalente (per ora null sotto wgpu), screen-cache (blit del frame
+   fermo), eviction/lost polish.
 2. **Misure dal campo**: pannello perf (riga GPU tratto) su desktop a mano
    e telefoni via HTTPS LAN (proxy scratchpad su 8443 → 8002, cert 30gg;
    navigator.gpu/SAB SOLO in contesto sicuro; sul telefono aprire UNA volta

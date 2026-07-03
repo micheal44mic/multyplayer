@@ -27,7 +27,7 @@ struct U {
   layerAlpha: f32,
   strokeOpacity: f32,
   mode: u32,            // 0 chunk, 1 paint combinato, 2 gomma, 3 solo tratto
-  pad0: u32,
+  blendFn: u32,         // fsBlend: 0 multiply, 1 overlay, 2 softlight, 3 darken, 4 lighten, 5 difference
   pad1: u32,
   pad2: u32,
 }
@@ -36,6 +36,7 @@ struct U {
 @group(0) @binding(1) var layerTex: texture_2d<f32>;
 @group(0) @binding(2) var strokeTex: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> u: U;
+@group(0) @binding(4) var back: texture_2d<f32>;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -56,8 +57,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VOut {
   return o;
 }
 
-@fragment
-fn fs(in: VOut) -> @location(0) vec4<f32> {
+fn srcPx(in: VOut) -> vec4<f32> {
   let c = textureSample(layerTex, samp, in.uv);
   let s = textureSample(strokeTex, samp, in.uv);
   var o: vec4<f32>;
@@ -76,7 +76,47 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
   }
   return o * u.layerAlpha;
 }
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+  return srcPx(in);
+}
+
+// B(Cb, Cs) del modulo W3C Compositing, sui colori NON premoltiplicati
+fn blendB(b: vec3<f32>, s: vec3<f32>) -> vec3<f32> {
+  switch u.blendFn {
+    case 0u: { return b * s; }                                     // multiply
+    case 1u: {                                                     // overlay
+      return select(2.0 * b * s, 1.0 - 2.0 * (1.0 - b) * (1.0 - s), b >= vec3<f32>(0.5));
+    }
+    case 2u: {                                                     // softlight
+      let dd = select(((16.0 * b - 12.0) * b + 4.0) * b, sqrt(b), b >= vec3<f32>(0.25));
+      return select(b - (1.0 - 2.0 * s) * b * (1.0 - b),
+        b + (2.0 * s - 1.0) * (dd - b), s >= vec3<f32>(0.5));
+    }
+    case 3u: { return min(b, s); }                                 // darken
+    case 4u: { return max(b, s); }                                 // lighten
+    default: { return abs(b - s); }                                // difference
+  }
+}
+
+// Modi "shader": formula completa col backdrop copiato (blending SPENTO:
+// dove il livello è vuoto riscrive il backdrop) —
+//   co = cs·(1-ab) + cb·(1-as) + as·ab·B(Cb,Cs)   ao = as + ab·(1-as)
+@fragment
+fn fsBlend(in: VOut) -> @location(0) vec4<f32> {
+  let s = srcPx(in);
+  let b = textureLoad(back, vec2<i32>(in.pos.xy), 0);
+  let B = blendB(b.rgb / max(b.a, 1e-4), s.rgb / max(s.a, 1e-4));
+  return vec4<f32>(s.rgb * (1.0 - b.a) + b.rgb * (1.0 - s.a) + s.a * b.a * B,
+    s.a + b.a * (1.0 - s.a));
+}
 `;
+
+// indici di blendFn nel WGSL (i 6 modi non esprimibili nel blending fisso)
+const SHADER_MODE_IDX = /** @type {Record<string, number>} */ ({
+  multiply: 0, overlay: 1, softlight: 2, darken: 3, lighten: 4, difference: 5,
+});
 
 // Blit di minificazione: ogni livello mip campiona il precedente in linear
 // a mezza risoluzione = media 2×2 esatta (l'equivalente del generateMipmap
@@ -155,6 +195,13 @@ export class WgpuRenderer {
     /** @type {any} */ this._mipBgl = null;
     /** @type {any} */ this._mipSampler = null;
     /** @type {any} */ this._samplerMip = null;
+    /** @type {any} */ this._pipelineGrp = null;
+    /** @type {any} */ this._pipelineGrpClip = null;
+    /** @type {any} */ this._grpTex = null;
+    /** @type {any} */ this._pipeScreen = null;
+    /** @type {any} */ this._pipeAdd = null;
+    /** @type {any} */ this._pipeBlend = null;
+    /** @type {any} */ this._bdTex = null; // backdrop dei modi shader
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
     /** @type {(() => ChunkStore[])|null} */
     this._storesFn = null;
@@ -165,7 +212,13 @@ export class WgpuRenderer {
       if (!this._ctx) return;
       const gpu = /** @type {any} */ (navigator).gpu;
       this._format = gpu.getPreferredCanvasFormat();
-      this._ctx.configure({ device: this.device, format: this._format, alphaMode: 'premultiplied' });
+      // COPY_SRC sul canvas: i modi shader copiano il backdrop accumulato
+      // (ATTENZIONE: le costanti di GPUTextureUsage NON sono quelle dei
+      // buffer — COPY_SRC texture = 0x1)
+      this._ctx.configure({
+        device: this.device, format: this._format, alphaMode: 'premultiplied',
+        usage: /* RENDER_ATTACHMENT|COPY_SRC */ 0x10 | 0x1,
+      });
       const module = this.device.createShaderModule({ code: WGSL });
       this._bgl = this.device.createBindGroupLayout({
         entries: [
@@ -173,23 +226,43 @@ export class WgpuRenderer {
           { binding: 1, visibility: 2, texture: {} },
           { binding: 2, visibility: 2, texture: {} },
           { binding: 3, visibility: 3, buffer: { type: 'uniform', hasDynamicOffset: true } },
+          { binding: 4, visibility: 2, texture: {} },
         ],
       });
-      this._pipeline = this.device.createRenderPipeline({
-        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._bgl] }),
-        vertex: { module, entryPoint: 'vs' },
-        fragment: {
-          module, entryPoint: 'fs',
-          targets: [{
-            format: this._format,
-            blend: {
-              color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
-            },
-          }],
-        },
-        primitive: { topology: 'triangle-list' },
+      const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this._bgl] });
+      const makePipe = (/** @type {string} */ format, /** @type {any} */ blend,
+        /** @type {string} */ entry = 'fs') =>
+        this.device.createRenderPipeline({
+          layout,
+          vertex: { module, entryPoint: 'vs' },
+          fragment: { module, entryPoint: entry, targets: [{ format, blend }] },
+          primitive: { topology: 'triangle-list' },
+        });
+      const over = {
+        color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      };
+      this._pipeline = makePipe(this._format, over);
+      // gruppi di ritaglio (FBO rgba8): base con over normale, figli con
+      // DST_ALPHA — il colore sostituisce dove la base ha alpha, la forma
+      // resta della base (blendFunc(DST_ALPHA, ONE_MINUS_SRC_ALPHA) del GL)
+      this._pipelineGrp = makePipe('rgba8unorm', over);
+      this._pipelineGrpClip = makePipe('rgba8unorm', {
+        color: { srcFactor: 'dst-alpha', dstFactor: 'one-minus-src-alpha' },
+        alpha: { srcFactor: 'dst-alpha', dstFactor: 'one-minus-src-alpha' },
       });
+      // blend mode fixed-function ESATTI sul premultiplied (come il GL):
+      // screen = ONE/ONE_MINUS_SRC_COLOR, add = ONE/ONE + alpha over
+      this._pipeScreen = makePipe(this._format, {
+        color: { srcFactor: 'one', dstFactor: 'one-minus-src' },
+        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      });
+      this._pipeAdd = makePipe(this._format, {
+        color: { srcFactor: 'one', dstFactor: 'one' },
+        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      });
+      // modi shader: formula W3C col backdrop, blending SPENTO
+      this._pipeBlend = makePipe(this._format, undefined, 'fsBlend');
       this._sampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
       this._samplerNearest = this.device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
       // minificazione (zoom<1): trilinear sui mip — il LINEAR_MIPMAP_LINEAR
@@ -325,6 +398,42 @@ export class WgpuRenderer {
     this.uploadsThisFrame++;
   }
 
+  /**
+   * Texture del bake testo/SVG: (ri)creata quando il bake cambia (texDirty)
+   * o la taglia del canvas non coincide; upload PREMOLTIPLICATO via
+   * copyExternalImageToTexture (il canvas è straight-alpha) con catena mip
+   * propria (NPOT ok in WebGPU), rigenerata subito — la minificazione la
+   * campiona quando serve. Riusa i campi tex/texGen/texDirty dell'entry
+   * (contratto di _ensureTextQuadTex del GL; un solo bottom renderer vivo).
+   * @param {{canvas: HTMLCanvasElement|null, tex: any, texGen: number, texDirty: boolean}} q
+   * @param {any[]} mipGen
+   */
+  _ensureQuadTex(q, mipGen) {
+    const cv = /** @type {HTMLCanvasElement} */ (q.canvas);
+    let tex = q.tex;
+    const fresh = !tex || q.texGen !== this.ctxGen || typeof tex.destroy !== 'function' ||
+      tex.width !== cv.width || tex.height !== cv.height;
+    if (!fresh && !q.texDirty) return tex;
+    if (fresh) {
+      if (tex && typeof tex.destroy === 'function') { tex.destroy(); this.texCount--; }
+      const levels = 1 + Math.floor(Math.log2(Math.max(cv.width, cv.height)));
+      tex = this.device.createTexture({
+        size: [cv.width, cv.height], format: 'rgba8unorm', mipLevelCount: levels,
+        usage: /* TEXTURE_BINDING|COPY_DST|RENDER_ATTACHMENT */ 0x4 | 0x2 | 0x10,
+      });
+      q.tex = tex;
+      q.texGen = this.ctxGen;
+      this.texCount++;
+    }
+    this.device.queue.copyExternalImageToTexture(
+      { source: cv }, { texture: tex, premultipliedAlpha: true },
+      [cv.width, cv.height]);
+    mipGen.push(tex); // catena subito buona: lo zoom può scendere quando vuole
+    q.texDirty = false;
+    this.uploadsThisFrame++;
+    return tex;
+  }
+
   /** @param {Chunk} chunk */
   disposeChunkTex(chunk) {
     const tex = this._tex.get(chunk);
@@ -384,8 +493,31 @@ export class WgpuRenderer {
     const W = this.canvas.width, H = this.canvas.height;
 
     // raccolta draw: [chunkTex, strokeTex|null, rect, mode, layerAlpha]
-    /** @type {{lt: any, st: any, x0: number, y0: number, x1: number, y1: number, mode: number, a: number}[]} */
-    const draws = [];
+    // samp/sciss opzionali per i quad testo/svg (LINEAR sempre + clip board);
+    // clip=true = figlio di gruppo di ritaglio (pipeline DST_ALPHA).
+    // Il frame è una sequenza di SEGMENTI: canvas (load/clear) e gruppo
+    // (base+figli nell'FBO canvas-size, poi blit nel segmento dopo) — la
+    // struttura FBO+blit del GL, in render pass WebGPU consecutivi.
+    /** @typedef {{lt: any, st: any, x0: number, y0: number, x1: number, y1: number, mode: number, a: number, samp?: any, sciss?: number[], clip?: boolean, pipe?: string, blendFn?: number, _ui?: number}} Draw */
+    /** @type {{group: boolean, draws: Draw[], bd?: number[]}[]} */
+    const segments = [{ group: false, draws: [] }];
+    /** @type {Draw[]} */
+    let sink = segments[0].draws;
+    // bbox device (clampato al canvas) di una lista di draw — la regione di
+    // backdrop da copiare per i modi shader; null = tutto fuori schermo
+    const drawsRect = (/** @type {Draw[]} */ list, /** @type {number} */ from, /** @type {number} */ to) => {
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let k = from; k < to; k++) {
+        const d = list[k];
+        if (d.x0 < x0) x0 = d.x0;
+        if (d.y0 < y0) y0 = d.y0;
+        if (d.x1 > x1) x1 = d.x1;
+        if (d.y1 > y1) y1 = d.y1;
+      }
+      x0 = Math.max(0, x0); y0 = Math.max(0, y0);
+      x1 = Math.min(W, x1); y1 = Math.min(H, y1);
+      return x1 > x0 && y1 > y0 ? [x0, y0, x1 - x0, y1 - y0] : null;
+    };
     // minificazione: sotto zoom 1 si campionano i mip (come il GL); i chunk
     // col livello 0 cambiato rigenerano la catena in questo stesso encoder
     const wantMips = camera.zoom < 1;
@@ -421,27 +553,15 @@ export class WgpuRenderer {
       return this._tex.get(sc);
     };
     const pushChunk = (/** @type {Chunk} */ chunk, /** @type {any} */ st,
-      /** @type {number} */ mode, /** @type {number} */ alpha) => {
+      /** @type {number} */ mode, /** @type {number} */ alpha, /** @type {boolean} */ clip) => {
       const x0 = Math.round(chunk.cx * CHUNK * s + tx);
       const y0 = Math.round(chunk.cy * CHUNK * s + ty);
       const x1 = Math.round((chunk.cx + 1) * CHUNK * s + tx);
       const y1 = Math.round((chunk.cy + 1) * CHUNK * s + ty);
-      draws.push({ lt: this._tex.get(chunk), st, x0, y0, x1, y1, mode, a: alpha });
+      sink.push({ lt: this._tex.get(chunk), st, x0, y0, x1, y1, mode, a: alpha, clip });
     };
-
-    const skip = proxies ? proxies.skip : null;
-    for (let i = 0; i < layers.length; i++) {
-      const layer = layers[i];
-      if (!layer.visible || layer.opacity <= 0) continue;
-      if (skip !== null && skip.has(layer.id)) continue;
-      if (layer.kind === 'text' || layer.kind === 'svg') {
-        if (textQuads || svgQuads) this._warnOnce('quad testo/svg');
-        continue;
-      }
-      if (layer.kind !== 'raster') continue;
-      if (layer.clip && layer.clipBase) { this._warnOnce('gruppi di ritaglio (figli)'); continue; }
-      const mode = layer.mode || 'normal';
-      if (mode !== 'normal') this._warnOnce(`blend mode ${mode}`);
+    // i draw di UN livello raster (chunk + tratto live) nel sink corrente
+    const collectRaster = (/** @type {Layer} */ layer, /** @type {boolean} */ clip) => {
       const alpha = layer.opacity;
       const live = strokeStore !== null && layer.id === activeId && strokeStore.map.size > 0;
       for (const chunk of layer.store.map.values()) {
@@ -451,38 +571,157 @@ export class WgpuRenderer {
         if (live) {
           const sc = /** @type {NonNullable<typeof strokeStore>} */ (strokeStore).getByKey(chunk.key);
           if (sc) {
-            pushChunk(chunk, strokeTex(sc), eraserLive ? 2 : 1, alpha);
+            pushChunk(chunk, strokeTex(sc), eraserLive ? 2 : 1, alpha, clip);
             continue;
           }
         }
-        pushChunk(chunk, null, 0, alpha);
+        pushChunk(chunk, null, 0, alpha, clip);
       }
       if (live && !eraserLive) {
         // tratto su zone vuote del livello (over diretto, esatto)
         for (const sc of /** @type {NonNullable<typeof strokeStore>} */ (strokeStore).map.values()) {
           if (sc.cx < cx0 || sc.cx > cx1 || sc.cy < cy0 || sc.cy > cy1) continue;
           if (layer.store.getByKey(sc.key)) continue;
-          pushChunk(sc, strokeTex(sc), 3, alpha);
+          pushChunk(sc, strokeTex(sc), 3, alpha, clip);
         }
       }
+    };
+
+    const skip = proxies ? proxies.skip : null;
+    for (let i = 0; i < layers.length; i++) {
+      const layer = layers[i];
+      if (!layer.visible || layer.opacity <= 0) continue;
+      if (skip !== null && skip.has(layer.id)) continue;
+      if (layer.kind === 'text' || layer.kind === 'svg') {
+        // vettori NON in editing: quad cotto alla posizione nella pila,
+        // clip al board (il testo può sbordare), LINEAR sempre (contenuto
+        // vettoriale: NEAREST lo squadretterebbe). L'SVG vivo ha il suo
+        // piano DOM e non passa da qui — come per il GL.
+        const cache = layer.kind === 'text' ? textQuads : svgQuads;
+        if (cache) {
+          const q = cache.quadFor(layer.id, camera);
+          if (q) {
+            const tex = this._ensureQuadTex(q, mipGen);
+            const b = layer.clipBoard;
+            /** @type {number[]|undefined} */
+            let sciss;
+            if (b) {
+              const sx0 = Math.max(0, Math.min(W, Math.round(b.x * s + tx)));
+              const sy0 = Math.max(0, Math.min(H, Math.round(b.y * s + ty)));
+              const sx1 = Math.max(0, Math.min(W, Math.round((b.x + b.w) * s + tx)));
+              const sy1 = Math.max(0, Math.min(H, Math.round((b.y + b.h) * s + ty)));
+              if (sx1 <= sx0 || sy1 <= sy0) continue; // board fuori schermo
+              sciss = [sx0, sy0, sx1 - sx0, sy1 - sy0];
+            }
+            sink.push({
+              lt: tex, st: null,
+              x0: Math.round(q.x * s + tx), y0: Math.round(q.y * s + ty),
+              x1: Math.round((q.x + q.w) * s + tx), y1: Math.round((q.y + q.h) * s + ty),
+              mode: 0, a: layer.opacity,
+              samp: wantMips ? this._samplerMip : this._sampler, sciss,
+            });
+          }
+        }
+        continue;
+      }
+      if (layer.kind !== 'raster') continue;
+      // membro di un gruppo di ritaglio: lo disegna il pass della sua base
+      if (layer.clip && layer.clipBase) continue;
+      const mode = layer.mode || 'normal';
+      // base di un gruppo? I figli sono la catena CONTIGUA di clippati sopra
+      // (come in GL: base + figli nell'FBO, poi blit alla posizione in pila)
+      let gEnd = i + 1;
+      while (gEnd < layers.length &&
+        layers[gEnd].clip && layers[gEnd].clipBase === layer) gEnd++;
+      if (gEnd > i + 1) {
+        /** @type {Draw[]} */
+        const grpDraws = [];
+        sink = grpDraws;
+        collectRaster(layer, false); // base: blending normale (dà la forma)
+        const baseN = grpDraws.length;
+        for (let j = i + 1; j < gEnd; j++) {
+          const child = layers[j];
+          if (!child.visible || child.opacity <= 0) continue;
+          collectRaster(child, true); // figli: DST_ALPHA (colore, non forma)
+        }
+        const canvasSeg = { group: false, draws: /** @type {Draw[]} */ ([]),
+          bd: /** @type {number[]|undefined} */ (undefined) };
+        sink = canvasSeg.draws;
+        if (grpDraws.length > 0) {
+          segments.push({ group: true, draws: grpDraws }, canvasSeg);
+          // il gruppo si presenta con un blit 1:1 (NEAREST) e il metodo di
+          // fusione della BASE si applica QUI, al gruppo intero (come GL)
+          /** @type {Draw} */
+          const blit = { lt: 'GRP', st: null, x0: 0, y0: 0, x1: W, y1: H,
+            mode: 0, a: 1, samp: this._samplerNearest };
+          if (mode in SHADER_MODE_IDX) {
+            // bbox del gruppo = bbox della base (l'alpha dei figli è sua)
+            const rect = drawsRect(grpDraws, 0, baseN);
+            if (rect) {
+              canvasSeg.bd = rect;
+              blit.pipe = 'blend';
+              blit.blendFn = SHADER_MODE_IDX[mode];
+              blit.sciss = rect;
+            }
+          } else if (mode === 'screen') blit.pipe = 'screen';
+          else if (mode === 'add') blit.pipe = 'add';
+          sink.push(blit);
+        } else {
+          segments.push(canvasSeg); // gruppo vuoto in vista: nessun blit
+        }
+        i = gEnd - 1;
+        continue;
+      }
+      if (mode in SHADER_MODE_IDX) {
+        // modo "shader": segmento con copia del backdrop (bbox dei chunk
+        // visibili) e pass fusione a blending spento
+        const seg = { group: false, draws: /** @type {Draw[]} */ ([]),
+          bd: /** @type {number[]|undefined} */ (undefined) };
+        sink = seg.draws;
+        collectRaster(layer, false);
+        if (seg.draws.length > 0) {
+          const rect = drawsRect(seg.draws, 0, seg.draws.length);
+          if (rect) {
+            for (const d of seg.draws) { d.pipe = 'blend'; d.blendFn = SHADER_MODE_IDX[mode]; }
+            seg.bd = rect;
+            segments.push(seg);
+          }
+        }
+        const cont = { group: false, draws: /** @type {Draw[]} */ ([]) };
+        segments.push(cont);
+        sink = cont.draws;
+        continue;
+      }
+      if (mode === 'screen' || mode === 'add') {
+        const from = sink.length;
+        collectRaster(layer, false);
+        for (let k = from; k < sink.length; k++) sink[k].pipe = mode;
+        continue;
+      }
+      collectRaster(layer, false);
     }
 
-    // uniform a offset dinamici, una fetta da 256B per draw
-    const need = Math.max(256, draws.length * 256);
+    // uniform a offset dinamici, una fetta da 256B per draw (indice globale
+    // sull'intero frame, attraverso tutti i segmenti)
+    /** @type {Draw[]} */
+    const flat = [];
+    for (const seg of segments) for (const d of seg.draws) { d._ui = flat.length; flat.push(d); }
+    const need = Math.max(256, flat.length * 256);
     if (need > this._uniCap) {
       if (this._uniBuf) this._uniBuf.destroy();
       this._uniCap = need * 2;
       this._uniBuf = this.device.createBuffer({ size: this._uniCap, usage: 0x40 | 0x8 });
     }
-    const uni = new ArrayBuffer(Math.max(256, draws.length * 256));
-    for (let i = 0; i < draws.length; i++) {
-      const d = draws[i];
+    const uni = new ArrayBuffer(need);
+    for (let i = 0; i < flat.length; i++) {
+      const d = flat[i];
       const f = new Float32Array(uni, i * 256, 8);
       const u32 = new Uint32Array(uni, i * 256, 12);
       f[0] = d.x0; f[1] = d.y0; f[2] = d.x1; f[3] = d.y1;
       f[4] = W; f[5] = H;
       f[6] = d.a; f[7] = strokeOpacity;
       u32[8] = d.mode;
+      u32[9] = d.blendFn || 0;
     }
     this.device.queue.writeBuffer(this._uniBuf, 0, uni);
 
@@ -504,7 +743,7 @@ export class WgpuRenderer {
     // precedente (dopo le copie arena: il livello 0 è quello del frame)
     for (const tex of mipGen) {
       const v = this._viewsOf(tex);
-      for (let l = 1; l < MIP_LEVELS; l++) {
+      for (let l = 1; l < v.level.length; l++) {
         const bg = this.device.createBindGroup({
           layout: this._mipBgl,
           entries: [
@@ -525,30 +764,105 @@ export class WgpuRenderer {
         mp.end();
       }
     }
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: this._ctx.getCurrentTexture().createView(),
-        clearValue: { r: 0, g: 0, b: 0, a: 0 },
-        loadOp: 'clear', storeOp: 'store',
-      }],
-    });
-    pass.setPipeline(this._pipeline);
-    for (let i = 0; i < draws.length; i++) {
-      const d = draws[i];
-      const bind = this.device.createBindGroup({
-        layout: this._bgl,
-        entries: [
-          { binding: 0, resource: samp },
-          { binding: 1, resource: this._viewsOf(d.lt || this._white).full },
-          { binding: 2, resource: this._viewsOf(d.st || this._white).full },
-          { binding: 3, resource: { buffer: this._uniBuf, size: 64 } },
-        ],
+    // i draw di un segmento nel pass corrente (pipeline per-draw: i figli
+    // clippati usano il blend DST_ALPHA — colore sostituito, forma della base)
+    const drawList = (/** @type {any} */ pass, /** @type {Draw[]} */ list,
+      /** @type {any} */ pipeNormal, /** @type {any} */ pipeClip) => {
+      /** @type {any} */ let curPipe = null;
+      let scissOn = false;
+      for (const d of list) {
+        const pipe = d.clip ? pipeClip
+          : d.pipe === 'screen' ? this._pipeScreen
+          : d.pipe === 'add' ? this._pipeAdd
+          : d.pipe === 'blend' ? this._pipeBlend
+          : pipeNormal;
+        if (pipe !== curPipe) { pass.setPipeline(pipe); curPipe = pipe; }
+        // clip al board dei quad testo/svg (lo scissor persiste: ripristino)
+        if (d.sciss) {
+          pass.setScissorRect(d.sciss[0], d.sciss[1], d.sciss[2], d.sciss[3]);
+          scissOn = true;
+        } else if (scissOn) {
+          pass.setScissorRect(0, 0, W, H);
+          scissOn = false;
+        }
+        const lt = d.lt === 'GRP' ? this._grpTex : d.lt;
+        const bind = this.device.createBindGroup({
+          layout: this._bgl,
+          entries: [
+            { binding: 0, resource: d.samp || samp },
+            { binding: 1, resource: this._viewsOf(lt || this._white).full },
+            { binding: 2, resource: this._viewsOf(d.st || this._white).full },
+            { binding: 3, resource: { buffer: this._uniBuf, size: 64 } },
+            { binding: 4, resource: this._viewsOf(this._bdTex || this._white).full },
+          ],
+        });
+        pass.setBindGroup(0, bind, [/** @type {number} */ (d._ui) * 256]);
+        pass.draw(6);
+      }
+    };
+
+    const canvasTex = this._ctx.getCurrentTexture();
+    const canvasView = canvasTex.createView();
+    let canvasStarted = false;
+    for (const seg of segments) {
+      if (seg.group) {
+        // pass del gruppo: base+figli nell'FBO canvas-size, azzerato
+        this._ensureGrpTex(W, H);
+        const gp = enc.beginRenderPass({
+          colorAttachments: [{
+            view: this._viewsOf(this._grpTex).full,
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: 'clear', storeOp: 'store',
+          }],
+        });
+        drawList(gp, seg.draws, this._pipelineGrp, this._pipelineGrpClip);
+        gp.end();
+        continue;
+      }
+      if (seg.draws.length === 0 && canvasStarted) continue;
+      if (seg.bd) {
+        // modi shader: il backdrop accumulato (solo il bbox) si copia in
+        // una texture — il pass fusione lo campiona via textureLoad
+        this._ensureBdTex(W, H);
+        enc.copyTextureToTexture(
+          { texture: canvasTex, origin: [seg.bd[0], seg.bd[1]] },
+          { texture: this._bdTex, origin: [seg.bd[0], seg.bd[1]] },
+          [seg.bd[2], seg.bd[3]]);
+      }
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{
+          view: canvasView,
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: canvasStarted ? 'load' : 'clear', storeOp: 'store',
+        }],
       });
-      pass.setBindGroup(0, bind, [i * 256]);
-      pass.draw(6);
+      canvasStarted = true;
+      drawList(pass, seg.draws, this._pipeline, this._pipeline);
+      pass.end();
     }
-    pass.end();
     this.device.queue.submit([enc.finish()]);
+  }
+
+  /** Backdrop dei modi shader: texture canvas-size nel formato del canvas.
+   * @param {number} w @param {number} h */
+  _ensureBdTex(w, h) {
+    if (this._bdTex && this._bdTex.width === w && this._bdTex.height === h) return;
+    if (this._bdTex) this._bdTex.destroy();
+    this._bdTex = this.device.createTexture({
+      size: [w, h], format: this._format,
+      usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
+    });
+  }
+
+  /** FBO dei gruppi di ritaglio: texture canvas-size, ricreata al resize.
+   * @param {number} w @param {number} h */
+  _ensureGrpTex(w, h) {
+    if (this._grpTex && this._grpTex.width === w && this._grpTex.height === h) return;
+    if (this._grpTex) this._grpTex.destroy();
+    this._grpTex = this.device.createTexture({
+      size: [w, h], format: 'rgba8unorm',
+      usage: /* TEXTURE_BINDING|RENDER_ATTACHMENT */ 0x4 | 0x10,
+    });
   }
 
   dispose() {}
