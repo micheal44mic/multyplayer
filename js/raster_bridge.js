@@ -65,6 +65,19 @@ export class RasterBridge {
 
   get idle() { return this.drained >= this.sent; }
 
+  // Entry inviate e non ancora rasterizzate dal worker: l'arretrato VERO.
+  // Se resta stabilmente alto con la penna in movimento, il worker singolo
+  // non tiene il passo (è il segnale per la fase 3 multi-worker).
+  get backlog() { return Math.max(0, this.sent - this.drained); }
+
+  // ms spesi in attesa (spin) dei flush dall'ultimo prelievo: il costo
+  // percepibile al pen-up. Campionato per frame dal pannello perf.
+  takeFlushMs() {
+    const v = this._flushMsFrame || 0;
+    this._flushMsFrame = 0;
+    return v;
+  }
+
   /** @param {object|null} obj @param {'tex'|'shape'} kind */
   _assetId(obj, kind) {
     if (!obj) return 0;
@@ -185,6 +198,7 @@ export class RasterBridge {
           return false;
         }
       }
+      this._flushMsFrame = (this._flushMsFrame || 0) + (performance.now() - t0);
     }
     this.tick();
     return true;

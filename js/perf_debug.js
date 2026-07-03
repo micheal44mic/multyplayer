@@ -97,6 +97,7 @@ export class PerfDebugConsole {
       ['browser', 'Browser'],
       ['wasm', 'WASM'],
       ['cpu', 'CPU px'],
+      ['worker', 'Worker'],
       ['gpu', 'GPU est'],
       ['canvas', 'Canvas'],
       ['renderer', 'Renderer'],
@@ -219,6 +220,9 @@ export class PerfDebugConsole {
       rasterPx: Math.round(frame.rasterPx || 0),
       queue: frame.queueCount || 0,
       commitChunksLeft: frame.commitChunksLeft || 0,
+      workerRaster: !!frame.workerRaster,
+      workerBacklog: Math.round(frame.workerBacklog || 0),
+      workerFlushMs: round(frame.workerFlushMs || 0),
       screenCacheHit: !!frame.screenCacheHit,
       textBakes: frame.textBakes || 0,
       textBakeMs: round(frame.textBakeMs),
@@ -590,6 +594,11 @@ export class PerfDebugConsole {
       avgTextQuadMs: round(avg('textQuadMs')),
       avgProxyMs: round(avg('proxyMs')),
       avgEvictMs: round(avg('evictMs')),
+      workerFrames: frames.filter((x) => x.workerRaster).length,
+      avgWorkerBacklog: round(avg('workerBacklog', frames.filter((x) => x.workerRaster)), 1),
+      maxWorkerBacklog: frames.reduce((m, x) => Math.max(m, x.workerBacklog || 0), 0),
+      maxWorkerFlushMs: round(frames.reduce((m, x) => Math.max(m, x.workerFlushMs || 0), 0)),
+      totWorkerFlushMs: round(frames.reduce((s, x) => s + (x.workerFlushMs || 0), 0)),
       lastMemory: this._memorySummary(frames[frames.length - 1] || null),
       maxFrame: maxBy('frameMs'),
       slowBuckets: buckets,
@@ -643,6 +652,20 @@ export class PerfDebugConsole {
     this.metrics.browser.textContent = browser ? fmtBytes(browser) : 'not exposed';
     this.metrics.wasm.textContent = diag.heapBytes ? fmtBytes(diag.heapBytes) : 'JS engine';
     this.metrics.cpu.textContent = `${fmtBytes(cpuLive)} live · ${fmtBytes(cpuPool)} pool`;
+    // Worker raster: SOLO i frame col tratto in modalità worker contano per
+    // l'arretrato (fuori dal tratto è sempre 0 e diluirebbe la media)
+    const wFrames = frames.filter((x) => x.workerRaster);
+    if (!this.app.rasterSab) {
+      this.metrics.worker.textContent = 'off (niente SAB/COOP+COEP)';
+    } else if (!wFrames.length) {
+      this.metrics.worker.textContent = frames.length ? 'idle (nessun tratto worker)' : '-';
+    } else {
+      const bAvg = wFrames.reduce((s, x) => s + (x.workerBacklog || 0), 0) / wFrames.length;
+      const bMax = wFrames.reduce((m, x) => Math.max(m, x.workerBacklog || 0), 0);
+      const fMax = max('workerFlushMs');
+      this.metrics.worker.textContent =
+        `backlog ${Math.round(bAvg)} avg · ${bMax} max · flush max ${fmtMs(fMax)}`;
+    }
     this.metrics.gpu.textContent = gpu
       ? `${fmtBytes(gpu)} est · tex ${diag.rendererTextures || 0}`
       : 'not exposed';

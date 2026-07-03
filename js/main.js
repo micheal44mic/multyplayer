@@ -2319,6 +2319,12 @@ export class App {
       proxyStats,
       queueCount: this.queue.count,
       commitChunksLeft: this.commitJob ? this.commitJob.chunks.length - this.commitJob.index : 0,
+      // raster worker: arretrato (entry inviate e non ancora rasterizzate) e
+      // ms spesi in attesa dei flush in questo frame — i numeri che dicono
+      // se il worker singolo tiene il passo (vedi pannello perf, riga Worker)
+      workerRaster: this.rasterMode === 'worker',
+      workerBacklog: this.rasterSab ? this.rasterBridge.backlog : 0,
+      workerFlushMs: this.rasterSab ? this.rasterBridge.takeFlushMs() : 0,
     };
     this.stressTest.sampleFrame(frameSample);
     if (this.perfDebug.active) {
