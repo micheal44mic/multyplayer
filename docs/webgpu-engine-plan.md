@@ -113,12 +113,36 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   TEXTURE_BINDING): il configure del canvas col flag sbagliato invalidava
   il command buffer INTERO (canvas nero) solo nei frame col backdrop.
 
+- **Parità renderer, seconda tranche (FATTA 03/07 notte, verificata al
+  pixel)**: (a) SESSIONI Sposta/Trasforma ed Effetti — i BAKE sono quelli
+  del renderer 2D riusati per composizione (istanza interna
+  Canvas2DRenderer: _ensureTransformCanvas/_ensureWarpCanvas/
+  _ensurePerspCanvas/_ensurePuppetCanvas/_ensureFxCanvas con le loro firme
+  di cache); l'affine è UN quad col vertex generalizzato p0+c.x·ex+c.y·ey
+  (U.rect→p0/ex/ey: i rect sono il caso assi allineati), warp/persp/
+  marionetta = bake CPU a triangoli disegnato come rect mondo (identico
+  all'anteprima 2D; il commit resta esatto via warpStore), effetti = quad
+  del bake CPU; scissor al clip di sessione, texture per slot tf/warp/fx
+  ricaricate solo a firma nuova, tutto liberato a sessione chiusa. smudge/
+  liquify GPU non partono sotto wgpu (gate su smudgeBegin del renderer) →
+  warn se mai arrivassero. Verifica: identità = pixel al posto originale,
+  traslazione+scala 0.5 = pixel alla nuova posizione e vecchia vuota,
+  gauss sigma 10 = centro pieno e bordo interno ad alpha 163. (b)
+  SCREEN-CACHE — stessa chiave e gating del GL (camera+pila+store.ver+
+  serial dei quad; mai con tratti/sessioni/bake); hit = UNA
+  copyTextureToTexture cache→canvas (usage canvas +COPY_DST), cattura in
+  coda all'encoder del frame. Verificata: miss→HIT pixel identici→miss al
+  cambio contenuto→HIT. screenCacheHitThisFrame esposto per il pannello.
+
 ## PROSSIMI PASSI (in ordine)
 
-1. **Parità renderer, seconda tranche** per togliere il flag: sessioni
-   Trasforma/Effetti (quad da canvas/texture di sessione), proxy zoom-out o
-   equivalente (per ora null sotto wgpu), screen-cache (blit del frame
-   fermo), eviction/lost polish.
+1. **Proxy zoom-out o equivalente** (ultimo pezzo per togliere il flag):
+   oggi null sotto wgpu (come sotto 2D). Con mip + screen-cache restano
+   coperti qualità e frame fermi; il costo scoperto è il PAN/ZOOM con
+   decine di board. DECIDERE dopo le misure dal campo: o port del bake
+   proxy (board_proxy è accoppiato al GL) o equivalente wgpu-nativo — che
+   in fase 2.3 (layer GPU-residenti) diventa quasi gratis (flatten del
+   board = un pass). Poi giudizio visivo umano complessivo e via il flag.
 2. **Misure dal campo**: pannello perf (riga GPU tratto) su desktop a mano
    e telefoni via HTTPS LAN (proxy scratchpad su 8443 → 8002, cert 30gg;
    navigator.gpu/SAB SOLO in contesto sicuro; sul telefono aprire UNA volta

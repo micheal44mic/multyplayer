@@ -14,22 +14,32 @@
 
 import { CHUNK } from './store.js';
 import { acquireWgpuDevice, onWgpuDeviceLost } from './wgpu_device.js';
+import { Canvas2DRenderer } from './renderer_2d.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
 /** @typedef {import('./camera.js').Camera} Camera */
 /** @typedef {import('./layers.js').Layer} Layer */
+/** @typedef {import('./renderer_gl.js').TransformFrame} TransformFrame */
+/** @typedef {import('./renderer_gl.js').FxFrame} FxFrame */
+
+/** @param {import('./renderer_gl.js').TransformFrameSet} transform @param {number} layerId @returns {TransformFrame|null} */
+function transformForLayer(transform, layerId) {
+  if (!transform) return null;
+  if (Array.isArray(transform)) return transform.find((f) => f.layerId === layerId) || null;
+  return transform.layerId === layerId ? transform : null;
+}
 
 const WGSL = /* wgsl */ `
 struct U {
-  rect: vec4<f32>,      // x0,y0,x1,y1 del quad in px device
+  p0: vec2<f32>,        // origine del quad in px device
+  ex: vec2<f32>,        // asse u=1 (per i rect: (w,0); affine: colonna X di T)
+  ey: vec2<f32>,        // asse v=1
   screen: vec2<f32>,    // dimensioni canvas in px device
   layerAlpha: f32,
   strokeOpacity: f32,
   mode: u32,            // 0 chunk, 1 paint combinato, 2 gomma, 3 solo tratto
   blendFn: u32,         // fsBlend: 0 multiply, 1 overlay, 2 softlight, 3 darken, 4 lighten, 5 difference
-  pad1: u32,
-  pad2: u32,
 }
 
 @group(0) @binding(0) var samp: sampler;
@@ -49,7 +59,9 @@ fn vs(@builtin(vertex_index) vi: u32) -> VOut {
     vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
     vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
   let c = corners[vi];
-  let px = mix(u.rect.xy, u.rect.zw, c);
+  // quad generico p0 + c.x·ex + c.y·ey: i rect sono il caso ex=(w,0),
+  // ey=(0,h); la sessione Sposta/Trasforma passa gli assi affini
+  let px = u.p0 + c.x * u.ex + c.y * u.ey;
   let ndc = vec2<f32>(px.x / u.screen.x * 2.0 - 1.0, 1.0 - px.y / u.screen.y * 2.0);
   var o: VOut;
   o.pos = vec4<f32>(ndc, 0.0, 1.0);
@@ -202,6 +214,18 @@ export class WgpuRenderer {
     /** @type {any} */ this._pipeAdd = null;
     /** @type {any} */ this._pipeBlend = null;
     /** @type {any} */ this._bdTex = null; // backdrop dei modi shader
+    // sessioni Sposta/Trasforma ed Effetti: i BAKE (canvas piatto, warp a
+    // triangoli, effetto CPU) sono quelli del renderer 2D — un'istanza
+    // interna riusa quel codice con le sue firme di cache; qui si caricano
+    // i canvas come texture e si disegnano come quad (affine o allineati)
+    /** @type {Canvas2DRenderer|null} */
+    this._bk = null;
+    /** @type {Record<string, {sig: string, tex: any}>} */
+    this._sess = {};
+    // screen-cache: a documento/camera fermi il frame è UNA copia (vedi GL)
+    /** @type {any} */ this._scTex = null;
+    this._scKey = '';
+    this.screenCacheHitThisFrame = false;
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
     /** @type {(() => ChunkStore[])|null} */
     this._storesFn = null;
@@ -212,12 +236,13 @@ export class WgpuRenderer {
       if (!this._ctx) return;
       const gpu = /** @type {any} */ (navigator).gpu;
       this._format = gpu.getPreferredCanvasFormat();
-      // COPY_SRC sul canvas: i modi shader copiano il backdrop accumulato
-      // (ATTENZIONE: le costanti di GPUTextureUsage NON sono quelle dei
-      // buffer — COPY_SRC texture = 0x1)
+      // COPY_SRC sul canvas: modi shader (backdrop) e cattura screen-cache;
+      // COPY_DST: il blit della cache a frame fermo. (ATTENZIONE: le
+      // costanti di GPUTextureUsage NON sono quelle dei buffer — COPY_SRC
+      // texture = 0x1)
       this._ctx.configure({
         device: this.device, format: this._format, alphaMode: 'premultiplied',
-        usage: /* RENDER_ATTACHMENT|COPY_SRC */ 0x10 | 0x1,
+        usage: /* RENDER_ATTACHMENT|COPY_SRC|COPY_DST */ 0x10 | 0x1 | 0x2,
       });
       const module = this.device.createShaderModule({ code: WGSL });
       this._bgl = this.device.createBindGroupLayout({
@@ -434,6 +459,49 @@ export class WgpuRenderer {
     return tex;
   }
 
+  // Baker delle sessioni: il renderer 2D possiede i bake CPU (canvas piatto,
+  // warp/persp/puppet a triangoli, effetto con fallback) e le loro firme di
+  // cache — un'istanza interna, mai usata per presentare.
+  _baker() {
+    if (!this._bk) this._bk = new Canvas2DRenderer(document.createElement('canvas'));
+    return this._bk;
+  }
+
+  /** Texture da un canvas di sessione (slot 'tf'|'warp'|'fx'), ricaricata
+   * solo quando la firma o la taglia cambiano.
+   * @param {string} slot @param {string} sig @param {HTMLCanvasElement} canvas */
+  _sessionTex(slot, sig, canvas) {
+    const key = `${sig}|${canvas.width}x${canvas.height}`;
+    const e = this._sess[slot];
+    if (e && e.sig === key) return e.tex;
+    if (e && e.tex) e.tex.destroy();
+    const tex = this.device.createTexture({
+      size: [canvas.width, canvas.height], format: 'rgba8unorm',
+      usage: /* TEXTURE_BINDING|COPY_DST|RENDER_ATTACHMENT */ 0x4 | 0x2 | 0x10,
+    });
+    this.device.queue.copyExternalImageToTexture(
+      { source: canvas }, { texture: tex, premultipliedAlpha: true },
+      [canvas.width, canvas.height]);
+    this.uploadsThisFrame++;
+    this._sess[slot] = { sig: key, tex };
+    return tex;
+  }
+
+  // A sessione chiusa i bake e le texture non servono più (id nuovo alla
+  // prossima): VRAM e canvas liberati subito.
+  _dropSessionState() {
+    for (const k of Object.keys(this._sess)) {
+      if (this._sess[k].tex) this._sess[k].tex.destroy();
+    }
+    this._sess = {};
+    if (this._bk) {
+      this._bk._tfCanvas = null; this._bk._tfId = 0;
+      this._bk._warpCanvas = null; this._bk._warpSig = '';
+      this._bk._fxFlat = null; this._bk._fxBlur = null;
+      this._bk._fxId = 0; this._bk._fxKey = '';
+    }
+  }
+
   /** @param {Chunk} chunk */
   disposeChunkTex(chunk) {
     const tex = this._tex.get(chunk);
@@ -480,8 +548,25 @@ export class WgpuRenderer {
     transform = null, fx = null, textQuads = null, svgQuads = null) {
     if (!this.ok) return;
     this.uploadsThisFrame = 0;
-    if (transform !== null) this._warnOnce('sessione Trasforma');
-    if (fx !== null) this._warnOnce('sessione Effetti');
+    this.screenCacheHitThisFrame = false;
+    if (transform === null && fx === null &&
+      (this._sess.tf || this._sess.warp || this._sess.fx)) {
+      this._dropSessionState();
+    }
+    // screen-cache (come il GL): documento, camera e proxy identici al
+    // frame precedente = il present è UNA copia texture→canvas
+    const cacheOk = this._canUseScreenCache(strokeStore, transform, fx, textQuads, svgQuads);
+    const cacheKey = cacheOk
+      ? this._makeScreenCacheKey(camera, layers, activeId, proxies, textQuads, svgQuads) : '';
+    if (cacheOk && this._scTex && cacheKey === this._scKey) {
+      const enc0 = this.device.createCommandEncoder();
+      enc0.copyTextureToTexture({ texture: this._scTex },
+        { texture: this._ctx.getCurrentTexture() },
+        [this.canvas.width, this.canvas.height]);
+      this.device.queue.submit([enc0.finish()]);
+      this.screenCacheHitThisFrame = true;
+      return;
+    }
 
     const dpr = camera.dpr;
     const s = camera.zoom * dpr;
@@ -498,7 +583,7 @@ export class WgpuRenderer {
     // Il frame è una sequenza di SEGMENTI: canvas (load/clear) e gruppo
     // (base+figli nell'FBO canvas-size, poi blit nel segmento dopo) — la
     // struttura FBO+blit del GL, in render pass WebGPU consecutivi.
-    /** @typedef {{lt: any, st: any, x0: number, y0: number, x1: number, y1: number, mode: number, a: number, samp?: any, sciss?: number[], clip?: boolean, pipe?: string, blendFn?: number, _ui?: number}} Draw */
+    /** @typedef {{lt: any, st: any, x0: number, y0: number, x1: number, y1: number, mode: number, a: number, samp?: any, sciss?: number[], clip?: boolean, pipe?: string, blendFn?: number, quad?: number[], _ui?: number}} Draw */
     /** @type {{group: boolean, draws: Draw[], bd?: number[]}[]} */
     const segments = [{ group: false, draws: [] }];
     /** @type {Draw[]} */
@@ -560,9 +645,87 @@ export class WgpuRenderer {
       const y1 = Math.round((chunk.cy + 1) * CHUNK * s + ty);
       sink.push({ lt: this._tex.get(chunk), st, x0, y0, x1, y1, mode, a: alpha, clip });
     };
-    // i draw di UN livello raster (chunk + tratto live) nel sink corrente
+    // rect device (clampato) di un clip mondo inclusivo — scissor di sessione
+    const clipRectDev = (/** @type {{x0:number,y0:number,x1:number,y1:number}} */ c) => {
+      const x0 = Math.max(0, Math.min(W, Math.round(c.x0 * s + tx)));
+      const y0 = Math.max(0, Math.min(H, Math.round(c.y0 * s + ty)));
+      const x1 = Math.max(0, Math.min(W, Math.round((c.x1 + 1) * s + tx)));
+      const y1 = Math.max(0, Math.min(H, Math.round((c.y1 + 1) * s + ty)));
+      return x1 > x0 && y1 > y0 ? [x0, y0, x1 - x0, y1 - y0] : null;
+    };
+    // sessione Sposta/Trasforma: quad affine dal canvas piatto, oppure bake
+    // warp/persp/marionetta (triangoli CPU del baker 2D) come rect mondo
+    const pushSession = (/** @type {TransformFrame} */ tf, /** @type {number} */ alpha,
+      /** @type {boolean} */ clip) => {
+      const sciss = clipRectDev(tf.clip);
+      if (!sciss) return;
+      const bk = this._baker();
+      bk._ensureTransformCanvas(tf);
+      if (tf.warp || tf.persp || tf.puppet) {
+        if (tf.puppet) bk._ensurePuppetCanvas(tf);
+        else if (tf.persp) bk._ensurePerspCanvas(tf);
+        else bk._ensureWarpCanvas(tf);
+        if (bk._warpEmpty || !bk._warpCanvas) return;
+        const cnv = /** @type {HTMLCanvasElement} */ (bk._warpCanvas);
+        const tex = this._sessionTex('warp', bk._warpSig, cnv);
+        sink.push({
+          lt: tex, st: null,
+          x0: Math.round(bk._warpX * s + tx), y0: Math.round(bk._warpY * s + ty),
+          x1: Math.round((bk._warpX + cnv.width) * s + tx),
+          y1: Math.round((bk._warpY + cnv.height) * s + ty),
+          mode: 0, a: alpha, samp: this._sampler, sciss, clip,
+        });
+        return;
+      }
+      const tex = this._sessionTex('tf', `tf|${tf.id}`, /** @type {HTMLCanvasElement} */ (bk._tfCanvas));
+      // quad affine: p0 = dev(T·(x,y)), assi = colonne di T scalate (il
+      // drawImage con matrice device∘T del 2D, in un solo quad)
+      const t = tf.m;
+      const p0x = (t[0] * tf.x + t[2] * tf.y + t[4]) * s + tx;
+      const p0y = (t[1] * tf.x + t[3] * tf.y + t[5]) * s + ty;
+      const exx = t[0] * tf.w * s, exy = t[1] * tf.w * s;
+      const eyx = t[2] * tf.h * s, eyy = t[3] * tf.h * s;
+      // AABB del quad (x0..y1: bbox per il backdrop dei modi shader)
+      const xs = [p0x, p0x + exx, p0x + eyx, p0x + exx + eyx];
+      const ys = [p0y, p0y + exy, p0y + eyy, p0y + exy + eyy];
+      sink.push({
+        lt: tex, st: null,
+        x0: Math.floor(Math.min(...xs)), y0: Math.floor(Math.min(...ys)),
+        x1: Math.ceil(Math.max(...xs)), y1: Math.ceil(Math.max(...ys)),
+        quad: [p0x, p0y, exx, exy, eyx, eyy],
+        mode: 0, a: alpha, samp: this._sampler, sciss, clip,
+      });
+    };
+    // sessione Effetti: quad del bake CPU (fallback del 2D — gauss via
+    // ctx.filter, halftone/bevel esatti; il commit CPU è comunque esatto)
+    const pushFx = (/** @type {FxFrame} */ fxF, /** @type {number} */ alpha,
+      /** @type {boolean} */ clip) => {
+      if (fxF.kind === 'smudge' || fxF.kind === 'liquify') {
+        // stato GPU del renderer GL: sotto wgpu quelle sessioni non partono
+        // (gate su smudgeBegin/liquify del renderer) — se mai arrivasse,
+        // meglio un warn che un crash
+        this._warnOnce(`sessione ${fxF.kind} GPU`);
+        return;
+      }
+      const sciss = clipRectDev(fxF.clip);
+      if (!sciss) return;
+      const bk = this._baker();
+      bk._ensureFxCanvas(fxF);
+      const tex = this._sessionTex('fx', `fx|${bk._fxId}|${bk._fxKey}`,
+        /** @type {HTMLCanvasElement} */ (bk._fxBlur));
+      sink.push({
+        lt: tex, st: null,
+        x0: Math.round(fxF.x * s + tx), y0: Math.round(fxF.y * s + ty),
+        x1: Math.round((fxF.x + fxF.w) * s + tx), y1: Math.round((fxF.y + fxF.h) * s + ty),
+        mode: 0, a: alpha, samp: this._sampler, sciss, clip,
+      });
+    };
+    // i draw di UN livello raster (sessione, o chunk + tratto live) nel sink
     const collectRaster = (/** @type {Layer} */ layer, /** @type {boolean} */ clip) => {
       const alpha = layer.opacity;
+      const ltf = transformForLayer(transform, layer.id);
+      if (ltf !== null) { pushSession(ltf, alpha, clip); return; }
+      if (fx !== null && fx.layerId === layer.id) { pushFx(fx, alpha, clip); return; }
       const live = strokeStore !== null && layer.id === activeId && strokeStore.map.size > 0;
       for (const chunk of layer.store.map.values()) {
         if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
@@ -715,13 +878,22 @@ export class WgpuRenderer {
     const uni = new ArrayBuffer(need);
     for (let i = 0; i < flat.length; i++) {
       const d = flat[i];
-      const f = new Float32Array(uni, i * 256, 8);
+      const f = new Float32Array(uni, i * 256, 10);
       const u32 = new Uint32Array(uni, i * 256, 12);
-      f[0] = d.x0; f[1] = d.y0; f[2] = d.x1; f[3] = d.y1;
-      f[4] = W; f[5] = H;
-      f[6] = d.a; f[7] = strokeOpacity;
-      u32[8] = d.mode;
-      u32[9] = d.blendFn || 0;
+      if (d.quad) {
+        // quad affine: p0 + assi (sessione Sposta/Trasforma)
+        f[0] = d.quad[0]; f[1] = d.quad[1];
+        f[2] = d.quad[2]; f[3] = d.quad[3];
+        f[4] = d.quad[4]; f[5] = d.quad[5];
+      } else {
+        f[0] = d.x0; f[1] = d.y0;
+        f[2] = d.x1 - d.x0; f[3] = 0;
+        f[4] = 0; f[5] = d.y1 - d.y0;
+      }
+      f[6] = W; f[7] = H;
+      f[8] = d.a; f[9] = strokeOpacity;
+      u32[10] = d.mode;
+      u32[11] = d.blendFn || 0;
     }
     this.device.queue.writeBuffer(this._uniBuf, 0, uni);
 
@@ -840,7 +1012,71 @@ export class WgpuRenderer {
       drawList(pass, seg.draws, this._pipeline, this._pipeline);
       pass.end();
     }
+    if (cacheOk) {
+      // cattura: il frame appena composto diventa la cache
+      this._ensureScTex(W, H);
+      enc.copyTextureToTexture({ texture: canvasTex }, { texture: this._scTex }, [W, H]);
+      this._scKey = cacheKey;
+    }
     this.device.queue.submit([enc.finish()]);
+  }
+
+  /**
+   * Gating della screen-cache (semantica del GL): mai durante tratti,
+   * sessioni o bake del frame — quei frame devono aggiornare il contenuto.
+   * @param {ChunkStore|null} strokeStore
+   * @param {import('./renderer_gl.js').TransformFrameSet} transform
+   * @param {FxFrame|null} fx
+   * @param {import('./text_quad.js').TextQuadCache|null} textQuads
+   * @param {import('./svg_quad.js').SvgQuadCache|null} svgQuads
+   */
+  _canUseScreenCache(strokeStore, transform, fx, textQuads, svgQuads) {
+    if (strokeStore && strokeStore.map.size > 0) return false;
+    if (transform !== null || fx !== null) return false;
+    if (textQuads && textQuads.bakedThisFrame > 0) return false;
+    if (svgQuads && svgQuads.bakedThisFrame > 0) return false;
+    return true;
+  }
+
+  /** Chiave del frame (stessi campi del GL: camera, pila, versioni store).
+   * @param {Camera} camera @param {Layer[]} layers @param {number} activeId
+   * @param {import('./board_proxy.js').ProxyFrame|null} proxies
+   * @param {import('./text_quad.js').TextQuadCache|null} textQuads
+   * @param {import('./svg_quad.js').SvgQuadCache|null} svgQuads
+   */
+  _makeScreenCacheKey(camera, layers, activeId, proxies, textQuads, svgQuads) {
+    /** @type {(string|number)[]} */
+    const parts = [
+      this.ctxGen, this.canvas.width, this.canvas.height,
+      camera.x, camera.y, camera.zoom, camera.w, camera.h, camera.dpr,
+      activeId, textQuads ? (textQuads.cacheSerial || 0) : 0,
+      svgQuads ? (svgQuads.cacheSerial || 0) : 0,
+    ];
+    if (proxies) {
+      parts.push(proxies.quads.length, proxies.skip.size);
+      for (const id of proxies.skip) parts.push(id);
+    } else {
+      parts.push(0, 0);
+    }
+    for (const l of layers) {
+      parts.push(l.id, l.kind || '', l.visible ? 1 : 0, l.opacity, l.mode || 'normal',
+        l.clip ? 1 : 0, l.clipBase ? l.clipBase.id : 0);
+      if (l.store) parts.push(l.store.ver, l.store.map.size);
+      else parts.push(l.ver || 0);
+    }
+    return parts.join('|');
+  }
+
+  /** Texture della screen-cache, ricreata al resize (chiave azzerata).
+   * @param {number} w @param {number} h */
+  _ensureScTex(w, h) {
+    if (this._scTex && this._scTex.width === w && this._scTex.height === h) return;
+    if (this._scTex) this._scTex.destroy();
+    this._scTex = this.device.createTexture({
+      size: [w, h], format: this._format,
+      usage: /* COPY_SRC|COPY_DST */ 0x1 | 0x2,
+    });
+    this._scKey = '';
   }
 
   /** Backdrop dei modi shader: texture canvas-size nel formato del canvas.
