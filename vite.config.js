@@ -31,6 +31,8 @@ export default defineConfig({
         privacy: resolve(import.meta.dirname, 'privacy.html'),
         terms: resolve(import.meta.dirname, 'terms.html'),
         support: resolve(import.meta.dirname, 'support.html'),
+        webgpuTest: resolve(import.meta.dirname, 'webgpu_test.html'),
+        capsuleCompare: resolve(import.meta.dirname, 'capsule_compare.html'),
       },
       output: {
         entryFileNames: 'assets/[name]-[hash].js',
