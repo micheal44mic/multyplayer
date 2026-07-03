@@ -12,6 +12,7 @@ import { ChunkStore, chunkKey, translateStore, translateStoreWrapped, forEachChu
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
+import { RasterBridge } from './raster_bridge.js';
 import { GLRenderer } from './renderer_gl.js';
 import { Canvas2DRenderer } from './renderer_2d.js';
 import { InputManager } from './input.js';
@@ -122,6 +123,21 @@ export class App {
     this.engine = new StrokeEngine(this.queue);
     this.raster = new Rasterizer(this.strokeStore, this.stampCache, heap);
 
+    // Raster worker (vedi docs/raster-worker-design.md): i tratti LOCALI
+    // rasterizzano su un Web Worker coi pixel in SharedArrayBuffer; qui
+    // restano lo store specchio e il Rasterizer secondario (heap=null: i
+    // chunk SAB non sono memoria wasm) per endPass e run sincroni. Gate
+    // per-tratto in startStroke; senza COOP/COEP il bridge non è usable e
+    // tutto resta identico a prima. La replay collab usa SEMPRE this.raster.
+    this.rasterBridge = new RasterBridge();
+    this.rasterSab = this.rasterBridge.usable
+      ? new Rasterizer(this.rasterBridge.store, this.stampCache, null) : null;
+    if (this.rasterBridge.usable) this._allStores.add(this.rasterBridge.store);
+    this._strokeStoreMain = this.strokeStore;
+    this.curRaster = this.raster;       // il Rasterizer autorevole del tratto corrente
+    /** @type {'main'|'worker'} */
+    this.rasterMode = 'main';
+
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
     // può far lampeggiare il tratto (frame presentati fuori sincrono).
     // Preferenza persistita; toggle nel pannello (sezione Renderer).
@@ -180,7 +196,7 @@ export class App {
     // deseleziona a metà — un tratto mezzo mascherato sarebbe incoerente
     /** @type {{mask: Uint8Array, x: number, y: number, w: number, h: number}|null} */
     this._strokeSel = null;
-    /** @type {{chunks: Chunk[], index: number, snap: Snap|null, store: ChunkStore, layerId: number}|null} */
+    /** @type {{chunks: Chunk[], index: number, snap: Snap|null, store: ChunkStore, layerId: number, heap?: WasmHeap|null}|null} */
     this.commitJob = null;        // commit incrementale spalmato sui frame
     this.COMMIT_CHUNKS_PER_FRAME = 24;
     this._imageImporting = false;
@@ -1470,7 +1486,7 @@ export class App {
     vcam.zoom = cam.zoom;
     vcam.resize(cssW, cssH, dpr, 0, 0);
 
-    const snap = this.raster.snap;
+    const snap = this.curRaster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
     this._patternRepeatRenderer.render(vcam, board.mgr.layers, board.mgr.activeId,
@@ -1608,7 +1624,24 @@ export class App {
     }
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
     this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom, direct);
-    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, target.store);
+    // raster worker per i tratti locali: pixel su un altro thread, output
+    // bit-exact (stesso Rasterizer JS). Gate: bridge usable, niente aqua
+    // (campiona il layer documento, che vive sul main). Fallback = path
+    // di sempre. La replay collab non passa di qui (usa this.raster).
+    const snap = /** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap);
+    if (this.rasterSab && !snap.aqua &&
+      this.rasterBridge.beginStroke(snap, this._strokeClip, this._strokeSel)) {
+      this.rasterMode = 'worker';
+      this.strokeStore = this.rasterBridge.store;
+      this.curRaster = this.rasterSab;
+      // lo snap serve subito sul main (live opacity, endPass, commit)
+      this.rasterSab.beginStroke(snap, this._strokeClip, this._strokeSel, null);
+    } else {
+      this.rasterMode = 'main';
+      this.strokeStore = this._strokeStoreMain;
+      this.curRaster = this.raster;
+      this.raster.beginStroke(snap, this._strokeClip, this._strokeSel, target.store);
+    }
     this.strokeLive = true;
     this.pendingCommit = false;
     // collaborazione: pennello fotografato + seed + eventi -> replay remoto
@@ -1633,10 +1666,31 @@ export class App {
     if (!this.strokeLive && !this.commitJob) return;
     if (this.strokeLive) {
       if (this.engine.snapDirty) this._syncSnapStroke();
-      if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+      this._runQueueSync();
       if (this.pendingCommit) this._beginCommit();
     }
     if (this.commitJob) this._runCommit(Infinity);
+  }
+
+  // Drena la coda in sincrono col motore del tratto corrente. In modalità
+  // worker: invia il resto e aspetta (spin) che il worker abbia finito —
+  // stessa semantica del run(Infinity) di sempre, il lavoro è solo altrove.
+  _runQueueSync() {
+    if (this.rasterMode === 'worker') {
+      if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+      this.rasterBridge.flushSync();
+      return;
+    }
+    if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+  }
+
+  // Fine vita di un tratto worker (commit chiuso/annullo): lo store attivo
+  // torna quello main, la collab e il prossimo tratto ripartono da lì.
+  _restoreMainStroke() {
+    if (this.rasterMode !== 'worker') return;
+    this.rasterMode = 'main';
+    this.strokeStore = this._strokeStoreMain;
+    this.curRaster = this.raster;
   }
 
   cancelStroke() {
@@ -1654,7 +1708,9 @@ export class App {
     }
     this.engine.cancel();
     this.queue.clear();
+    if (this.rasterMode === 'worker') this.rasterBridge.reset();
     this._dropStrokeBuffer();
+    this._restoreMainStroke();
     this.strokeLive = false;
     this.pendingCommit = false;
     this.collab.strokeCancel();
@@ -1753,7 +1809,16 @@ export class App {
   _syncSnapStroke() {
     if (!this.engine.snapMode || !this.engine.snapDirty) return false;
     this.queue.clear();
-    this._dropStrokeBuffer();
+    if (this.rasterMode === 'worker') {
+      // lo snap butta e ridisegna TUTTO il tratto: l'output del worker non
+      // serve più — reset (gli slot si riciclano a drain finito) e il
+      // ridisegno gira sul path main di sempre
+      this.rasterBridge.reset();
+      this._dropStrokeBuffer();
+      this._restoreMainStroke();
+    } else {
+      this._dropStrokeBuffer();
+    }
     this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
     return this.engine.emitSnap();
   }
@@ -1767,8 +1832,10 @@ export class App {
   _endPass() {
     // il live ancora in coda va rasterizzato PRIMA di svuotare i chunk della
     // punta: il replay fuori dal clip viene scartato, e un dab mai disegnato
-    // lascerebbe un buco nel corpo
-    if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+    // lascerebbe un buco nel corpo. In modalità worker il flush aspetta che
+    // il worker finisca; da qui in poi il tratto è tutto sul main (curRaster
+    // scrive direttamente negli slot SAB del mirror, il worker resta fermo).
+    this._runQueueSync();
     const rect = this.engine.endPassRect();
     /** @type {Set<number>|null} */
     let clip = null;
@@ -1791,11 +1858,11 @@ export class App {
     } else {
       this._dropStrokeBuffer();
     }
-    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
-    this.raster.clip = clip;
+    this.curRaster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
+    this.curRaster.clip = clip;
     this.engine.replay();
-    this.raster.run(this.queue, Infinity);
-    this.raster.clip = null;
+    this.curRaster.run(this.queue, Infinity);
+    this.curRaster.clip = null;
   }
 
   /** @param {{x0:number,y0:number,x1:number,y1:number}} rect */
@@ -1834,11 +1901,19 @@ export class App {
   // resta corretto chunk per chunk (mai doppia applicazione).
   _beginCommit() {
     this.pendingCommit = false;
+    if (this.rasterMode === 'worker') {
+      // il worker deve aver scritto TUTTO prima di leggere i chunk (il gate
+      // nel frame arriva già idle: qui il flush è quasi sempre un no-op);
+      // touched arriva dai flag SAB scritti dal worker
+      this.rasterBridge.flushSync();
+      this.rasterBridge.syncTouched();
+    }
     const layer = this.boards.layerById(this._strokeLayerId);
     if (!layer || !layer.store) {
       // il livello è stato eliminato durante il tratto: il tratto muore
       this.queue.clear();
       this._dropStrokeBuffer();
+      this._restoreMainStroke();
       this.strokeLive = false;
       return;
     }
@@ -1852,11 +1927,18 @@ export class App {
     }
     if (touched.length === 0) {
       this._dropStrokeBuffer();
+      this._restoreMainStroke();
       this.strokeLive = false;
       return;
     }
     this.undoMgr.captureBegin(layer.id);
-    this.commitJob = { chunks: touched, index: 0, snap: this.raster.snap, store: layer.store, layerId: layer.id };
+    // heap: i chunk SAB non sono memoria wasm — il commit va col path JS
+    // (bit-exact per contratto, spalmato sui frame come sempre)
+    this.commitJob = {
+      chunks: touched, index: 0, snap: this.curRaster.snap,
+      store: layer.store, layerId: layer.id,
+      heap: this.rasterMode === 'worker' ? null : this.heap,
+    };
   }
 
   /** @param {number} maxChunks */
@@ -1868,7 +1950,7 @@ export class App {
       const sc = job.chunks[job.index++];
       commitChunk(job.store, sc, job.snap,
         (key, cx, cy, before) => this.undoMgr.captureChunk(key, cx, cy, before),
-        this.heap);
+        job.heap !== undefined ? job.heap : this.heap);
       this.strokeStore.remove(sc.key, this._disposeTex);
       n++;
     }
@@ -1876,6 +1958,7 @@ export class App {
       this.commitJob = null;
       this.undoMgr.captureEnd();
       this._dropStrokeBuffer(); // residui (non touched) e dirty set
+      this._restoreMainStroke();
       this.strokeLive = false;
       const done = this.boards.layerById(job.layerId);
       if (done) done.thumbDirty = true;
@@ -2028,11 +2111,15 @@ export class App {
     const t1 = performance.now();
 
     // 2. (il sampling avviene dentro drain via engine.move)
-    // 3. raster con budget
+    // 3. raster con budget (modalità worker: la coda parte verso il worker
+    // senza budget — ha un core tutto suo — e il tick applica al mirror i
+    // dirty delle entry già scritte, mai upload di pixel in volo)
     let rasterPx = 0;
     if (this.queue.count > 0) {
-      rasterPx = this.raster.run(this.queue, this.budgetPx);
+      if (this.rasterMode === 'worker') this.rasterBridge.sendEntries(this.queue);
+      else rasterPx = this.raster.run(this.queue, this.budgetPx);
     }
+    if (this.rasterSab) this.rasterBridge.tick();
     if (this.blurSession) this._pumpBlur(3.5);
     if (this.liquifySession) this._pumpLiquify(5.5);
     const t2 = performance.now();
@@ -2043,7 +2130,8 @@ export class App {
     const tPrep0 = performance.now();
     // commit differito: parte quando il catch-up è finito, poi procede
     // a fette per non produrre un frame da centinaia di ms
-    if (this.pendingCommit && this.queue.count === 0 && !this.engine.active) {
+    if (this.pendingCommit && this.queue.count === 0 && !this.engine.active &&
+      (this.rasterMode !== 'worker' || this.rasterBridge.idle)) {
       this._beginCommit();
     }
     if (this.commitJob) this._runCommit(this.COMMIT_CHUNKS_PER_FRAME);
@@ -2060,7 +2148,7 @@ export class App {
     const spacesMode = !!this.ui?.spacesMode;
     const activeBoardIdForRender = spacesMode ? 0 : this.boards.activeId;
     const activeLayerIdForRender = spacesMode ? 0 : this.layerMgr.activeId;
-    const snap = this.raster.snap;
+    const snap = this.curRaster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
     // proxy dei board per lo zoom-out (solo WebGL): quad piatti al posto dei

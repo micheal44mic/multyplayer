@@ -5,6 +5,11 @@ import { handleGeminiFillRequest, handleGeminiGenerateRequest } from './server/g
 export default defineConfig({
   base: './',
   server: {
+    // SharedArrayBuffer per il raster worker (docs/raster-worker-design.md)
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
     configureServer(server) {
       server.middlewares.use('/api/ai/fill', async (req, res) => {
         await handleGeminiFillRequest(req, res);
