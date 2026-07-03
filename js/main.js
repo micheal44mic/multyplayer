@@ -35,6 +35,7 @@ import { blitImageDataToStore, imageDataFromFile, imageLayerName } from './image
 import { vectorizeDebug, vectorizeRasterLayer as traceRasterLayer } from './vectorize.js';
 import { normalSourceFromBackdrop, renderLayerStackToCanvas } from './layer_composite.js';
 import { SelectionManager, SelectionOverlay } from './selection.js';
+import { InkOverlay } from './ink_overlay.js';
 import { aiLayerName, aiResultToImageData, prepareAiFillPayload, requestAiFill } from './ai_fill.js';
 import { Collab } from './collab.js';
 import { BlurBrushSession } from './blur_brush.js';
@@ -223,6 +224,7 @@ export class App {
         if (this.liquifySession) return this.liquifySession.move(x, y, p, t);
         if (this.strokeLive) {
           this.engine.move(x, y, p, t);
+          this.ink.strokePoint(x, y, p, t);
           this.collab.strokePoint(x, y, p, t);
         }
       },
@@ -243,6 +245,7 @@ export class App {
         }
         if (!this.strokeLive) return;
         this.engine.end(x, y, p, t);
+        this.ink.strokeEnd();
         if (this.engine.snapMode) this._syncSnapStroke();
         else if (this.engine.endPassNeeded) this._endPass();
         this.pendingCommit = true;
@@ -277,6 +280,10 @@ export class App {
     // (tinta + formiche), fuori dai piani e trasparente all'input
     this.selection = new SelectionManager();
     this.selectionUI = new SelectionOverlay(this.selection);
+
+    // ink overlay: punta provvisoria raw+predizione sopra i piani (fase 0
+    // del piano WebGPU) — fuori da #planes come la selezione
+    this.ink = new InkOverlay();
 
     // Specchio verticale: i descrittori in coda vengono duplicati riflessi
     // sull'asse a metà del canvas attivo (queue.mirrorX, fotografato al
@@ -493,6 +500,7 @@ export class App {
     this.camera.resize(w, h, dpr, r?.left || 0, r?.top || 0);
     this.renderer.resize(w, h, dpr);
     this.planes.resize(w, h, dpr);
+    this.ink.resize(w, h, dpr, r?.left || 0, r?.top || 0);
     this.requestFrame();
   }
 
@@ -1650,6 +1658,9 @@ export class App {
     }
     this.strokeLive = true;
     this.pendingCommit = false;
+    // punta provvisoria: SOLO i tratti locali passano di qui (la replay
+    // collab usa l'engine direttamente); gomma/aqua le scarta frame()
+    this.ink.strokeBegin(x, y, p, t);
     // collaborazione: pennello fotografato + seed + eventi -> replay remoto
     this.collab.strokeBegin(board, target.id, x, y, p, t, direct);
   }
@@ -1713,6 +1724,7 @@ export class App {
       return;
     }
     this.engine.cancel();
+    this.ink.strokeEnd();
     this.queue.clear();
     if (this.rasterMode === 'worker') this.rasterBridge.reset();
     this._dropStrokeBuffer();
@@ -2257,6 +2269,9 @@ export class App {
       patternTile: !spacesMode && this.patternMode ? this.boards.active : null,
     });
     const tPlanes1 = performance.now();
+    // punta provvisoria del tratto: dopo il present (copre solo ciò che il
+    // raster non ha ancora messo sullo schermo), anche in corsia prioritaria
+    this.ink.frame(this);
     const tOverlay0 = performance.now();
     if (strokePriority || spacesMode) {
       this._hideDeferredStrokeOverlays();

@@ -44,6 +44,14 @@ export class RasterBridge {
     // endpass asincrono in corso: {watermark, items} (vedi endPassBegin)
     /** @type {{watermark: number, items: {chunk: import('./store.js').Chunk, oldSlot: number, newSlot: number}[]}|null} */
     this._swap = null;
+    // geometria delle entry inviate, per idx (ink overlay: le entry in volo
+    // fra tickDrained e sent sono la parte di tratto non ancora sullo
+    // schermo). 8 float per entry: type, x1, y1, r1, x2, y2, r2, pad.
+    this.inkRing = new Float32Array(2048 * 8);
+    // drained fotografato all'ultimo tick(): i dirty del mirror (quindi i
+    // pixel visibili) arrivano fin lì — il valore atomico live può essere
+    // già oltre l'upload di questo frame
+    this.tickDrained = 0;
     this._ready = false;      // il worker ha valutato il modulo (diagnostica)
     this._flushMsFrame = 0;
 
@@ -186,6 +194,13 @@ export class RasterBridge {
       for (let k = 0; k < ENTRY_STRIDE; k++) buf[i * ENTRY_STRIDE + k] = src[o + k];
       queue.pop();
       const idx = ++this.sent;
+      const eb = i * ENTRY_STRIDE;
+      const rb = (idx & 2047) * 8;
+      this.inkRing[rb] = buf[eb];
+      this.inkRing[rb + 1] = buf[eb + 1]; this.inkRing[rb + 2] = buf[eb + 2];
+      this.inkRing[rb + 3] = buf[eb + 3];
+      this.inkRing[rb + 4] = buf[eb + 5]; this.inkRing[rb + 5] = buf[eb + 6];
+      this.inkRing[rb + 6] = buf[eb + 7];
       simulateEntry(this.store, sim, buf, i * ENTRY_STRIDE, this._clip,
         (chunk, lx0, ly0, lx1, ly1) => {
           if (!this._known.has(chunk.key)) {
@@ -203,6 +218,7 @@ export class RasterBridge {
   // il worker è fermo.
   tick() {
     const d = this.drained;
+    this.tickDrained = d;
     if (this._pending.length > 0) {
       let i = 0;
       for (; i < this._pending.length; i++) {

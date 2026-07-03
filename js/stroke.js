@@ -70,7 +70,7 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
 
 export const T_DAB = 0;
 export const T_SEG = 1;
-const STRIDE = 10;
+export const STRIDE = 10;
 const TWO_PI_STROKE = Math.PI * 2;
 
 // Sotto questa frazione di spacing, in modalità wash, l'unione dei dab tondi

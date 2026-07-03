@@ -559,6 +559,18 @@ body.android-perf-mode #android-badge { display: block; }
   #adbar { display: flex; }
 }
 
+/* punta provvisoria del tratto (ink overlay, js/ink_overlay.js): canvas 2D
+   incollato al riquadro dei piani, sotto guide e selezione. left/top e
+   misure arrivano inline da App._resize. */
+#ink-overlay {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  pointer-events: none;
+  display: block;
+}
+
 /* guida dello specchio verticale: asse a metà del canvas attivo, posizionata
    in px schermo da main.js (transform, come i .board); sparisce mentre si
    disegna. Tratteggio sottile, mai cliccabile. */
