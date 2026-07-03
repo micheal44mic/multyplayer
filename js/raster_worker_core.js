@@ -76,6 +76,17 @@ class WorkerStore {
   /** @param {number} key */
   getByKey(key) { return this.map.get(key); }
 
+  // Pass finale del taper: il main ha svuotato questi chunk sul mirror; qui
+  // muore il binding (il replay li ricrea con slot NUOVI decisi dal main).
+  /** @param {number} key */
+  removeKey(key) {
+    const c = this.map.get(key);
+    if (!c) return;
+    this.map.delete(key);
+    this.dirty.delete(c);
+    if (this.heap && c.ptr) this.heap.free(c.ptr, CHUNK_BYTES);
+  }
+
   /** @param {any} chunk @param {number} [lx0] @param {number} [ly0] @param {number} [lx1] @param {number} [ly1] */
   markDirty(chunk, lx0 = 0, ly0 = 0, lx1 = CHUNK - 1, ly1 = CHUNK - 1) {
     this.ver++;
@@ -179,6 +190,22 @@ export class WorkerEngine {
         if (this._pendingHeap) this._swapToWasm();
         const snap = reviveSnap(m.snap, this.assets);
         this.raster.beginStroke(snap, m.clip || null, m.sel || null, null);
+        this.raster.clip = null;
+        break;
+      }
+      case 'endpass': {
+        // punta del taper: via i binding dei chunk svuotati dal main, e le
+        // entry successive (il replay) scrivono SOLO dentro il clip — la
+        // stessa semantica di _endPass, ma al passo dei kernel wasm
+        if (m.gen !== this.gen) break;
+        if (m.clip) {
+          for (const k of m.clip) this.store.removeKey(k);
+          this.raster.clip = new Set(m.clip);
+        } else {
+          // punta più lunga del corpo disegnato: si rifà il tratto intero
+          this.store.clear();
+          this.raster.clip = null;
+        }
         break;
       }
       case 'entries': {
@@ -201,6 +228,7 @@ export class WorkerEngine {
         this.gen = m.gen;
         this.store.clear();
         this.raster.beginStroke(null);
+        this.raster.clip = null;
         break;
     }
   }

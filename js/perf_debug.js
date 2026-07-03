@@ -608,6 +608,9 @@ export class PerfDebugConsole {
       // raster worker: se false, i tratti girano sul main (manca SAB o
       // COOP/COEP, o il worker è morto) e il backlog resterà 0 per definizione
       workerAvailable: !!this.app.rasterSab && !!this.app.rasterBridge?.usable,
+      workerReason: this.app.rasterBridge?.reason || '',
+      coi: typeof crossOriginIsolated !== 'undefined' ? !!crossOriginIsolated : 'api-assente',
+      sab: typeof SharedArrayBuffer !== 'undefined',
       cores: navigator.hardwareConcurrency || 0,
     };
   }

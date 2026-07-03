@@ -42,13 +42,24 @@ export class RasterBridge {
     /** @type {{x0:number,y0:number,x1:number,y1:number}|null} */
     this._clip = null;
 
+    // perché il bridge NON è usable (diagnostica nel pannello perf):
+    // no-coi = pagina non isolata (header COOP/COEP assenti o rifiutati),
+    // no-sab = isolata ma senza SharedArrayBuffer, worker-error = spawn/crash
+    this.reason = '';
     try {
-      if (typeof SharedArrayBuffer === 'undefined' ||
-        (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated)) return;
+      if (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated) {
+        this.reason = 'no-coi';
+        return;
+      }
+      if (typeof SharedArrayBuffer === 'undefined') {
+        this.reason = typeof crossOriginIsolated === 'undefined' ? 'no-coi-api' : 'no-sab';
+        return;
+      }
       this.worker = new Worker(new URL('./raster_worker.js', import.meta.url), { type: 'module' });
       this.worker.onerror = (e) => {
         console.error('[raster_bridge] worker morto, fallback main-thread', e.message || e);
         this.usable = false;
+        this.reason = 'worker-error: ' + (e.message || 'unknown');
       };
       this.ctlSab = new SharedArrayBuffer(16 * 4);
       this.ctl = new Int32Array(this.ctlSab);
@@ -56,6 +67,7 @@ export class RasterBridge {
     } catch (err) {
       console.warn('[raster_bridge] non disponibile:', err);
       this.usable = false;
+      this.reason = 'init-error: ' + (err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -121,6 +133,7 @@ export class RasterBridge {
     this.gen++;
     this._known.clear();
     this._pending.length = 0;
+    this._clipKeys = null;
     this._sim = { hardness: snap.hardness, roundness: snap.roundness, shape: snap.shape };
     this._clip = clip;
     const texId = this._assetId(snap.tex, 'tex');
@@ -159,7 +172,7 @@ export class RasterBridge {
             creations.push(chunk.key, this.store.slotFor(chunk));
           }
           this._pending.push({ idx, gen: this.gen, chunk, lx0, ly0, lx1, ly1 });
-        });
+        }, this._clipKeys || null);
     }
     this.worker.postMessage({ t: 'entries', gen: this.gen, n, buf, creations });
   }
@@ -217,6 +230,28 @@ export class RasterBridge {
     }
   }
 
+  /**
+   * Pass finale del taper SUL WORKER (al passo dei kernel wasm, non JS sul
+   * main): il main ha già svuotato i chunk della punta sul mirror; qui il
+   * worker scarta i binding corrispondenti e le entry successive (il replay
+   * emesso dall'engine) vengono clippate a quei soli chunk — la stessa
+   * semantica di Rasterizer.clip. clipKeys null = tratto rifatto per intero
+   * (il chiamante ha già svuotato tutto il mirror).
+   * @param {Set<number>|null} clipKeys
+   */
+  endPassBegin(clipKeys) {
+    if (!this.usable || !this.worker) return;
+    this._clipKeys = clipKeys;
+    if (clipKeys) {
+      // i chunk svuotati rinascono con slot nuovi: vanno ri-annunciati
+      for (const k of clipKeys) this._known.delete(k);
+      this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: [...clipKeys] });
+    } else {
+      this._known.clear();
+      this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: null });
+    }
+  }
+
   // Annullo/snap: il worker dimentica binding e snap. Gli slot del mirror
   // vengono rilasciati dal chiamante (releaseAll) e riciclati a drain finito.
   reset() {
@@ -224,6 +259,7 @@ export class RasterBridge {
     this.gen++;
     this._pending.length = 0;
     this._known.clear();
+    this._clipKeys = null;
     this.worker.postMessage({ t: 'reset', gen: this.gen });
   }
 }

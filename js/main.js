@@ -1859,6 +1859,17 @@ export class App {
       this._dropStrokeBuffer();
     }
     this.curRaster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
+    if (this.rasterMode === 'worker' && this.rasterBridge.usable) {
+      // il replay della punta gira SUL WORKER (kernel wasm, core suo): sul
+      // main il JS puro costava secondi coi pennelli giganti su mobile.
+      // beginStroke qui sopra serve solo allo snap del commit; il worker
+      // tiene lo stato del tratto vivo (stesso snap → stessi byte)
+      this.rasterBridge.endPassBegin(clip);
+      this.engine.replay();
+      if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+      this.rasterBridge.flushSync();
+      return;
+    }
     this.curRaster.clip = clip;
     this.engine.replay();
     this.curRaster.run(this.queue, Infinity);

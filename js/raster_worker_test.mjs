@@ -221,6 +221,104 @@ for (const wasm of [false, true]) {
   }
 }
 
+// ---- pass finale del taper (endpass): live, svuota la punta, replay clippato ----
+/** @param {string} name @param {boolean} wasm */
+async function runEndPassCase(name, wasm) {
+  const clip = { x0: 0, y0: 0, x1: 1023, y1: 1023 };
+  const snap = makeSnap();
+  const rnd2 = mulberry32(4242);
+  const mkStream = (/** @type {number} */ n, /** @type {number} */ seed) => {
+    const q = new DabQueue();
+    pushRandomEntries(q, mulberry32(seed), n, clip);
+    const out = new Float32Array(q.count * ENTRY_STRIDE);
+    let i = 0;
+    while (q.count > 0) {
+      const o = q.peekOffset();
+      for (let k = 0; k < ENTRY_STRIDE; k++) out[i * ENTRY_STRIDE + k] = q.buf[o + k];
+      q.pop(); i++;
+    }
+    return out;
+  };
+  const live = mkStream(70, 91);
+  const replay = mkStream(50, 92); // "punta" ridisegnata (descrittori qualsiasi)
+  // chiavi della punta: un blocco di chunk in mezzo al board
+  const tipKeys = new Set();
+  for (let cy = 1; cy <= 2; cy++) for (let cx = 1; cx <= 2; cx++) tipKeys.add(((cx + 32768) << 16) | (cy + 32768));
+
+  // riferimento: pipeline main di sempre
+  const refStore = new ChunkStore('ref', null);
+  const refRaster = new Rasterizer(refStore, new StampCache(), null);
+  refRaster.beginStroke(snap, clip, null, null);
+  const refQ = new DabQueue();
+  const feed = (/** @type {Float32Array} */ s) => {
+    for (let i = 0; i < s.length; i += ENTRY_STRIDE) {
+      refQ.push(s[i], s[i + 1], s[i + 2], s[i + 3], s[i + 4], s[i + 5], s[i + 6], s[i + 7], s[i + 8], s[i + 9]);
+    }
+  };
+  feed(live);
+  refRaster.run(refQ, Infinity);
+  for (const k of tipKeys) refStore.remove(k, null);
+  refRaster.beginStroke(snap, clip, null, null);
+  refRaster.clip = tipKeys;
+  feed(replay);
+  refRaster.run(refQ, Infinity);
+  refRaster.clip = null;
+
+  // path worker: live -> endpass -> replay (creazioni simulate col clip)
+  const pool = new SlotPool();
+  pool.ensure(16 + 16);
+  const mirror = new SabStrokeStore('mirror', pool);
+  const ctlSab = new SharedArrayBuffer(64);
+  const eng = new WorkerEngine();
+  if (wasm) {
+    const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+    eng.attachHeap(new WasmHeap(instance));
+  }
+  eng.handle({ t: 'init', ctl: ctlSab, slots: pool.sab, touched: pool.touchedSab });
+  eng.handle({ t: 'begin', gen: 1, snap: serializeSnap(snap, 0, 0), clip: { ...clip }, sel: null });
+  const sim = { hardness: snap.hardness, roundness: snap.roundness, shape: snap.shape };
+  const known = new Set();
+  let sent = 0;
+  /** @param {Float32Array} s @param {Set<number>|null} ck */
+  const send = (s, ck) => {
+    const n = s.length / ENTRY_STRIDE;
+    /** @type {number[]} */
+    const creations = [];
+    for (let k = 0; k < n; k++) {
+      sent++;
+      simulateEntry(mirror, sim, s, k * ENTRY_STRIDE, clip, (chunk) => {
+        if (!known.has(chunk.key)) {
+          known.add(chunk.key);
+          creations.push(chunk.key, mirror.slotFor(chunk));
+        }
+      }, ck);
+    }
+    eng.handle({ t: 'entries', gen: 1, n, buf: s, creations });
+  };
+  send(live, null);
+  // endpass: il main svuota la punta sul mirror e il worker scarta i binding
+  for (const k of tipKeys) { mirror.remove(k, null); known.delete(k); }
+  eng.handle({ t: 'endpass', gen: 1, clip: [...tipKeys] });
+  send(replay, tipKeys);
+  const drained = Atomics.load(new Int32Array(ctlSab), CTL_DRAINED);
+  check(drained === sent, `${name}: drained ${drained}/${sent}`);
+
+  const refKeys = [...refStore.map.keys()].sort();
+  const mirKeys = [...mirror.map.keys()].sort();
+  check(refKeys.length === mirKeys.length && refKeys.every((k, i) => k === mirKeys[i]),
+    `${name}: stesso insieme di chunk (${refKeys.length})`);
+  let diffBytes = 0;
+  for (const [key, rc] of refStore.map) {
+    const mc = mirror.map.get(key);
+    if (!mc) continue;
+    for (let i = 0; i < rc.data.length; i++) if (rc.data[i] !== mc.data[i]) diffBytes++;
+  }
+  check(diffBytes === 0, `${name}: 0 byte diversi dopo endpass (${diffBytes})`);
+}
+
+await runEndPassCase('endpass [worker js]', false);
+await runEndPassCase('endpass [worker wasm]', true);
+
 if (failures) {
   console.error(`\n${failures} FALLIMENTI`);
   process.exit(1);

@@ -27,8 +27,9 @@ export const ENTRY_STRIDE = 10; // = STRIDE di stroke.js (descrittori Float32)
  * @param {Float32Array} buf @param {number} o offset dell'entry
  * @param {{x0:number,y0:number,x1:number,y1:number}|null} clipRect
  * @param {(chunk: import('./store.js').Chunk, lx0: number, ly0: number, lx1: number, ly1: number) => void} cb
+ * @param {Set<number>|null} [clipKeys] pass finale del taper: solo questi chunk
  */
-export function simulateEntry(store, snap, buf, o, clipRect, cb) {
+export function simulateEntry(store, snap, buf, o, clipRect, cb, clipKeys = null) {
   let x0, y0, x1, y1;
   if (buf[o] === T_DAB) {
     // _dab: a255 0 = nessun lavoro (nemmeno creazioni), poi bbox dello stamp
@@ -54,7 +55,7 @@ export function simulateEntry(store, snap, buf, o, clipRect, cb) {
     if (x0 > x1 || y0 > y1) return;
   }
   forEachChunkInRect(store, x0, y0, x1, y1, true,
-    (chunk, lx0, ly0, lx1, ly1) => cb(chunk, lx0, ly0, lx1, ly1));
+    (chunk, lx0, ly0, lx1, ly1) => cb(chunk, lx0, ly0, lx1, ly1), clipKeys);
 }
 
 /**
