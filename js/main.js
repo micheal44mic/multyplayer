@@ -1737,19 +1737,27 @@ export class App {
       // il GPU non si può attendere in sincrono (mapAsync vuole l'event
       // loop): si ributta il TRATTO INTERO sul CPU — stessi byte, la v2 è
       // ovunque. Caso raro: pen-down dentro la finestra di commit.
-      this.gpuStroke.reset();
-      this._dropStrokeBuffer();
-      this.rasterMode = 'main';
-      this.strokeStore = this._strokeStoreMain;
-      this.curRaster = this.raster;
-      this.queue.clear();
-      this.raster.beginStroke(/** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap),
-        this._strokeClip, this._strokeSel, this._strokeSampleStore());
-      this.engine.replay();
-      this.raster.run(this.queue, Infinity);
+      this._gpuReplayOnCpu();
       return;
     }
     if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+  }
+
+  // Ributta il tratto GPU corrente sul CPU — stessi byte, la capsule v2 è
+  // ovunque. Due chiamanti: il flush sincrono (pen-down nella finestra di
+  // commit) e la PERDITA DEL DEVICE a metà tratto (i pixel in arena non
+  // atterreranno mai: si riparte dai descrittori, che vivono sul main).
+  _gpuReplayOnCpu() {
+    /** @type {NonNullable<typeof this.gpuStroke>} */ (this.gpuStroke).reset();
+    this._dropStrokeBuffer();
+    this.rasterMode = 'main';
+    this.strokeStore = this._strokeStoreMain;
+    this.curRaster = this.raster;
+    this.queue.clear();
+    this.raster.beginStroke(/** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap),
+      this._strokeClip, this._strokeSel, this._strokeSampleStore());
+    this.engine.replay();
+    this.raster.run(this.queue, Infinity);
   }
 
   // Fine vita di un tratto worker (commit chiuso/annullo): lo store attivo
@@ -2244,7 +2252,20 @@ export class App {
       else rasterPx = this.raster.run(this.queue, this.budgetPx);
     }
     if (this.rasterSab) this.rasterBridge.tick();
-    if (this.gpuStroke) this.gpuStroke.tick();
+    if (this.gpuStroke) {
+      this.gpuStroke.tick();
+      if (this.rasterMode === 'gpu' && !this.commitJob) {
+        if (!this.gpuStroke.usable) {
+          // device perso a metà tratto: senza questo il commit aspetterebbe
+          // per sempre un atterraggio che non arriverà mai
+          this._gpuReplayOnCpu();
+        } else if (this.pendingCommit && this.queue.count === 0 && !this.engine.active) {
+          // modalità direct (renderer wgpu legge l'arena): l'UNICO readback
+          // del tratto parte qui; il gate del commit sotto attende idle
+          this.gpuStroke.requestLand();
+        }
+      }
+    }
     if (this.blurSession) this._pumpBlur(this.blurBudgetMs);
     if (this.liquifySession) this._pumpLiquify(5.5);
     const t2 = performance.now();
@@ -2518,7 +2539,18 @@ const heap = forceJs ? null : await WasmHeap.load(new URL('./raster_core.wasm', 
 // present WebGPU (fase 2, flag): il device va inizializzato PRIMA del
 // costruttore dell'App perché la scelta del renderer è sincrona
 function wantsWgpuRenderer() {
-  if (new URLSearchParams(location.search).get('renderer') === 'wgpu') return true;
+  // il flag in query SI PERSISTE in localStorage: la home riscrive l'URL e
+  // sul telefono non c'è console — ?renderer=wgpu accende (e resta),
+  // ?renderer=gl (o altro) spegne e pulisce
+  const q = new URLSearchParams(location.search).get('renderer');
+  if (q === 'wgpu') {
+    try { localStorage.setItem('fable-paint.renderer', 'wgpu'); } catch { /* storage negato */ }
+    return true;
+  }
+  if (q) {
+    try { localStorage.removeItem('fable-paint.renderer'); } catch { /* storage negato */ }
+    return false;
+  }
   try { return localStorage.getItem('fable-paint.renderer') === 'wgpu'; } catch { return false; }
 }
 if (wantsWgpuRenderer()) {
@@ -2528,10 +2560,22 @@ const app = new App(heap);
 // stroke buffer WebGPU (fase 1): feature-detect a runtime, aggancio quando
 // pronto (i tratti partiti prima restano su worker/main); ?gpu=off lo esclude
 if (new URLSearchParams(location.search).get('gpu') !== 'off') {
-  WgpuStrokeBridge.create(() => app.requestFrame()).then((bridge) => { app.gpuStroke = bridge; });
+  WgpuStrokeBridge.create(() => app.requestFrame()).then((bridge) => {
+    app.gpuStroke = bridge;
+    // fase 2.2: col present WebGPU attivo il renderer legge il tratto vivo
+    // dall'arena del ponte (stesso device, un solo requestDevice per l'app):
+    // il readback CPU resta SOLO al commit (requestLand)
+    if (bridge && app.renderer instanceof WgpuRenderer && app.renderer.ok) {
+      bridge.direct = true;
+      app.renderer.attachStrokeBridge(bridge);
+      console.info('[wgpu_stroke] modalità direct: il present legge l\'arena, readback solo al commit');
+    }
+  });
 }
 const projects = new ProjectHub(app);
 app.projects = projects;
+// TEMPORANEO (verifica fase 2.2): handle per le firme dei chunk nel preview
+/** @type {any} */ (window).__app = app;
 track('app_ready', { engine: heap ? 'wasm' : 'js' });
 // Diagnostica del testo 3D/ombra dalla console: __textDebug3d() fa toggle,
 // __textDebug3d(true|false) imposta. Costosa: accenderla solo per indagare.

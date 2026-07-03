@@ -18,6 +18,7 @@
 import { ChunkStore, CHUNK, CHUNK_SHIFT, chunkKey } from './store.js';
 import { T_DAB, STRIDE } from './stroke.js';
 import { CAP_STRIDE_I32, CAP_FP, FALLOFF_LUT, quantHardness, capsuleIntParams } from './capsule_int.js';
+import { acquireWgpuDevice, onWgpuDeviceLost } from './wgpu_device.js';
 
 const REC_U32 = 12;          // record kernel: [tipo, ...campi], vedi WGSL
 const SLOT_WORDS = CHUNK * CHUNK; // 65536 u32 = 256KB per chunk
@@ -197,12 +198,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 export class WgpuStrokeBridge {
   /** Feature-detect a runtime; null se WebGPU non c'è. @param {() => void} requestFrame */
   static async create(requestFrame) {
-    const gpu = /** @type {any} */ (navigator).gpu;
-    if (!gpu) return null;
     try {
-      const adapter = await gpu.requestAdapter();
-      if (!adapter) return null;
-      const device = await adapter.requestDevice();
+      // device CONDIVISO col renderer WebGPU (fase 2.2): il present legge
+      // l'arena del ponte via copyBufferToTexture, serve lo stesso device
+      const device = await acquireWgpuDevice();
+      if (!device) return null;
       const b = new WgpuStrokeBridge(device, requestFrame);
       await b._init();
       return b;
@@ -272,7 +272,23 @@ export class WgpuStrokeBridge {
     this.sent = 0;
     this.tickDrained = 0;
     this.inkRing = new Float32Array(INK_RING * 8);
+    // modalità DIRECT (fase 2.2): il renderer WebGPU legge l'arena con
+    // copyBufferToTexture nello stesso frame del dispatch — niente readback
+    // nel loop, il mirror CPU atterra UNA volta sola al commit (requestLand)
+    this.direct = false;
+    this.presentDrained = 0;     // entry già a schermo via arena (solo direct)
+    this._landing = false;       // readback di commit in volo
   }
+
+  /** Fin dove l'ink overlay può smettere di coprire: in direct i pixel sono
+   * a schermo al submit, altrimenti quando atterrano nel mirror. */
+  get overlayDrained() { return this.direct ? this.presentDrained : this.tickDrained; }
+
+  /** Slot GPU del chunk (per il renderer in direct). @param {number} key */
+  slotOfKey(key) { return this._slotOf.get(key); }
+
+  /** Buffer arena corrente (può cambiare alla crescita: rileggerlo a ogni frame). */
+  get arenaBuffer() { return this._arena; }
 
   async _init() {
     const dev = this.device;
@@ -298,8 +314,18 @@ export class WgpuStrokeBridge {
     lutBytes.set(new Uint8Array(FALLOFF_LUT.buffer, 0, FALLOFF_LUT.length * 2));
     dev.queue.writeBuffer(this._lutBuf, 0, lutBytes);
     this._growArena(ARENA_START);
-    this._atlas = dev.createBuffer({ size: this._atlasCap, usage: 0x80 | 0x8 });
+    // COPY_SRC anche sull'atlas: la crescita copia il vecchio nel nuovo
+    this._atlas = dev.createBuffer({ size: this._atlasCap, usage: 0x80 | 0x8 | 0x4 });
     this.usable = true;
+    // device perso (Android in background, TDR): il ponte si spegne e sveglia
+    // l'app, che ributta l'eventuale tratto in corso sul CPU (stessi byte) —
+    // senza questo il commit aspetterebbe per sempre un atterraggio mai fatto
+    onWgpuDeviceLost(() => {
+      if (!this.usable) return;
+      this.usable = false;
+      console.warn('[wgpu_stroke] device perso: ponte GPU spento, tratti su worker/CPU');
+      this._requestFrame();
+    });
   }
 
   /** @param {number} slots */
@@ -322,7 +348,9 @@ export class WgpuStrokeBridge {
     return this.sent === this.tickDrained && this._recs.length === 0 && this._inflight === 0;
   }
 
-  get backlog() { return Math.max(0, this.sent - this.tickDrained); }
+  // in direct il "non ancora visibile" è sent-presentDrained (il mirror
+  // atterra solo al commit: sent-tickDrained mostrerebbe numeri finti)
+  get backlog() { return Math.max(0, this.sent - (this.direct ? this.presentDrained : this.tickDrained)); }
 
   /**
    * Gate per-tratto (come il bridge worker): niente aqua/texture/selezione.
@@ -339,6 +367,7 @@ export class WgpuStrokeBridge {
     this._hq = quantHardness(snap.hardness);
     this._resetGpuState();
     this._endpassZero = null;
+    this.presentDrained = this.sent;
     this.statBytes = 0;
     this.statBatches = 0;
     return true;
@@ -362,8 +391,10 @@ export class WgpuStrokeBridge {
   reset() {
     this.gen++;
     this._inflight = 0;
+    this._landing = false;
     this._resetGpuState();
     this.tickDrained = this.sent;
+    this.presentDrained = this.sent;
     this._endpassZero = null;
     this._snap = null;
   }
@@ -390,13 +421,19 @@ export class WgpuStrokeBridge {
     if (off !== undefined) return off;
     const len = (mask.length + 3) & ~3;
     if (this._atlasUsed + len > this._atlasCap) {
-      // atlas pieno: si raddoppia (le maschere già caricate si ricaricano
-      // alla prossima richiesta — reset della mappa)
-      this._atlasCap *= 2;
+      // atlas pieno: crescita CON COPIA, gli offset restano validi. (La v1
+      // azzerava mappa e buffer: i record già in _recs — e le maschere dei
+      // tick precedenti riusate da quelli nuovi — puntavano a offset ormai
+      // vuoti o ricoperti da altre maschere: dab corrotti in silenzio.)
+      let cap = this._atlasCap;
+      while (this._atlasUsed + len > cap) cap *= 2;
+      const nb = this.device.createBuffer({ size: cap, usage: 0x80 | 0x8 | 0x4 });
+      const enc = this.device.createCommandEncoder();
+      enc.copyBufferToBuffer(this._atlas, 0, nb, 0, this._atlasCap);
+      this.device.queue.submit([enc.finish()]);
       this._atlas.destroy();
-      this._atlas = this.device.createBuffer({ size: this._atlasCap, usage: 0x80 | 0x8 });
-      this._atlasOff.clear();
-      this._atlasUsed = 0;
+      this._atlas = nb;
+      this._atlasCap = cap;
       this._bind = null;
     }
     off = this._atlasUsed;
@@ -585,6 +622,30 @@ export class WgpuStrokeBridge {
     }
     const bind = this._bind;
 
+    // modalità DIRECT: niente banda di readback — il renderer copia gli slot
+    // dell'arena nelle texture dei chunk nello stesso frame (stesso device,
+    // stessa coda: il present vede QUESTO dispatch). Il mirror CPU atterra
+    // una volta sola al commit, via requestLand.
+    if (this.direct) {
+      const enc = dev.createCommandEncoder();
+      for (const slot of this._needClear) {
+        enc.clearBuffer(this._arena, slot * SLOT_WORDS * 4, SLOT_WORDS * 4);
+      }
+      this._needClear.clear();
+      const pass = enc.beginComputePass();
+      pass.setPipeline(this.pipeline);
+      for (let i = 0; i < chunkKeys.length; i++) {
+        pass.setBindGroup(0, bind, [i * 256]);
+        pass.dispatchWorkgroups(CHUNK / 8, CHUNK / 8);
+      }
+      pass.end();
+      dev.queue.submit([enc.finish()]);
+      this.statBatches++;
+      this.presentDrained = this.sent;
+      this._dirty.clear();
+      return;
+    }
+
     // bande di righe sporche per chunk: si copia e rilegge SOLO quelle
     // (righe contigue in memoria: un dab da 30px = ~30KB, non 256KB)
     /** @type {{key: number, ry0: number, ry1: number, x0: number, x1: number, off: number}[]} */
@@ -597,25 +658,7 @@ export class WgpuStrokeBridge {
     }
     this._dirty.clear();
 
-    // pool di staging: mai riusare un buffer mappato (flag busy)
-    /** @type {{buf: any, size: number, busy: boolean}|null} */
-    let sb = null;
-    for (const s of this._stagingPool) {
-      if (!s.busy && s.size >= stagingBytes) { sb = s; break; }
-    }
-    if (!sb) {
-      let size = 262144;
-      while (size < stagingBytes) size *= 2;
-      sb = { buf: dev.createBuffer({ size, usage: /* MAP_READ|COPY_DST */ 0x1 | 0x8 }), size, busy: false };
-      this._stagingPool.push(sb);
-      // pota i liberi in eccesso (tiene al più 4 buffer)
-      while (this._stagingPool.length > 4) {
-        const i = this._stagingPool.findIndex((s) => !s.busy && s !== sb);
-        if (i < 0) break;
-        this._stagingPool.splice(i, 1)[0].buf.destroy();
-      }
-    }
-    sb.busy = true;
+    const sb = this._acquireStaging(stagingBytes);
 
     const enc = dev.createCommandEncoder();
     for (const slot of this._needClear) {
@@ -664,6 +707,96 @@ export class WgpuStrokeBridge {
     }).catch(() => {
       sb.busy = false;
       if (gen === this.gen) this._inflight--;
+      // device perso a metà lettura: sveglia l'app (ripiega sul CPU)
+      this._requestFrame();
+    });
+  }
+
+  /** pool di staging: mai riusare un buffer mappato (flag busy)
+   * @param {number} bytes @returns {{buf: any, size: number, busy: boolean}} */
+  _acquireStaging(bytes) {
+    /** @type {{buf: any, size: number, busy: boolean}|null} */
+    let sb = null;
+    for (const s of this._stagingPool) {
+      if (!s.busy && s.size >= bytes) { sb = s; break; }
+    }
+    if (!sb) {
+      let size = 262144;
+      while (size < bytes) size *= 2;
+      sb = { buf: this.device.createBuffer({ size, usage: /* MAP_READ|COPY_DST */ 0x1 | 0x8 }), size, busy: false };
+      this._stagingPool.push(sb);
+      // pota i liberi in eccesso (tiene al più 4 buffer)
+      while (this._stagingPool.length > 4) {
+        const i = this._stagingPool.findIndex((s) => !s.busy && s !== sb);
+        if (i < 0) break;
+        this._stagingPool.splice(i, 1)[0].buf.destroy();
+      }
+    }
+    sb.busy = true;
+    return sb;
+  }
+
+  /**
+   * Modalità direct: l'UNICO readback del tratto — gli slot interi verso il
+   * mirror CPU, quando la coda è drenata e il commit aspetta. Chiamata
+   * dall'App a ogni frame di attesa; no-op se non c'è niente da atterrare o
+   * un atterraggio è già in volo. touched si calcola qui (il commit filtra).
+   */
+  requestLand() {
+    if (!this.direct || this._landing) return;
+    if (this._recs.length > 0 || this._inflight > 0) return;
+    if (this.sent === this.tickDrained) return;
+    const drainedTo = this.sent;
+    /** @type {[number, number][]} */
+    const entries = [...this._slotOf.entries()];
+    if (entries.length === 0) {
+      // tratto interamente fuori clip: niente pixel, solo contatori
+      this.tickDrained = drainedTo;
+      this._maybeFinishEndpass();
+      return;
+    }
+    const dev = this.device;
+    const bytesPer = SLOT_WORDS * 4;
+    const total = entries.length * bytesPer;
+    const sb = this._acquireStaging(total);
+    const enc = dev.createCommandEncoder();
+    for (let i = 0; i < entries.length; i++) {
+      enc.copyBufferToBuffer(this._arena, entries[i][1] * bytesPer, sb.buf, i * bytesPer, bytesPer);
+    }
+    dev.queue.submit([enc.finish()]);
+    this.statBytes += total;
+    const gen = this.gen;
+    const tSubmit = performance.now();
+    this._landing = true;
+    this._inflight++;
+    sb.buf.mapAsync(1, 0, total).then(() => {
+      if (gen === this.gen) {
+        const bytes = new Uint8Array(sb.buf.getMappedRange(0, total));
+        for (let i = 0; i < entries.length; i++) {
+          const chunk = this.store.getByKey(entries[i][0]);
+          if (chunk) {
+            chunk.data.set(bytes.subarray(i * bytesPer, (i + 1) * bytesPer));
+            chunk.touched = this._bandHasInk(chunk.data, 0, CHUNK - 1);
+            // niente markDirty: le texture mostrano già questi byte via
+            // arena (un markDirty rifarebbe l'upload dell'intero tratto)
+          }
+        }
+        this.statLandMs = performance.now() - tSubmit;
+        this.tickDrained = Math.max(this.tickDrained, drainedTo);
+        this._inflight--;
+        this._landing = false;
+        this._maybeFinishEndpass();
+        this._requestFrame();
+      } else {
+        this._landing = false;
+      }
+      sb.buf.unmap();
+      sb.busy = false;
+    }).catch(() => {
+      sb.busy = false;
+      this._landing = false;
+      if (gen === this.gen) this._inflight--;
+      this._requestFrame();
     });
   }
 

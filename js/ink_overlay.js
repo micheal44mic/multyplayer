@@ -309,11 +309,12 @@ export class InkOverlay {
   }
 
   /**
-   * Entry mandate al worker/GPU ma non ancora drenate: (tickDrained, sent]
-   * nel ring (tickDrained = fin dove i pixel sono davvero arrivati allo
-   * store specchio; il valore live può essere oltre l'upload del frame).
+   * Entry mandate al worker/GPU ma non ancora drenate: (drained, sent] nel
+   * ring. drained = fin dove i pixel sono già visibili: per il worker e il
+   * ponte GPU classico è tickDrained (atterrati nel mirror), per il ponte in
+   * modalità DIRECT è overlayDrained (a schermo al submit, via arena).
    * @param {CanvasRenderingContext2D} ctx
-   * @param {{inkRing: Float32Array, sent: number, tickDrained: number}} bridge
+   * @param {{inkRing: Float32Array, sent: number, tickDrained: number, overlayDrained?: number}} bridge
    * @param {Camera} cam
    */
   _inFlightWorker(ctx, bridge, cam) {
@@ -321,7 +322,8 @@ export class InkOverlay {
     if (!ring) return;
     const cap = ring.length >> 3;
     const hi = bridge.sent;
-    const lo = Math.max(bridge.tickDrained + 1, hi - cap + 1);
+    const drained = bridge.overlayDrained !== undefined ? bridge.overlayDrained : bridge.tickDrained;
+    const lo = Math.max(drained + 1, hi - cap + 1);
     for (let idx = lo; idx <= hi; idx++) {
       const o = (idx & (cap - 1)) * 8;
       if (ring[o] === T_DAB) this._dab(ctx, cam, ring[o + 1], ring[o + 2], ring[o + 3]);

@@ -13,6 +13,7 @@
 // e va fatto PRIMA di new App: WgpuRenderer.preinit() + available.
 
 import { CHUNK } from './store.js';
+import { acquireWgpuDevice, onWgpuDeviceLost } from './wgpu_device.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
@@ -88,16 +89,10 @@ export class WgpuRenderer {
   static async preinit() {
     if (preinitTried) return sharedDevice !== null;
     preinitTried = true;
-    try {
-      const gpu = /** @type {any} */ (navigator).gpu;
-      if (!gpu) return false;
-      const adapter = await gpu.requestAdapter();
-      if (!adapter) return false;
-      sharedDevice = await adapter.requestDevice();
-      return true;
-    } catch {
-      return false;
-    }
+    // stesso device del ponte tratto (fase 2.2): il present copia gli slot
+    // dell'arena nelle texture dei chunk — con due device non si potrebbe
+    sharedDevice = await acquireWgpuDevice();
+    return sharedDevice !== null;
   }
 
   /** @param {HTMLCanvasElement} canvas */
@@ -123,6 +118,8 @@ export class WgpuRenderer {
     /** @type {string} */ this._format = 'bgra8unorm';
     /** @type {WeakMap<Chunk, any>} texture per chunk (possedute qui) */
     this._tex = new WeakMap();
+    /** @type {import('./wgpu_stroke.js').WgpuStrokeBridge|null} */
+    this._bridge = null;
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
     /** @type {(() => ChunkStore[])|null} */
     this._storesFn = null;
@@ -165,11 +162,24 @@ export class WgpuRenderer {
         usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
       });
       this.ok = true;
+      onWgpuDeviceLost(() => {
+        // v0: niente recovery (ricreare device+pipeline+texture); il warn
+        // spiega lo schermo fermo — il flag è sperimentale
+        console.warn('[renderer_wgpu] device perso: present WebGPU fermo, ricaricare la pagina');
+      });
     } catch (err) {
       console.warn('[renderer_wgpu] init fallita:', err);
       this.ok = false;
     }
   }
+
+  /**
+   * Fase 2.2: il tratto vivo si legge DIRETTAMENTE dall'arena del ponte
+   * (bridge.direct): copyBufferToTexture slot→texture nello stesso submit
+   * del present — il readback CPU vive solo al commit.
+   * @param {import('./wgpu_stroke.js').WgpuStrokeBridge} bridge
+   */
+  attachStrokeBridge(bridge) { this._bridge = bridge; }
 
   /** @param {string} what */
   _warnOnce(what) {
@@ -300,6 +310,33 @@ export class WgpuRenderer {
     // raccolta draw: [chunkTex, strokeTex|null, rect, mode, layerAlpha]
     /** @type {{lt: any, st: any, x0: number, y0: number, x1: number, y1: number, mode: number, a: number}[]} */
     const draws = [];
+    // tratto GPU-diretto: copie arena→texture da accodare prima del pass
+    // (solo quando lo strokeStore È il mirror del ponte in modalità direct)
+    const bridge = this._bridge && this._bridge.direct && strokeStore === this._bridge.store
+      ? this._bridge : null;
+    /** @type {{slot: number, tex: any}[]} */
+    const copies = [];
+    const strokeTex = (/** @type {Chunk} */ sc) => {
+      if (bridge) {
+        const slot = bridge.slotOfKey(sc.key);
+        if (slot !== undefined) {
+          let tex = this._tex.get(sc);
+          if (!tex) {
+            tex = this.device.createTexture({
+              size: [CHUNK, CHUNK], format: 'rgba8unorm',
+              usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
+            });
+            this._tex.set(sc, tex);
+            this.texCount++;
+          }
+          copies.push({ slot, tex });
+          return tex;
+        }
+      }
+      // niente slot (ponte spento, chunk scoperto dall'endpass): via CPU
+      if (sc.texDirty || !this._tex.has(sc)) this._uploadNow(sc);
+      return this._tex.get(sc);
+    };
     const pushChunk = (/** @type {Chunk} */ chunk, /** @type {any} */ st,
       /** @type {number} */ mode, /** @type {number} */ alpha) => {
       const x0 = Math.round(chunk.cx * CHUNK * s + tx);
@@ -330,8 +367,7 @@ export class WgpuRenderer {
         if (live) {
           const sc = /** @type {NonNullable<typeof strokeStore>} */ (strokeStore).getByKey(chunk.key);
           if (sc) {
-            if (sc.texDirty || !this._tex.has(sc)) this._uploadNow(sc);
-            pushChunk(chunk, this._tex.get(sc), eraserLive ? 2 : 1, alpha);
+            pushChunk(chunk, strokeTex(sc), eraserLive ? 2 : 1, alpha);
             continue;
           }
         }
@@ -342,8 +378,7 @@ export class WgpuRenderer {
         for (const sc of /** @type {NonNullable<typeof strokeStore>} */ (strokeStore).map.values()) {
           if (sc.cx < cx0 || sc.cx > cx1 || sc.cy < cy0 || sc.cy > cy1) continue;
           if (layer.store.getByKey(sc.key)) continue;
-          if (sc.texDirty || !this._tex.has(sc)) this._uploadNow(sc);
-          pushChunk(sc, this._tex.get(sc), 3, alpha);
+          pushChunk(sc, strokeTex(sc), 3, alpha);
         }
       }
     }
@@ -369,6 +404,15 @@ export class WgpuRenderer {
 
     const samp = camera.zoom <= 3.8 ? this._sampler : this._samplerNearest;
     const enc = this.device.createCommandEncoder();
+    // slot dell'arena → texture dei chunk vivi, PRIMA del pass: stesso
+    // device e stessa coda del compute del ponte (già sottomesso in questo
+    // frame) — il present mostra il dispatch di QUESTO frame, zero ritardo
+    for (const c of copies) {
+      enc.copyBufferToTexture(
+        { buffer: /** @type {NonNullable<typeof this._bridge>} */ (this._bridge).arenaBuffer,
+          offset: c.slot * CHUNK * CHUNK * 4, bytesPerRow: CHUNK * 4, rowsPerImage: CHUNK },
+        { texture: c.tex }, [CHUNK, CHUNK, 1]);
+    }
     const pass = enc.beginRenderPass({
       colorAttachments: [{
         view: this._ctx.getCurrentTexture().createView(),
