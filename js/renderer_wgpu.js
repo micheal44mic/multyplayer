@@ -78,6 +78,35 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 `;
 
+// Blit di minificazione: ogni livello mip campiona il precedente in linear
+// a mezza risoluzione = media 2×2 esatta (l'equivalente del generateMipmap
+// GL: senza mip, a zoom<1 i tratti sottili si sgranano/spezzano).
+const WGSL_MIP = /* wgsl */ `
+@group(0) @binding(0) var s: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+struct VOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VOut {
+  let uv = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+  var o: VOut;
+  o.pos = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+  o.uv = vec2<f32>(uv.x, 1.0 - uv.y);
+  return o;
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+  return textureSample(src, s, in.uv);
+}
+`;
+
+const MIP_LEVELS = 9; // 256 -> 1 (CHUNK è POT)
+
 /** @type {any} */ let sharedDevice = null;
 let preinitTried = false;
 
@@ -118,8 +147,14 @@ export class WgpuRenderer {
     /** @type {string} */ this._format = 'bgra8unorm';
     /** @type {WeakMap<Chunk, any>} texture per chunk (possedute qui) */
     this._tex = new WeakMap();
+    /** @type {WeakMap<any, {full: any, level: any[]}>} view cache per texture */
+    this._views = new WeakMap();
     /** @type {import('./wgpu_stroke.js').WgpuStrokeBridge|null} */
     this._bridge = null;
+    /** @type {any} */ this._mipPipeline = null;
+    /** @type {any} */ this._mipBgl = null;
+    /** @type {any} */ this._mipSampler = null;
+    /** @type {any} */ this._samplerMip = null;
     this._rect = { x0: 0, y0: 0, x1: 0, y1: 0 };
     /** @type {(() => ChunkStore[])|null} */
     this._storesFn = null;
@@ -157,10 +192,30 @@ export class WgpuRenderer {
       });
       this._sampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
       this._samplerNearest = this.device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
+      // minificazione (zoom<1): trilinear sui mip — il LINEAR_MIPMAP_LINEAR
+      // del GL, senza cui i tratti sottili da lontano si sgranano/spezzano
+      this._samplerMip = this.device.createSampler({
+        magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
+      });
       this._white = this.device.createTexture({
         size: [1, 1], format: 'rgba8unorm',
         usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
       });
+      // pipeline del blit mip (bersaglio rgba8unorm, niente blend)
+      const mipModule = this.device.createShaderModule({ code: WGSL_MIP });
+      this._mipBgl = this.device.createBindGroupLayout({
+        entries: [
+          { binding: 0, visibility: 2, sampler: {} },
+          { binding: 1, visibility: 2, texture: {} },
+        ],
+      });
+      this._mipPipeline = this.device.createRenderPipeline({
+        layout: this.device.createPipelineLayout({ bindGroupLayouts: [this._mipBgl] }),
+        vertex: { module: mipModule, entryPoint: 'vs' },
+        fragment: { module: mipModule, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      this._mipSampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
       this.ok = true;
       onWgpuDeviceLost(() => {
         // v0: niente recovery (ricreare device+pipeline+texture); il warn
@@ -221,6 +276,7 @@ export class WgpuRenderer {
         bytes += w * h * 4;
         this.uploadsThisFrame++;
         chunk.dirX0 = CHUNK; chunk.dirY0 = CHUNK; chunk.dirX1 = -1; chunk.dirY1 = -1;
+        chunk.mips = false; // il livello 0 è cambiato: catena mip stantia
       } else {
         this._uploadNow(chunk);
         bytes += chunk.data.length;
@@ -230,22 +286,42 @@ export class WgpuRenderer {
     return bytes;
   }
 
+  /** Texture di chunk: catena mip completa (la minificazione la usa) e
+   * RENDER_ATTACHMENT per il blit dei livelli. @param {Chunk} chunk */
+  _newTex(chunk) {
+    const tex = this.device.createTexture({
+      size: [CHUNK, CHUNK], format: 'rgba8unorm', mipLevelCount: MIP_LEVELS,
+      usage: /* TEXTURE_BINDING|COPY_DST|RENDER_ATTACHMENT */ 0x4 | 0x2 | 0x10,
+    });
+    this._tex.set(chunk, tex);
+    this.texCount++;
+    return tex;
+  }
+
+  /** View cache: full (trilinear nel pass principale) + per livello (blit).
+   * @param {any} tex */
+  _viewsOf(tex) {
+    let v = this._views.get(tex);
+    if (!v) {
+      v = { full: tex.createView(), level: [] };
+      for (let l = 0; l < tex.mipLevelCount; l++) {
+        v.level.push(tex.createView({ baseMipLevel: l, mipLevelCount: 1 }));
+      }
+      this._views.set(tex, v);
+    }
+    return v;
+  }
+
   /** @param {Chunk} chunk */
   _uploadNow(chunk) {
     let tex = this._tex.get(chunk);
-    if (!tex) {
-      tex = this.device.createTexture({
-        size: [CHUNK, CHUNK], format: 'rgba8unorm',
-        usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
-      });
-      this._tex.set(chunk, tex);
-      this.texCount++;
-    }
+    if (!tex) tex = this._newTex(chunk);
     this.device.queue.writeTexture({ texture: tex },
       /** @type {Uint8Array} */ (/** @type {unknown} */ (chunk.data)),
       { bytesPerRow: CHUNK * 4 }, [CHUNK, CHUNK]);
     chunk.texDirty = false;
     chunk.dirX0 = CHUNK; chunk.dirY0 = CHUNK; chunk.dirX1 = -1; chunk.dirY1 = -1;
+    chunk.mips = false; // il livello 0 è cambiato: catena mip stantia
     this.uploadsThisFrame++;
   }
 
@@ -310,6 +386,17 @@ export class WgpuRenderer {
     // raccolta draw: [chunkTex, strokeTex|null, rect, mode, layerAlpha]
     /** @type {{lt: any, st: any, x0: number, y0: number, x1: number, y1: number, mode: number, a: number}[]} */
     const draws = [];
+    // minificazione: sotto zoom 1 si campionano i mip (come il GL); i chunk
+    // col livello 0 cambiato rigenerano la catena in questo stesso encoder
+    const wantMips = camera.zoom < 1;
+    /** @type {any[]} texture con catena mip da rigenerare questo frame */
+    const mipGen = [];
+    const needMips = (/** @type {Chunk} */ chunk) => {
+      if (wantMips && !chunk.mips) {
+        mipGen.push(this._tex.get(chunk));
+        chunk.mips = true; // la catena si rigenera in questo frame
+      }
+    };
     // tratto GPU-diretto: copie arena→texture da accodare prima del pass
     // (solo quando lo strokeStore È il mirror del ponte in modalità direct)
     const bridge = this._bridge && this._bridge.direct && strokeStore === this._bridge.store
@@ -321,20 +408,16 @@ export class WgpuRenderer {
         const slot = bridge.slotOfKey(sc.key);
         if (slot !== undefined) {
           let tex = this._tex.get(sc);
-          if (!tex) {
-            tex = this.device.createTexture({
-              size: [CHUNK, CHUNK], format: 'rgba8unorm',
-              usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
-            });
-            this._tex.set(sc, tex);
-            this.texCount++;
-          }
+          if (!tex) tex = this._newTex(sc);
           copies.push({ slot, tex });
+          // la copia riscrive il livello 0 a ogni frame: mip da rifare
+          if (wantMips) mipGen.push(tex);
           return tex;
         }
       }
       // niente slot (ponte spento, chunk scoperto dall'endpass): via CPU
       if (sc.texDirty || !this._tex.has(sc)) this._uploadNow(sc);
+      needMips(sc);
       return this._tex.get(sc);
     };
     const pushChunk = (/** @type {Chunk} */ chunk, /** @type {any} */ st,
@@ -364,6 +447,7 @@ export class WgpuRenderer {
       for (const chunk of layer.store.map.values()) {
         if (chunk.cx < cx0 || chunk.cx > cx1 || chunk.cy < cy0 || chunk.cy > cy1) continue;
         if (chunk.texDirty || !this._tex.has(chunk)) this._uploadNow(chunk);
+        needMips(chunk);
         if (live) {
           const sc = /** @type {NonNullable<typeof strokeStore>} */ (strokeStore).getByKey(chunk.key);
           if (sc) {
@@ -402,7 +486,10 @@ export class WgpuRenderer {
     }
     this.device.queue.writeBuffer(this._uniBuf, 0, uni);
 
-    const samp = camera.zoom <= 3.8 ? this._sampler : this._samplerNearest;
+    // filtri come il GL: mip in minificazione, linear fino a 3.8×, poi
+    // nearest per il lavoro di dettaglio
+    const samp = wantMips ? this._samplerMip
+      : camera.zoom <= 3.8 ? this._sampler : this._samplerNearest;
     const enc = this.device.createCommandEncoder();
     // slot dell'arena → texture dei chunk vivi, PRIMA del pass: stesso
     // device e stessa coda del compute del ponte (già sottomesso in questo
@@ -412,6 +499,31 @@ export class WgpuRenderer {
         { buffer: /** @type {NonNullable<typeof this._bridge>} */ (this._bridge).arenaBuffer,
           offset: c.slot * CHUNK * CHUNK * 4, bytesPerRow: CHUNK * 4, rowsPerImage: CHUNK },
         { texture: c.tex }, [CHUNK, CHUNK, 1]);
+    }
+    // rigenerazione mip: un blit per livello, ogni livello media 2×2 il
+    // precedente (dopo le copie arena: il livello 0 è quello del frame)
+    for (const tex of mipGen) {
+      const v = this._viewsOf(tex);
+      for (let l = 1; l < MIP_LEVELS; l++) {
+        const bg = this.device.createBindGroup({
+          layout: this._mipBgl,
+          entries: [
+            { binding: 0, resource: this._mipSampler },
+            { binding: 1, resource: v.level[l - 1] },
+          ],
+        });
+        const mp = enc.beginRenderPass({
+          colorAttachments: [{
+            view: v.level[l],
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: 'clear', storeOp: 'store',
+          }],
+        });
+        mp.setPipeline(this._mipPipeline);
+        mp.setBindGroup(0, bg);
+        mp.draw(3);
+        mp.end();
+      }
     }
     const pass = enc.beginRenderPass({
       colorAttachments: [{
@@ -427,8 +539,8 @@ export class WgpuRenderer {
         layout: this._bgl,
         entries: [
           { binding: 0, resource: samp },
-          { binding: 1, resource: (d.lt || this._white).createView() },
-          { binding: 2, resource: (d.st || this._white).createView() },
+          { binding: 1, resource: this._viewsOf(d.lt || this._white).full },
+          { binding: 2, resource: this._viewsOf(d.st || this._white).full },
           { binding: 3, resource: { buffer: this._uniBuf, size: 64 } },
         ],
       });
