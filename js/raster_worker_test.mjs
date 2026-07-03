@@ -306,6 +306,7 @@ async function runEndPassCase(name, wasm) {
     const c = mirror.map.get(k);
     if (!c) continue;
     const r = mirror.rebindFresh(c);
+    if (!r) { check(false, `${name}: pool esaurito nel rebind (capienza test insufficiente)`); continue; }
     swapItems.push({ chunk: c, oldSlot: r.oldSlot, newSlot: r.newSlot });
   }
   eng.handle({ t: 'endpass', gen: 1, clip: [...tipKeys] });

@@ -130,11 +130,14 @@ export class RasterBridge {
   beginStroke(snap, clip, sel) {
     if (!this.usable || !this.worker) return false;
     if (this.store.map.size > 0) return false; // mai qui: tratto precedente non chiuso
-    // capienza: tutti i chunk del board + margine; se gli slot in attesa di
-    // riciclo bloccano, un flush (worker quasi sempre già idle) li libera
+    // capienza: DUE board + margine — l'endpass tiene vivi gli slot vecchi
+    // della punta (pixel visibili fino allo swap) MENTRE alloca i nuovi:
+    // il caso peggiore è tratto a tutto board + punta a tutto board. Con
+    // "board+16" il pool si esauriva e la punta perdeva pixel (bug traccia
+    // cancellata a metà, visto su iPhone coi taper lunghi).
     const cols = (clip.x1 >> CHUNK_SHIFT) - (clip.x0 >> CHUNK_SHIFT) + 1;
     const rows = (clip.y1 >> CHUNK_SHIFT) - (clip.y0 >> CHUNK_SHIFT) + 1;
-    const needed = cols * rows + 16;
+    const needed = cols * rows * 2 + 16;
     if (!this.idle || this.pool.pendingCount > 0) {
       if (!this.flushSync()) return false;
     }
@@ -260,20 +263,44 @@ export class RasterBridge {
    */
   endPassBegin(clipKeys) {
     if (!this.usable || !this.worker) return;
-    this._clipKeys = clipKeys;
+    // universo del clip: le chiavi della punta, o TUTTO il board (redo del
+    // tratto intero) — enumerabile perché il clip del tratto è un board
+    /** @type {Set<number>} */
+    const universe = clipKeys ? new Set(clipKeys) : this._boardKeys();
     /** @type {{chunk: import('./store.js').Chunk, oldSlot: number, newSlot: number}[]} */
     const items = [];
-    const keys = clipKeys || new Set(this.store.map.keys());
-    for (const k of keys) {
+    for (const k of universe) {
       const c = this.store.map.get(k);
-      this._known.delete(k);
-      if (!c) continue;
+      if (!c) { this._known.delete(k); continue; }
       const r = this.store.rebindFresh(c);
+      if (!r) {
+        // pool pieno (mai con la capienza 2×board): il chunk tiene slot e
+        // pixel vivi, la sua punta resta non rastremata — niente perdita
+        console.error('[raster_bridge] endpass: pool pieno, chunk escluso dal replay', k);
+        universe.delete(k);
+        continue;
+      }
+      this._known.delete(k);
       items.push({ chunk: c, oldSlot: r.oldSlot, newSlot: r.newSlot });
     }
-    if (!clipKeys) this._known.clear();
+    this._clipKeys = universe;
     this._swap = { watermark: -1, items };
-    this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: clipKeys ? [...clipKeys] : null });
+    this.worker.postMessage({ t: 'endpass', gen: this.gen, clip: [...universe] });
+  }
+
+  // Tutte le chiavi chunk del board del tratto corrente (clip fotografato
+  // al begin): serve all'endpass "tratto intero" per un clip enumerabile.
+  _boardKeys() {
+    /** @type {Set<number>} */
+    const keys = new Set();
+    const c = this._clip;
+    if (!c) return keys;
+    for (let cy = c.y0 >> CHUNK_SHIFT; cy <= c.y1 >> CHUNK_SHIFT; cy++) {
+      for (let cx = c.x0 >> CHUNK_SHIFT; cx <= c.x1 >> CHUNK_SHIFT; cx++) {
+        keys.add(((cx + 32768) << 16) | (cy + 32768));
+      }
+    }
+    return keys;
   }
 
   /**

@@ -137,6 +137,8 @@ export class App {
     this.curRaster = this.raster;       // il Rasterizer autorevole del tratto corrente
     /** @type {'main'|'worker'} */
     this.rasterMode = 'main';
+    // blocco scratch wasm per il commit dei chunk SAB (vedi _runCommit)
+    this._commitScratch = 0;
 
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
     // può far lampeggiare il tratto (frame presentati fuori sincrono).
@@ -1966,9 +1968,21 @@ export class App {
     let n = 0;
     while (job.index < job.chunks.length && n < maxChunks) {
       const sc = job.chunks[job.index++];
-      commitChunk(job.store, sc, job.snap,
+      let src = sc;
+      let heap = job.heap !== undefined ? job.heap : this.heap;
+      if (heap === null && this.heap && sc.ptr === 0) {
+        // chunk SAB (tratto worker): i kernel wasm non lo indirizzano, ma
+        // una copia da 256KB nello scratch costa ~nulla e il commit torna
+        // al passo wasm (bit-exact col path JS per contratto) — su mobile
+        // il commit JS era il pezzo grosso del frame (misurato ~95ms/24)
+        if (!this._commitScratch) this._commitScratch = this.heap.alloc(CHUNK * CHUNK * 4);
+        this.heap.u8c(this._commitScratch, CHUNK * CHUNK * 4).set(sc.data);
+        src = /** @type {Chunk} */ ({ key: sc.key, cx: sc.cx, cy: sc.cy, data: sc.data, ptr: this._commitScratch });
+        heap = this.heap;
+      }
+      commitChunk(job.store, src, job.snap,
         (key, cx, cy, before) => this.undoMgr.captureChunk(key, cx, cy, before),
-        job.heap !== undefined ? job.heap : this.heap);
+        heap);
       this.strokeStore.remove(sc.key, this._disposeTex);
       n++;
     }

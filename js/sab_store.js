@@ -122,13 +122,15 @@ export class SabStrokeStore extends ChunkStore {
   // (data non cambia), ma il protocollo da qui in poi usa uno slot NUOVO —
   // il worker ridisegna la punta lì, e lo scambio data→slot nuovo avviene
   // solo a replay finito (bridge._trySwap). Ritorna i due slot per il
-  // rilascio differito del vecchio.
+  // rilascio differito del vecchio; null = pool pieno, il chunk TIENE lo
+  // slot vecchio (punta non rastremata su quel chunk: degradazione visiva,
+  // MAI perdita di pixel — il chiamante lo esclude dal clip del replay).
   /** @param {import('./store.js').Chunk} c */
   rebindFresh(c) {
     const old = this.slotOf.get(c);
     const slot = this.pool.alloc();
-    if (slot >= 0) this.slotOf.set(c, slot);
-    else this.slotOf.delete(c);
+    if (slot < 0) return null;
+    this.slotOf.set(c, slot);
     return { oldSlot: old === undefined ? -1 : old, newSlot: slot };
   }
 
