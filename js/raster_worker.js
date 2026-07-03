@@ -18,8 +18,10 @@ self.postMessage({ t: 'ready' });
 
 WasmHeap.load(new URL('./raster_core.wasm', import.meta.url)).then((heap) => {
   // artefatto vecchio in cache senza i kernel del paint = si resta in JS
-  if (heap && heap.exports.dab && heap.exports.capsule &&
-    heap.exports.dab_tex_tile && heap.exports.capsule_tex) {
+  // (capsule_int/capsule_tex_int: kernel v2 a interi — un binario v1 in
+  // cache non li ha e resta correttamente sul path JS, che è già v2)
+  if (heap && heap.exports.dab && heap.exports.capsule_int &&
+    heap.exports.dab_tex_tile && heap.exports.capsule_tex_int) {
     engine.attachHeap(heap);
     console.info('[raster_worker] core wasm+SIMD attivo nel worker');
   } else {

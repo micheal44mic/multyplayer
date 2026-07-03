@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fable Paint — test differenziale kernel WebGPU</title>
+<style>
+  body { background: #131418; color: #d8dbe4; font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 0; padding: 16px; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  p { margin: 0 0 12px; color: #8d92a3; }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .ok { color: #6fd08c; }
+  .fail { color: #ff6b6b; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Kernel WebGPU dab vs Rasterizer JS</h1>
+<p>Fase 1 del piano WebGPU: contratto bit-exact (docs/webgpu-engine-plan.md). Ricarica per rieseguire.</p>
+<pre id="out">avvio…</pre>
+<script type="module">
+  import { runAll, setPrinter } from './js/wgpu_dab_test.js';
+  import { runAllCapsule, setCapsulePrinter } from './js/wgpu_capsule_test.js';
+  const out = document.getElementById('out');
+  out.textContent = '';
+  const printer = (s) => {
+    const line = document.createElement('span');
+    line.textContent = s + '\n';
+    if (s.startsWith('FAIL') || s.includes('FAILURE')) line.className = 'fail';
+    else if (s.startsWith('ok') || s.includes('PASS')) line.className = 'ok';
+    out.appendChild(line);
+    console.log('[wgpu-test]', s);
+  };
+  setPrinter(printer);
+  setCapsulePrinter(printer);
+  (async () => {
+    const dab = await runAll();
+    printer('');
+    const capsule = await runAllCapsule();
+    window.__wgpuTestResult = { ok: dab.ok && capsule.ok, dab, capsule };
+  })().catch((e) => {
+    window.__wgpuTestResult = { ok: false, error: String(e && e.stack || e) };
+    const line = document.createElement('span');
+    line.className = 'fail';
+    line.textContent = 'ERRORE: ' + (e && e.stack || e);
+    out.appendChild(line);
+  });
+</script>
+</body>
+</html>

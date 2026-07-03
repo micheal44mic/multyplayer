@@ -6,6 +6,8 @@
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+// capsule v2: lo SPEC intero vive in capsule_int.js — qui fa da riferimento
+import { CAP_STRIDE_I32, FALLOFF_LUT, capsuleIntParams, capsuleIntMa } from '../js/capsule_int.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const wasmBytes = readFileSync(join(here, '../js/raster_core.wasm'));
@@ -41,13 +43,19 @@ console.log('ok  div255 identity (0..65025)');
 
 // ---- memory: dst/src chunks, mask, factor tile, RGBX tile ----
 const base = ex.__heap_base.value;
-const need = base + CHUNK_BYTES * 2 + 65536 + 65536 + CHUNK * CHUNK * 4;
+const need = base + CHUNK_BYTES * 2 + 65536 + 65536 + CHUNK * CHUNK * 4 + 8192;
 const pages = Math.ceil((need - ex.memory.buffer.byteLength) / 65536);
 if (pages > 0) ex.memory.grow(pages);
 const PTR_DST = (base + 15) & ~15;
 const PTR_SRC = PTR_DST + CHUNK_BYTES;
 const PTR_MASK = PTR_SRC + CHUNK_BYTES;
 const mem = () => new Uint8Array(ex.memory.buffer);
+
+// LUT del falloff capsule v2 nel modulo (unica fonte: js/capsule_int.js)
+const PTR_LUT = PTR_MASK + 65536 + 65536 + CHUNK * CHUNK * 4;
+new Uint8Array(ex.memory.buffer, PTR_LUT, FALLOFF_LUT.length * 2)
+  .set(new Uint8Array(FALLOFF_LUT.buffer, 0, FALLOFF_LUT.length * 2));
+ex.set_falloff_lut(PTR_LUT);
 
 /** @param {Uint8Array} m */
 function randomize(m, off, len, sparse) {
@@ -91,38 +99,14 @@ function refDab(d, lx0, ly0, lx1, ly1, mask, maskW, mcol0, mrow0, a255, cr, cg, 
   return wrote ? 1 : 0;
 }
 
-// ---- JS reference: capsule (copy of _capsule) ----
-function falloff(dist, r, h) {
-  const core = r * h;
-  let w = r - core;
-  if (w < 1) w = 1;
-  let t = (dist - core) / w;
-  if (t <= 0) return 1;
-  if (t >= 1) return 0;
-  return 1 - t * t * (3 - 2 * t);
-}
-function refCapsule(d, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb) {
-  const dx = x1 - x0, dy = y1 - y0;
-  const len2 = dx * dx + dy * dy;
-  const invLen2 = len2 > 0 ? 1 / len2 : 0;
-  const dr = r1 - r0, da = a1 - a0;
+// ---- JS reference: capsule v2 (lo spec di capsule_int.js, senza bound:
+// verifica che gli skip SIMD/di riga del wasm siano esatti) ----
+function refCapsuleInt(d, lx0, ly0, lx1, ly1, ox, oy, recs, s, hq, cr, cg, cb) {
   let wrote = false;
   for (let y2 = ly0; y2 <= ly1; y2++) {
-    const py = oy + y2 + 0.5;
     let di = ((y2 << 8) + lx0) << 2;
     for (let x2 = lx0; x2 <= lx1; x2++, di += 4) {
-      const px = ox + x2 + 0.5;
-      let t = ((px - x0) * dx + (py - y0) * dy) * invLen2;
-      if (t < 0) t = 0; else if (t > 1) t = 1;
-      const qx = px - (x0 + dx * t);
-      const qy = py - (y0 + dy * t);
-      const rT = r0 + dr * t;
-      const dist2 = qx * qx + qy * qy;
-      const lim = rT + 1;
-      if (dist2 >= lim * lim) continue;
-      const a = falloff(Math.sqrt(dist2), rT, h) * (a0 + da * t);
-      if (a <= 0) continue;
-      const ma = (a * 255 + 0.5) | 0;
+      const ma = capsuleIntMa(recs, s, ox + x2, oy + y2, hq);
       if (ma > d[di + 3]) {
         d[di] = div255(cr * ma);
         d[di + 1] = div255(cg * ma);
@@ -285,7 +269,7 @@ for (let it = 0; it < 300; it++) {
 }
 console.log('ok  dab_tex_tile (300 cases, wash+buildup, fixed color+RGBX)');
 
-// ---- capsule: 300 random cases ----
+// ---- capsule_int: 300 random cases (quantizzazione dallo spec condiviso) ----
 for (let it = 0; it < 300; it++) {
   const lx0 = ri(200), ly0 = ri(200);
   const lx1 = lx0 + 1 + ri(CHUNK - lx0 - 1), ly1 = ly0 + 1 + ri(CHUNK - ly0 - 1);
@@ -298,50 +282,44 @@ for (let it = 0; it < 300; it++) {
   const a0 = rng(), a1 = rng();
   const h = rng();
   const cr = ri(256), cg = ri(256), cb = ri(256);
+  const hq = Math.round(h * 4096);
+  const recs = [];
+  capsuleIntParams(x0, y0, r0, a0, x1, y1, r1, a1, recs);
 
   const m = mem();
   randomize(m, PTR_DST, CHUNK_BYTES, true);
   const ref = m.slice(PTR_DST, PTR_DST + CHUNK_BYTES);
 
-  const refWrote = refCapsule(ref, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb);
-  const wasmWrote = ex.capsule(PTR_DST, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb);
+  let refWrote = 0, wasmWrote = 0;
+  for (let s = 0; s < recs.length; s += CAP_STRIDE_I32) {
+    refWrote |= refCapsuleInt(ref, lx0, ly0, lx1, ly1, ox, oy, recs, s, hq, cr, cg, cb);
+    wasmWrote |= ex.capsule_int(PTR_DST, lx0, ly0, lx1, ly1, ox, oy,
+      recs[s], recs[s + 1], recs[s + 2], recs[s + 3], recs[s + 4],
+      recs[s + 5], recs[s + 6], recs[s + 7], recs[s + 8], hq, cr, cg, cb);
+  }
 
-  const e = diff(ref, mem().subarray(PTR_DST, PTR_DST + CHUNK_BYTES), `capsule #${it}`);
+  const e = diff(ref, mem().subarray(PTR_DST, PTR_DST + CHUNK_BYTES), `capsule_int #${it}`);
   if (e || refWrote !== wasmWrote) {
-    console.error('FAIL', e || `capsule #${it}: wrote ref=${refWrote} wasm=${wasmWrote}`);
+    console.error('FAIL', e || `capsule_int #${it}: wrote ref=${refWrote} wasm=${wasmWrote}`);
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  capsule (300 cases)');
+console.log('ok  capsule_int (300 cases, v2 interi)');
 
-// ---- capsule_tex: 300 random cases ----
-// Reference path without shortcuts (no row/pixel bounds): verifies that the
-// wasm SIMD skips are exact. ma = div255(maBase * f), with the factor read from
-// the tile; rgb != null means per-pixel colors from the RGBX tile.
-function refCapsuleTex(d, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h,
+// ---- capsule_tex_int: 300 random cases ----
+// Riferimento v2 senza scorciatoie (nessun bound di riga/pixel): verifica che
+// gli skip SIMD del wasm siano esatti. ma = div255(maBase * f) col fattore dal
+// tile; rgb != null = colori per pixel dal tile RGBX.
+function refCapsuleTexInt(d, lx0, ly0, lx1, ly1, ox, oy, recs, s, hq,
   cr, cg, cb, tile, rgbx) {
-  const dx = x1 - x0, dy = y1 - y0;
-  const len2 = dx * dx + dy * dy;
-  const invLen2 = len2 > 0 ? 1 / len2 : 0;
-  const dr = r1 - r0, da = a1 - a0;
   let wrote = false;
   for (let y2 = ly0; y2 <= ly1; y2++) {
-    const py = oy + y2 + 0.5;
     let di = ((y2 << 8) + lx0) << 2;
     let ti = (y2 << 8) + lx0;
     for (let x2 = lx0; x2 <= lx1; x2++, di += 4, ti++) {
-      const px = ox + x2 + 0.5;
-      let t = ((px - x0) * dx + (py - y0) * dy) * invLen2;
-      if (t < 0) t = 0; else if (t > 1) t = 1;
-      const qx = px - (x0 + dx * t);
-      const qy = py - (y0 + dy * t);
-      const rT = r0 + dr * t;
-      const dist2 = qx * qx + qy * qy;
-      const lim = rT + 1;
-      if (dist2 >= lim * lim) continue;
-      const a = falloff(Math.sqrt(dist2), rT, h) * (a0 + da * t);
-      if (a <= 0) continue;
-      const ma = div255(((a * 255 + 0.5) | 0) * tile[ti]);
+      const maB = capsuleIntMa(recs, s, ox + x2, oy + y2, hq);
+      if (maB === 0) continue;
+      const ma = div255(maB * tile[ti]);
       if (ma > d[di + 3]) {
         const r = rgbx ? rgbx[ti * 4] : cr;
         const g = rgbx ? rgbx[ti * 4 + 1] : cg;
@@ -380,24 +358,33 @@ for (let it = 0; it < 300; it++) {
     }
   }
 
+  const hq = Math.round(h * 4096);
+  const recs = [];
+  capsuleIntParams(x0, y0, r0, a0, x1, y1, r1, a1, recs);
+
   const m = mem();
   randomize(m, PTR_DST, CHUNK_BYTES, true);
   const ref = m.slice(PTR_DST, PTR_DST + CHUNK_BYTES);
   m.set(tile, PTR_TILE);
   if (rgbx) m.set(rgbx, PTR_RGBX);
 
-  const refWrote = refCapsuleTex(ref, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h,
-    cr, cg, cb, tile, rgbx);
-  const wasmWrote = ex.capsule_tex(PTR_DST, lx0, ly0, lx1, ly1, ox, oy, x0, y0, r0, a0, x1, y1, r1, a1, h,
-    cr, cg, cb, PTR_TILE, rgbx ? PTR_RGBX : 0);
+  let refWrote = 0, wasmWrote = 0;
+  for (let s = 0; s < recs.length; s += CAP_STRIDE_I32) {
+    refWrote |= refCapsuleTexInt(ref, lx0, ly0, lx1, ly1, ox, oy, recs, s, hq,
+      cr, cg, cb, tile, rgbx);
+    wasmWrote |= ex.capsule_tex_int(PTR_DST, lx0, ly0, lx1, ly1, ox, oy,
+      recs[s], recs[s + 1], recs[s + 2], recs[s + 3], recs[s + 4],
+      recs[s + 5], recs[s + 6], recs[s + 7], recs[s + 8], hq,
+      cr, cg, cb, PTR_TILE, rgbx ? PTR_RGBX : 0);
+  }
 
-  const e = diff(ref, mem().subarray(PTR_DST, PTR_DST + CHUNK_BYTES), `capsule_tex #${it}`);
+  const e = diff(ref, mem().subarray(PTR_DST, PTR_DST + CHUNK_BYTES), `capsule_tex_int #${it}`);
   if (e || refWrote !== wasmWrote) {
-    console.error('FAIL', e || `capsule_tex #${it}: wrote ref=${refWrote} wasm=${wasmWrote}`, { useRgb });
+    console.error('FAIL', e || `capsule_tex_int #${it}: wrote ref=${refWrote} wasm=${wasmWrote}`, { useRgb });
     if (++fails > 3) process.exit(1);
   }
 }
-console.log('ok  capsule_tex (300 cases, fixed color+RGBX)');
+console.log('ok  capsule_tex_int (300 cases, v2 interi, fixed color+RGBX)');
 
 // ---- commit: 200 random cases ----
 for (let it = 0; it < 200; it++) {

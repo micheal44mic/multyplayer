@@ -39,7 +39,9 @@ import { STRIDE, T_DAB } from './stroke.js';
 
 const RING = 64;                 // punti raw tenuti (coalesced 240Hz ≈ 250ms)
 const PRED_MS = 14;              // orizzonte di predizione (~1 frame + margine)
-const PRED_CAP_CSS = 40;         // tetto allo spostamento predetto (px CSS)
+const PRED_CAP_CSS = 28;         // tetto allo spostamento predetto (px CSS):
+                                 // al pen-up la predizione sparisce, oltre
+                                 // questo si percepisce la punta "ritirarsi"
 const PRED_MIN_SPEED = 0.05;     // sotto (px CSS/ms) niente predizione: jitter
 const TIP_MAX_PTS = 24;          // punti raw massimi nella polilinea di punta
 const CHAIN_MAX = 12;            // catene aperte (specchio ×2, pattern ×9)
@@ -57,6 +59,9 @@ export class InkOverlay {
     this._w = 1; this._h = 1; this._dpr = 1;
     this._sized = false;         // backing store allineato alle misure correnti
     this._active = false;        // tratto locale di pennello in corso
+    this._tail = false;          // pen-up fatto ma pipeline non drenata: si
+                                 // continua a coprire il SOLO in-volo (sui
+                                 // pennelli grandi la scia non scatta indietro)
     this._opacity = '';          // ultima style.opacity applicata
     // bbox CSS px sporcata dall'ultimo draw (da pulire al frame dopo)
     this._dx0 = 0; this._dy0 = 0; this._dx1 = -1; this._dy1 = -1;
@@ -98,6 +103,7 @@ export class InkOverlay {
    * @param {number} x @param {number} y @param {number} p @param {number} t */
   strokeBegin(x, y, p, t) {
     this._active = true;
+    this._tail = false;
     this._rn = 0;
     this._pushRaw(x, y, p, t);
   }
@@ -108,9 +114,11 @@ export class InkOverlay {
     if (this._active) this._pushRaw(x, y, p, t);
   }
 
-  /** Pen-up o annullo: la punta provvisoria sparisce al prossimo frame. */
+  /** Pen-up o annullo: la punta raw+predizione sparisce al prossimo frame;
+   * l'in-volo resta coperto finché la pipeline non è drenata (_tail). */
   strokeEnd() {
     this._active = false;
+    this._tail = true;
   }
 
   /**
@@ -121,10 +129,19 @@ export class InkOverlay {
   frame(app) {
     const eng = app.engine;
     const snap = eng.snap;
-    const show = this._active && app.strokeLive && eng.active && snap !== null &&
-      !eng.snapMode && !snap.eraser && !snap.aqua && app._strokeSel === null;
-    if (!show) {
-      if (!this._active) this._rn = 0;
+    // live = penna giù (in-volo + punta raw + predizione); tail = pen-up
+    // fatto ma pipeline non drenata (SOLO in-volo: sui pennelli grandi la
+    // scia resta coperta mentre il worker recupera, e il replay rastremato
+    // della punta passa anch'esso dall'in-volo del bridge)
+    const gates = snap !== null && !eng.snapMode && !snap.eraser && !snap.aqua &&
+      app._strokeSel === null;
+    const live = this._active && app.strokeLive && eng.active && gates;
+    const tail = !this._active && this._tail && app.strokeLive && gates;
+    if (!live && !tail) {
+      if (!this._active) {
+        this._rn = 0;
+        if (!app.strokeLive) this._tail = false;
+      }
       this._clearPrev();
       return;
     }
@@ -165,10 +182,13 @@ export class InkOverlay {
     else this._inFlightQueue(ctx, app.queue, cam);
     this._flushChains(ctx, cam);
 
-    // 2+3. punta raw + predizione (e la sua copia specchiata)
-    this._drawTip(ctx, app, 0);
-    const ax = app.queue.mirrorX;
-    if (ax !== null) this._drawTip(ctx, app, ax * 2);
+    // 2+3. punta raw + predizione (e la sua copia specchiata) — solo a
+    // penna giù: al pen-up si ritirano subito, il tratto vero arriva lì
+    if (live) {
+      this._drawTip(ctx, app, 0);
+      const ax = app.queue.mirrorX;
+      if (ax !== null) this._drawTip(ctx, app, ax * 2);
+    }
 
     ctx.restore();
   }
@@ -415,11 +435,12 @@ export class InkOverlay {
     this.el.height = Math.max(1, Math.round(this._h * this._dpr));
     this.el.style.width = this._w + 'px';
     this.el.style.height = this._h + 'px';
-    // desynchronized: fuori dalla coda del compositor dove supportato — è il
-    // punto di un layer d'inchiostro. Il set di width azzera lo stato: la
-    // transform DPR va rimessa qui.
+    // NIENTE hint desynchronized: su Chrome Android il canvas low-latency
+    // non supporta la trasparenza e diventa una superficie NERA opaca che
+    // copre l'intero workspace (visto dal campo). Il set di width azzera lo
+    // stato: la transform DPR va rimessa qui.
     if (!this.ctx) {
-      this.ctx = this.el.getContext('2d', { desynchronized: true });
+      this.ctx = this.el.getContext('2d');
     }
     if (this.ctx) this.ctx.setTransform(this._dpr, 0, 0, this._dpr, 0, 0);
     this._dx1 = -1; this._dy1 = -1;

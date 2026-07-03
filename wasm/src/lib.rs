@@ -276,61 +276,138 @@ fn sqrt64(x: f64) -> f64 {
     f64x2_extract_lane::<0>(f64x2_sqrt(f64x2_splat(x)))
 }
 
-// Falloff radiale identico a brush.js (banda AA di almeno 1px).
-#[inline(always)]
-fn falloff(dist: f64, r: f64, h: f64) -> f64 {
-    let core_r = r * h;
-    let mut w = r - core_r;
-    if w < 1.0 {
-        w = 1.0;
-    }
-    let t = (dist - core_r) / w;
-    if t <= 0.0 {
-        return 1.0;
-    }
-    if t >= 1.0 {
-        return 0.0;
-    }
-    1.0 - t * t * (3.0 - 2.0 * t)
+// ---- CAPSULE v2 A INTERI (spec: js/capsule_int.js) ----
+// La LUT del falloff (1025 u16, smoothstep discendente a scala 32768) viene
+// scritta dal JS nel heap all'attach e registrata qui: unica fonte per
+// JS/wasm/WGSL. Il puntatore resta valido attraverso i memory.grow.
+static mut FALLOFF_LUT_PTR: usize = 0;
+
+#[no_mangle]
+pub unsafe extern "C" fn set_falloff_lut(ptr: u32) {
+    FALLOFF_LUT_PTR = ptr as usize;
 }
 
-// Parametri costanti di una capsula (evita firme chilometriche).
-struct Caps {
-    x0: f64, y0: f64, dx: f64, dy: f64, inv_len2: f64,
-    r0: f64, dr: f64, a0: f64, da: f64, h: f64,
+#[inline(always)]
+unsafe fn lut16(i: u32) -> u32 {
+    *((FALLOFF_LUT_PTR + (i as usize) * 2) as *const u16) as u32
+}
+
+// t di proiezione ARROTONDATO: floor((num<<16 + den/2)/den), esatto in u64.
+#[inline(always)]
+fn div_t(num: u32, den: u32) -> u32 {
+    ((((num as u64) << 16) + ((den >> 1) as u64)) / (den as u64)) as u32
+}
+
+// round(sqrt(n)) esatto, n < 2^31 (mai tie: D²+D+0.25 non è intero).
+// sqrt f64 è correttamente arrotondata -> il floor sbaglia di al più 1,
+// i quadrati esatti in u32 correggono; poi n > s²+s decide l'arrotondamento.
+#[inline(always)]
+fn isqrt_round(n: u32) -> u32 {
+    let mut s = sqrt64(n as f64) as u32;
+    if s > 46340 {
+        s = 46340;
+    }
+    while s * s > n {
+        s -= 1;
+    }
+    while (s + 1) * (s + 1) <= n {
+        s += 1;
+    }
+    if n > s * s + s {
+        s += 1;
+    }
+    s
+}
+
+// Parametri interi di una tratta (record dello spec, quantizzato dal JS:
+// fixed 1/32px, tratte <=128px).
+struct CapsInt {
+    x0: i32, y0: i32, dx: i32, dy: i32, den: u32,
+    r0: i32, dr: i32, a0: i32, da: i32, hq: i32,
     cr: u32, cg: u32, cb: u32, ma_max: u32,
 }
 
-// Un pixel della capsula: identico, operazione per operazione, al loop JS.
-// Il pre-check su ma_max è esatto: ma <= ma_max sempre, quindi un pixel del
-// documento già a quell'alpha non può superare il test `ma > alpha`.
-// Qui il tie resta `>` (primo vince), a differenza dei dab: in via continua
-// colore e alpha per pixel sono identici tra nodi, a parità i byte non
-// cambierebbero — si salta e si tengono i bound esatti per riga.
+// ma v2 (0..255) al pixel (px,py in 1/32 px) — speculare, operazione per
+// operazione, a capsuleIntMa in capsule_int.js.
 #[inline(always)]
-unsafe fn capsule_px(c: &Caps, p: *mut u8, px: f64, py: f64, py_dy: f64) -> bool {
+unsafe fn capsule_int_ma(c: &CapsInt, px: i32, py: i32) -> u32 {
+    let rx = px - c.x0;
+    let ry = py - c.y0;
+    let num = rx as i64 * c.dx as i64 + ry as i64 * c.dy as i64;
+    let tq: u32 = if c.den == 0 || num <= 0 {
+        0
+    } else if num >= c.den as i64 {
+        65536
+    } else {
+        div_t(num as u32, c.den)
+    };
+    let ti = tq as i32;
+    let qx = rx - ((c.dx * ti) >> 16);
+    let qy = ry - ((c.dy * ti) >> 16);
+    let r_t = c.r0 + ((c.dr * ti) >> 16);
+    let lim = r_t + 32;
+    if lim <= 0 {
+        return 0;
+    }
+    // qx²+qy² può superare i31: somma in u32 (i quadrati singoli stanno in i32)
+    let d2 = (qx * qx) as u32 + (qy * qy) as u32;
+    let ulim = lim as u32;
+    if d2 >= ulim * ulim {
+        return 0;
+    }
+    let a_t = c.a0 + ((c.da * (ti >> 4)) >> 12);
+    if a_t <= 0 {
+        return 0;
+    }
+    let core = (r_t * c.hq) >> 12;
+    let mut w = r_t - core;
+    if w < 32 {
+        w = 32;
+    }
+    let d = isqrt_round(d2) as i32;
+    let u: u32 = if d <= core {
+        0
+    } else {
+        (((d - core) * 1024) as u32 + ((w as u32) >> 1)) / (w as u32)
+    };
+    if u >= 1024 {
+        return 0;
+    }
+    (lut16(u) * (a_t as u32) + (1 << 22)) >> 23
+}
+
+// Bound esatto di riga: ma(pixel) <= bound per monotonia del falloff intero
+// (D >= row_dist, rT <= r_max, aT <= a_max) — speculare a capsuleIntBound.
+#[inline(always)]
+unsafe fn capsule_int_bound(row_dist: i32, r_max: i32, a_max: i32, hq: i32) -> u32 {
+    let lim = r_max + 32;
+    if lim <= 0 || row_dist >= lim || a_max <= 0 {
+        return 0;
+    }
+    let core = (r_max * hq) >> 12;
+    let mut w = r_max - core;
+    if w < 32 {
+        w = 32;
+    }
+    let u: u32 = if row_dist <= core {
+        0
+    } else {
+        (((row_dist - core) * 1024) as u32 + ((w as u32) >> 1)) / (w as u32)
+    };
+    if u >= 1024 {
+        return 0;
+    }
+    (lut16(u) * (a_max as u32) + (1 << 22)) >> 23
+}
+
+// Un pixel della capsula v2: pre-check esatto sul bound di riga, poi la
+// matematica intera e il tie `>` (primo vince) come in raster.js.
+#[inline(always)]
+unsafe fn capsule_int_px(c: &CapsInt, p: *mut u8, px: i32, py: i32) -> bool {
     if *p.add(3) as u32 >= c.ma_max {
         return false;
     }
-    let mut t = ((px - c.x0) * c.dx + py_dy) * c.inv_len2;
-    if t < 0.0 {
-        t = 0.0;
-    } else if t > 1.0 {
-        t = 1.0;
-    }
-    let qx = px - (c.x0 + c.dx * t);
-    let qy = py - (c.y0 + c.dy * t);
-    let r_t = c.r0 + c.dr * t;
-    let dist2 = qx * qx + qy * qy;
-    let lim = r_t + 1.0;
-    if dist2 >= lim * lim {
-        return false;
-    }
-    let a = falloff(sqrt64(dist2), r_t, c.h) * (c.a0 + c.da * t);
-    if a <= 0.0 {
-        return false;
-    }
-    let ma = (a * 255.0 + 0.5) as u32;
+    let ma = capsule_int_ma(c, px, py);
     if ma > *p.add(3) as u32 {
         *p = div255(c.cr * ma) as u8;
         *p.add(1) = div255(c.cg * ma) as u8;
@@ -341,108 +418,82 @@ unsafe fn capsule_px(c: &Caps, p: *mut u8, px: f64, py: f64, py_dy: f64) -> bool
     false
 }
 
-// Capsula con raggio e alpha interpolati, replica esatta di _capsule in
-// raster.js. È il path caldo del pennello di default (spacing < 0.05 ->
-// modalità continua): i segmenti consecutivi si sovrappongono quasi del
-// tutto, quindi quasi tutti i pixel falliscono `ma > alpha` DOPO la
-// matematica. Bound esatto per riga: dist >= rowDist (distanza riga ->
-// segmento) e falloff monotono danno ma <= maMaxRow; un blocco di 4 pixel
-// del documento già a quell'alpha non può cambiare -> un confronto SIMD e
-// si salta, senza toccare l'output di un bit. Le righe con maMaxRow = 0
-// (oltre il raggio: il bbox è quadrato, la capsula no) si saltano intere.
-// La matematica f64 resta scalare: su V8 f64x2 è risultata più lenta.
-// ox/oy: origine mondo del chunk.
+// Capsula v2 con raggio e alpha interpolati, replica esatta di _capsule in
+// raster.js (il chiamante passa il record già quantizzato: tratte <=128px).
+// È il path caldo del pennello di default (spacing < 0.05 -> via continua):
+// i segmenti consecutivi si sovrappongono quasi del tutto, quindi quasi
+// tutti i pixel falliscono `ma > alpha` DOPO la matematica. Struttura di
+// skip identica a prima — bound esatto per riga (righe a bound 0 saltate
+// intere) + confronto SIMD dell'alpha di 4 pixel contro il bound — nessuno
+// dei due cambia l'output di un bit. cox/coy: origine mondo del chunk in px.
 #[no_mangle]
-pub unsafe extern "C" fn capsule(
+pub unsafe extern "C" fn capsule_int(
     chunk_ptr: u32, lx0: u32, ly0: u32, lx1: u32, ly1: u32,
-    ox: f64, oy: f64,
-    x0: f64, y0: f64, r0: f64, a0: f64,
-    x1: f64, y1: f64, r1: f64, a1: f64,
-    hardness: f64, cr: u32, cg: u32, cb: u32,
+    cox: i32, coy: i32,
+    x0: i32, y0: i32, dx: i32, dy: i32, den: u32,
+    r0: i32, dr: i32, a0: i32, da: i32,
+    hq: u32, cr: u32, cg: u32, cb: u32,
 ) -> u32 {
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-    let len2 = dx * dx + dy * dy;
-    let a_max = if a0 > a1 { a0 } else { a1 };
-    let r_max = if r0 > r1 { r0 } else { r1 };
-    let y_lo = if y0 < y1 { y0 } else { y1 };
-    let y_hi = if y0 > y1 { y0 } else { y1 };
-    let c = Caps {
-        x0, y0, dx, dy,
-        inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 },
-        r0, dr: r1 - r0, a0, da: a1 - a0, h: hardness,
-        cr, cg, cb,
+    let r_max = if dr > 0 { r0 + dr } else { r0 };
+    let a_max = if da > 0 { a0 + da } else { a0 };
+    let y_lo = if dy < 0 { y0 + dy } else { y0 };
+    let y_hi = if dy > 0 { y0 + dy } else { y0 };
+    let mut c = CapsInt {
+        x0, y0, dx, dy, den, r0, dr, a0, da,
+        hq: hq as i32, cr, cg, cb,
         ma_max: 0, // impostato per riga
     };
-    let mut c = c;
     let w = (lx1 - lx0 + 1) as usize;
     let mut wrote = false;
 
     for y2 in ly0..=ly1 {
-        let py = oy + y2 as f64 + 0.5;
-        // distanza minima dalla riga al segmento e bound esatto della riga:
-        // dist >= rowDist, falloff cala con dist e cresce con r, a <= a_max
-        let row_dist = if py < y_lo { y_lo - py } else if py > y_hi { py - y_hi } else { 0.0 };
-        let ma_max_row = (falloff(row_dist, r_max, hardness) * a_max * 255.0 + 0.5) as u32;
-        if ma_max_row == 0 {
+        let py = (coy + y2 as i32) * 32 + 16;
+        let row_dist = if py < y_lo { y_lo - py } else if py > y_hi { py - y_hi } else { 0 };
+        let bound = capsule_int_bound(row_dist, r_max, a_max, hq as i32);
+        if bound == 0 {
             continue; // nessun pixel della riga può scrivere
         }
-        c.ma_max = ma_max_row;
-        let ma_max_v = u8x16_splat(ma_max_row as u8); // <= 255 (falloff, a <= 1)
+        c.ma_max = bound;
+        let bound_v = u8x16_splat(bound as u8); // <= 255
 
-        let py_dy = (py - y0) * dy; // termine costante per riga
         let row = chunk_ptr as usize + ((((y2 as usize) << CHUNK_SHIFT) + lx0 as usize) << 2);
-        let px0 = ox + lx0 as f64 + 0.5;
+        let px0 = (cox + lx0 as i32) * 32 + 16;
         let mut x = 0usize;
 
         while x + 4 <= w {
             let d4 = v128_load((row + x * 4) as *const v128);
-            if !u8x16_all_true(u8x16_ge(splat_alpha(d4), ma_max_v)) {
+            if !u8x16_all_true(u8x16_ge(splat_alpha(d4), bound_v)) {
                 let p = (row + x * 4) as *mut u8;
-                wrote |= capsule_px(&c, p, px0 + x as f64, py, py_dy);
-                wrote |= capsule_px(&c, p.add(4), px0 + (x + 1) as f64, py, py_dy);
-                wrote |= capsule_px(&c, p.add(8), px0 + (x + 2) as f64, py, py_dy);
-                wrote |= capsule_px(&c, p.add(12), px0 + (x + 3) as f64, py, py_dy);
+                let xi = x as i32;
+                wrote |= capsule_int_px(&c, p, px0 + xi * 32, py);
+                wrote |= capsule_int_px(&c, p.add(4), px0 + (xi + 1) * 32, py);
+                wrote |= capsule_int_px(&c, p.add(8), px0 + (xi + 2) * 32, py);
+                wrote |= capsule_int_px(&c, p.add(12), px0 + (xi + 3) * 32, py);
             }
             x += 4;
         }
         while x < w {
-            wrote |= capsule_px(&c, (row + x * 4) as *mut u8, px0 + x as f64, py, py_dy);
+            wrote |= capsule_int_px(&c, (row + x * 4) as *mut u8, px0 + (x as i32) * 32, py);
             x += 1;
         }
     }
     wrote as u32
 }
 
-// Un pixel della capsula texturizzata: geometria identica a capsule_px, poi
-// ma = div255(ma_base * f) col fattore f letto dal tile. Il pre-check è
-// esatto: ma <= div255(ma_max * f) sempre (div255 è monotona), quindi un
-// pixel del documento già a quell'alpha non può superare `ma > alpha`.
+// Un pixel della capsula v2 texturizzata: geometria intera identica a
+// capsule_int_ma, poi ma = div255(ma_base * f) col fattore f dal tile.
+// Pre-check esatto: ma <= div255(bound * f) sempre (div255 è monotona).
 // rgb = 0 -> colore del pennello; altrimenti ptr al pixel RGBX del tile.
 #[inline(always)]
-unsafe fn capsule_tex_px(c: &Caps, p: *mut u8, f: u32, rgb: usize, px: f64, py: f64, py_dy: f64) -> bool {
+unsafe fn capsule_tex_int_px(c: &CapsInt, p: *mut u8, f: u32, rgb: usize, px: i32, py: i32) -> bool {
     if *p.add(3) as u32 >= div255(c.ma_max * f) {
         return false;
     }
-    let mut t = ((px - c.x0) * c.dx + py_dy) * c.inv_len2;
-    if t < 0.0 {
-        t = 0.0;
-    } else if t > 1.0 {
-        t = 1.0;
-    }
-    let qx = px - (c.x0 + c.dx * t);
-    let qy = py - (c.y0 + c.dy * t);
-    let r_t = c.r0 + c.dr * t;
-    let dist2 = qx * qx + qy * qy;
-    let lim = r_t + 1.0;
-    if dist2 >= lim * lim {
+    let ma_base = capsule_int_ma(c, px, py);
+    if ma_base == 0 {
         return false;
     }
-    let a = falloff(sqrt64(dist2), r_t, c.h) * (c.a0 + c.da * t);
-    if a <= 0.0 {
-        return false;
-    }
-    let ma = div255((a * 255.0 + 0.5) as u32 * f);
+    let ma = div255(ma_base * f);
     if ma > *p.add(3) as u32 {
         let (cr, cg, cb) = if rgb != 0 {
             (
@@ -462,81 +513,76 @@ unsafe fn capsule_tex_px(c: &Caps, p: *mut u8, f: u32, rgb: usize, px: f64, py: 
     false
 }
 
-// Capsula texturizzata: la via continua quando la grana è ancorata al canvas
-// (il fattore per pixel non dipende dal dab, quindi commuta con l'unione
-// wash). Stessa struttura di `capsule`; il bound per riga viene raffinato per
-// pixel col fattore del tile: dove la grana satura il documento a un'alpha
-// più bassa, il blocco di 4 pixel si salta con un confronto SIMD esatto.
-// tile_ptr: fattori 1 byte/px in spazio chunk; rgb_ptr: tile RGBX o 0.
+// Capsula v2 texturizzata: la via continua quando la grana è ancorata al
+// canvas (il fattore per pixel non dipende dal dab, quindi commuta con
+// l'unione wash). Stessa struttura di `capsule_int`; il bound per riga viene
+// raffinato per pixel col fattore del tile: dove la grana satura il
+// documento a un'alpha più bassa, il blocco di 4 pixel si salta con un
+// confronto SIMD esatto. tile_ptr: fattori 1 byte/px; rgb_ptr: RGBX o 0.
 #[no_mangle]
-pub unsafe extern "C" fn capsule_tex(
+pub unsafe extern "C" fn capsule_tex_int(
     chunk_ptr: u32, lx0: u32, ly0: u32, lx1: u32, ly1: u32,
-    ox: f64, oy: f64,
-    x0: f64, y0: f64, r0: f64, a0: f64,
-    x1: f64, y1: f64, r1: f64, a1: f64,
-    hardness: f64, cr: u32, cg: u32, cb: u32,
+    cox: i32, coy: i32,
+    x0: i32, y0: i32, dx: i32, dy: i32, den: u32,
+    r0: i32, dr: i32, a0: i32, da: i32,
+    hq: u32, cr: u32, cg: u32, cb: u32,
     tile_ptr: u32, rgb_ptr: u32,
 ) -> u32 {
-    let dx = x1 - x0;
-    let dy = y1 - y0;
-    let len2 = dx * dx + dy * dy;
-    let a_max = if a0 > a1 { a0 } else { a1 };
-    let r_max = if r0 > r1 { r0 } else { r1 };
-    let y_lo = if y0 < y1 { y0 } else { y1 };
-    let y_hi = if y0 > y1 { y0 } else { y1 };
-    let mut c = Caps {
-        x0, y0, dx, dy,
-        inv_len2: if len2 > 0.0 { 1.0 / len2 } else { 0.0 },
-        r0, dr: r1 - r0, a0, da: a1 - a0, h: hardness,
-        cr, cg, cb,
+    let r_max = if dr > 0 { r0 + dr } else { r0 };
+    let a_max = if da > 0 { a0 + da } else { a0 };
+    let y_lo = if dy < 0 { y0 + dy } else { y0 };
+    let y_hi = if dy > 0 { y0 + dy } else { y0 };
+    let mut c = CapsInt {
+        x0, y0, dx, dy, den, r0, dr, a0, da,
+        hq: hq as i32, cr, cg, cb,
         ma_max: 0, // impostato per riga
     };
     let w = (lx1 - lx0 + 1) as usize;
     let mut wrote = false;
 
     for y2 in ly0..=ly1 {
-        let py = oy + y2 as f64 + 0.5;
-        let row_dist = if py < y_lo { y_lo - py } else if py > y_hi { py - y_hi } else { 0.0 };
-        let ma_max_row = (falloff(row_dist, r_max, hardness) * a_max * 255.0 + 0.5) as u32;
-        if ma_max_row == 0 {
+        let py = (coy + y2 as i32) * 32 + 16;
+        let row_dist = if py < y_lo { y_lo - py } else if py > y_hi { py - y_hi } else { 0 };
+        let bound = capsule_int_bound(row_dist, r_max, a_max, hq as i32);
+        if bound == 0 {
             continue; // nessun pixel della riga può scrivere
         }
-        c.ma_max = ma_max_row;
-        let mam16 = u16x8_splat(ma_max_row as u16);
+        c.ma_max = bound;
+        let bnd16 = u16x8_splat(bound as u16);
 
-        let py_dy = (py - y0) * dy; // termine costante per riga
         let trow = ((y2 as usize) << CHUNK_SHIFT) + lx0 as usize;
         let row = chunk_ptr as usize + (trow << 2);
         let tr = tile_ptr as usize + trow;
         let rr = rgb_ptr as usize + (trow << 2); // valido solo se rgb_ptr != 0
-        let px0 = ox + lx0 as f64 + 0.5;
+        let px0 = (cox + lx0 as i32) * 32 + 16;
         let mut x = 0usize;
 
         while x + 4 <= w {
             let d4 = v128_load((row + x * 4) as *const v128);
             // bound esatto per pixel, replicato sui 4 canali come l'alpha:
-            // ma <= div255(ma_max_row * f) (f*ma_max <= 65025: dentro u16)
+            // ma <= div255(bound * f) (f*bound <= 65025: dentro u16)
             let fword = ((tr + x) as *const u32).read_unaligned();
             let f8 = splat_bytes(fword);
-            let b_lo = div255_v(i16x8_mul(u16x8_extend_low_u8x16(f8), mam16));
-            let b_hi = div255_v(i16x8_mul(u16x8_extend_high_u8x16(f8), mam16));
-            let bound = u8x16_narrow_i16x8(b_lo, b_hi);
-            if !u8x16_all_true(u8x16_ge(splat_alpha(d4), bound)) {
+            let b_lo = div255_v(i16x8_mul(u16x8_extend_low_u8x16(f8), bnd16));
+            let b_hi = div255_v(i16x8_mul(u16x8_extend_high_u8x16(f8), bnd16));
+            let bound_v = u8x16_narrow_i16x8(b_lo, b_hi);
+            if !u8x16_all_true(u8x16_ge(splat_alpha(d4), bound_v)) {
                 let p = (row + x * 4) as *mut u8;
                 let f = fword;
                 let rb = if rgb_ptr != 0 { rr + x * 4 } else { 0 };
                 let rs = if rgb_ptr != 0 { 4 } else { 0 };
-                wrote |= capsule_tex_px(&c, p, f & 0xff, rb, px0 + x as f64, py, py_dy);
-                wrote |= capsule_tex_px(&c, p.add(4), (f >> 8) & 0xff, rb + rs, px0 + (x + 1) as f64, py, py_dy);
-                wrote |= capsule_tex_px(&c, p.add(8), (f >> 16) & 0xff, rb + rs * 2, px0 + (x + 2) as f64, py, py_dy);
-                wrote |= capsule_tex_px(&c, p.add(12), f >> 24, rb + rs * 3, px0 + (x + 3) as f64, py, py_dy);
+                let xi = x as i32;
+                wrote |= capsule_tex_int_px(&c, p, f & 0xff, rb, px0 + xi * 32, py);
+                wrote |= capsule_tex_int_px(&c, p.add(4), (f >> 8) & 0xff, rb + rs, px0 + (xi + 1) * 32, py);
+                wrote |= capsule_tex_int_px(&c, p.add(8), (f >> 16) & 0xff, rb + rs * 2, px0 + (xi + 2) * 32, py);
+                wrote |= capsule_tex_int_px(&c, p.add(12), f >> 24, rb + rs * 3, px0 + (xi + 3) * 32, py);
             }
             x += 4;
         }
         while x < w {
             let f = *((tr + x) as *const u8) as u32;
             let rb = if rgb_ptr != 0 { rr + x * 4 } else { 0 };
-            wrote |= capsule_tex_px(&c, (row + x * 4) as *mut u8, f, rb, px0 + x as f64, py, py_dy);
+            wrote |= capsule_tex_int_px(&c, (row + x * 4) as *mut u8, f, rb, px0 + (x as i32) * 32, py);
             x += 1;
         }
     }

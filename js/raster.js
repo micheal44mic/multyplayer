@@ -5,9 +5,9 @@
 // Il budget limita i pixel toccati per frame: l'eccedenza resta in coda (catch-up).
 
 import { div255 } from './util.js';
-import { falloff } from './brush.js';
 import { CHUNK, CHUNK_SHIFT, forEachChunkInRect } from './store.js';
 import { T_DAB } from './stroke.js';
+import { CAP_STRIDE_I32, CAP_FP, quantHardness, capsuleIntParams, capsuleIntMa, capsuleIntBound } from './capsule_int.js';
 
 /** @typedef {import('./store.js').Chunk} Chunk */
 /** @typedef {import('./store.js').ChunkStore} ChunkStore */
@@ -82,6 +82,10 @@ export class Rasterizer {
     this.selMask = null;
     // bbox ritagliato riusato (zero allocazioni per dab)
     this._box = { x0: 0, y0: 0, x1: 0, y1: 0 };
+    // record integer della capsule v2 riusati (tratte quantizzate del
+    // segmento corrente, spec in capsule_int.js)
+    /** @type {number[]} */
+    this._capRecs = [];
     // dab/segmenti applicati nell'ultimo run (la maschera di selezione parte
     // solo se il run ha scritto qualcosa)
     this.lastDabs = 0;
@@ -1023,84 +1027,75 @@ export class Rasterizer {
       this._capsuleTex(x0, y0, r0, a0, x1, y1, r1, a1);
       return;
     }
-    const h = snap.hardness;
+    // CAPSULE v2 A INTERI (spec: capsule_int.js). Il segmento si quantizza
+    // UNA volta (fixed 1/32px, tratte <=128px la cui unione wash è la
+    // capsula intera), poi il per-pixel è solo aritmetica intera: gli stessi
+    // byte del kernel wasm e del motore WebGPU per costruzione.
+    const hq = quantHardness(snap.hardness);
     const cr = snap.colR, cg = snap.colG, cb = snap.colB;
     const store = this.store;
-
-    const maxR = Math.max(r0, r1) + 1;
-    const box = this._clampBox(
-      Math.floor(Math.min(x0, x1) - maxR), Math.floor(Math.min(y0, y1) - maxR),
-      Math.ceil(Math.max(x0, x1) + maxR), Math.ceil(Math.max(y0, y1) + maxR));
-    if (!box) return;
-    const bx0 = box.x0, by0 = box.y0, bx1 = box.x1, by1 = box.y1;
-
-    if (this.heap) {
-      const ex = this.heap.exports;
-      forEachChunkInRect(store, bx0, by0, bx1, by1, true,
-        (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
-          store.markDirty(chunk, lx0, ly0, lx1, ly1);
-          const wrote = ex.capsule(chunk.ptr, lx0, ly0, lx1, ly1, ox, oy,
-            x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb);
-          if (wrote) chunk.touched = true;
-        }, this.clip);
-      return;
-    }
-
+    const recs = this._capRecs;
+    recs.length = 0;
+    capsuleIntParams(x0, y0, r0, a0, x1, y1, r1, a1, recs);
     this._ensureColorLut(cr, cg, cb);
     const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
 
-    const dx = x1 - x0, dy = y1 - y0;
-    const len2 = dx * dx + dy * dy;
-    const invLen2 = len2 > 0 ? 1 / len2 : 0;
-    const dr = r1 - r0, da = a1 - a0;
-    // Bound esatto per riga: dist >= distanza riga->segmento e falloff
-    // monotono danno ma <= maMaxRow. Nei tratti a spacing basso i segmenti si
-    // sovrappongono quasi del tutto: i pixel già saturi vengono saltati prima
-    // di proiezione e sqrt senza cambiare l'output; le righe con bound 0
-    // (il bbox è quadrato, la capsula no) si saltano intere.
-    const aMax = Math.max(a0, a1);
-    const rMax = Math.max(r0, r1);
-    const yLo = Math.min(y0, y1), yHi = Math.max(y0, y1);
+    for (let s = 0; s < recs.length; s += CAP_STRIDE_I32) {
+      const X0 = recs[s], Y0 = recs[s + 1], DX = recs[s + 2], DY = recs[s + 3];
+      const den = recs[s + 4];
+      const R0 = recs[s + 5], DR = recs[s + 6], A0 = recs[s + 7], DA = recs[s + 8];
+      const rMax = DR > 0 ? R0 + DR : R0;
+      const aMax = DA > 0 ? A0 + DA : A0;
+      const yLo = DY < 0 ? Y0 + DY : Y0, yHi = DY > 0 ? Y0 + DY : Y0;
+      // bbox della tratta (stessa forma di prima: maxR + 1px), dagli interi
+      const mR = rMax / CAP_FP + 1;
+      const box = this._clampBox(
+        Math.floor(Math.min(X0, X0 + DX) / CAP_FP - mR), Math.floor(yLo / CAP_FP - mR),
+        Math.ceil(Math.max(X0, X0 + DX) / CAP_FP + mR), Math.ceil(yHi / CAP_FP + mR));
+      if (!box) continue;
 
-    forEachChunkInRect(store, bx0, by0, bx1, by1, true,
-      (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
-        store.markDirty(chunk, lx0, ly0, lx1, ly1);
-        const d = chunk.data;
-        let wrote = false;
-        for (let y2 = ly0; y2 <= ly1; y2++) {
-          const py = oy + y2 + 0.5;
-          const rowDist = py < yLo ? yLo - py : py > yHi ? py - yHi : 0;
-          const maMaxRow = (falloff(rowDist, rMax, h) * aMax * 255 + 0.5) | 0;
-          if (maMaxRow === 0) continue;
-          let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
-          for (let x2 = lx0; x2 <= lx1; x2++, di += 4) {
-            if (d[di + 3] >= maMaxRow) continue;
-            const px = ox + x2 + 0.5;
-            let t = ((px - x0) * dx + (py - y0) * dy) * invLen2;
-            if (t < 0) t = 0; else if (t > 1) t = 1;
-            const qx = px - (x0 + dx * t);
-            const qy = py - (y0 + dy * t);
-            const rT = r0 + dr * t;
-            const dist2 = qx * qx + qy * qy;
-            const lim = rT + 1;
-            if (dist2 >= lim * lim) continue;
-            const a = falloff(Math.sqrt(dist2), rT, h) * (a0 + da * t);
-            if (a <= 0) continue;
-            const ma = (a * 255 + 0.5) | 0;
-            // qui il tie resta `>` (primo vince): in via continua colore e
-            // alpha per pixel sono identici tra nodi, a parità i byte non
-            // cambierebbero — si salta e si tengono i bound esatti per riga
-            if (ma > d[di + 3]) {
-              d[di] = lutR[ma];
-              d[di + 1] = lutG[ma];
-              d[di + 2] = lutB[ma];
-              d[di + 3] = ma;
-              wrote = true;
+      if (this.heap) {
+        const ex = this.heap.exports;
+        forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
+          (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+            store.markDirty(chunk, lx0, ly0, lx1, ly1);
+            const wrote = ex.capsule_int(chunk.ptr, lx0, ly0, lx1, ly1, ox, oy,
+              X0, Y0, DX, DY, den, R0, DR, A0, DA, hq, cr, cg, cb);
+            if (wrote) chunk.touched = true;
+          }, this.clip);
+        continue;
+      }
+
+      forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
+        (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+          store.markDirty(chunk, lx0, ly0, lx1, ly1);
+          const d = chunk.data;
+          let wrote = false;
+          for (let y2 = ly0; y2 <= ly1; y2++) {
+            const pyq = (oy + y2) * CAP_FP + (CAP_FP >> 1);
+            const rowDist = pyq < yLo ? yLo - pyq : pyq > yHi ? pyq - yHi : 0;
+            // bound esatto per riga (monotonia del falloff intero): come in
+            // v1, i pixel già saturi si saltano senza cambiare l'output e le
+            // righe a bound 0 si saltano intere
+            const bound = capsuleIntBound(rowDist, rMax, aMax, hq);
+            if (bound === 0) continue;
+            let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
+            for (let x2 = lx0; x2 <= lx1; x2++, di += 4) {
+              if (d[di + 3] >= bound) continue;
+              const ma = capsuleIntMa(recs, s, ox + x2, oy + y2, hq);
+              // tie `>` (primo vince) come sempre in via continua
+              if (ma > d[di + 3]) {
+                d[di] = lutR[ma];
+                d[di + 1] = lutG[ma];
+                d[di + 2] = lutB[ma];
+                d[di + 3] = ma;
+                wrote = true;
+              }
             }
           }
-        }
-        if (wrote) chunk.touched = true;
-      }, this.clip);
+          if (wrote) chunk.touched = true;
+        }, this.clip);
+    }
   }
 
   // Capsula texturizzata: la via continua quando la grana è ancorata al
@@ -1115,91 +1110,85 @@ export class Rasterizer {
    */
   _capsuleTex(x0, y0, r0, a0, x1, y1, r1, a1) {
     const snap = this.snap;
-    const h = snap.hardness;
+    // geometria capsule v2 a interi (spec: capsule_int.js), poi il fattore
+    // del tile come prima: ma = div255(maBase * f)
+    const hq = quantHardness(snap.hardness);
     const cr = snap.colR, cg = snap.colG, cb = snap.colB;
     const useColor = snap.texColor;
     const store = this.store;
-
-    const maxR = Math.max(r0, r1) + 1;
-    const box = this._clampBox(
-      Math.floor(Math.min(x0, x1) - maxR), Math.floor(Math.min(y0, y1) - maxR),
-      Math.ceil(Math.max(x0, x1) + maxR), Math.ceil(Math.max(y0, y1) + maxR));
-    if (!box) return;
-    const bx0 = box.x0, by0 = box.y0, bx1 = box.x1, by1 = box.y1;
-
-    if (this.heap) {
-      const ex = this.heap.exports;
-      forEachChunkInRect(store, bx0, by0, bx1, by1, true,
-        (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
-          const t = this._tile(chunk, useColor);
-          store.markDirty(chunk, lx0, ly0, lx1, ly1);
-          const wrote = ex.capsule_tex(chunk.ptr, lx0, ly0, lx1, ly1, ox, oy,
-            x0, y0, r0, a0, x1, y1, r1, a1, h, cr, cg, cb,
-            t.lumPtr, useColor ? t.rgbxPtr : 0);
-          if (wrote) chunk.touched = true;
-        }, this.clip);
-      return;
-    }
-
+    const recs = this._capRecs;
+    recs.length = 0;
+    capsuleIntParams(x0, y0, r0, a0, x1, y1, r1, a1, recs);
     this._ensureColorLut(cr, cg, cb);
     const lutR = this._lutR, lutG = this._lutG, lutB = this._lutB;
 
-    const dx = x1 - x0, dy = y1 - y0;
-    const len2 = dx * dx + dy * dy;
-    const invLen2 = len2 > 0 ? 1 / len2 : 0;
-    const dr = r1 - r0, da = a1 - a0;
-    const aMax = Math.max(a0, a1);
-    const rMax = Math.max(r0, r1);
-    const yLo = Math.min(y0, y1), yHi = Math.max(y0, y1);
+    for (let s = 0; s < recs.length; s += CAP_STRIDE_I32) {
+      const X0 = recs[s], Y0 = recs[s + 1], DX = recs[s + 2], DY = recs[s + 3];
+      const den = recs[s + 4];
+      const R0 = recs[s + 5], DR = recs[s + 6], A0 = recs[s + 7], DA = recs[s + 8];
+      const rMax = DR > 0 ? R0 + DR : R0;
+      const aMax = DA > 0 ? A0 + DA : A0;
+      const yLo = DY < 0 ? Y0 + DY : Y0, yHi = DY > 0 ? Y0 + DY : Y0;
+      const mR = rMax / CAP_FP + 1;
+      const box = this._clampBox(
+        Math.floor(Math.min(X0, X0 + DX) / CAP_FP - mR), Math.floor(yLo / CAP_FP - mR),
+        Math.ceil(Math.max(X0, X0 + DX) / CAP_FP + mR), Math.ceil(yHi / CAP_FP + mR));
+      if (!box) continue;
 
-    forEachChunkInRect(store, bx0, by0, bx1, by1, true,
-      (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
-        const t = this._tile(chunk, useColor);
-        const lum = t.lum, rgbx = useColor ? t.rgbx : null;
-        store.markDirty(chunk, lx0, ly0, lx1, ly1);
-        const d = chunk.data;
-        let wrote = false;
-        for (let y2 = ly0; y2 <= ly1; y2++) {
-          const py = oy + y2 + 0.5;
-          const rowDist = py < yLo ? yLo - py : py > yHi ? py - yHi : 0;
-          const maMaxRow = (falloff(rowDist, rMax, h) * aMax * 255 + 0.5) | 0;
-          if (maMaxRow === 0) continue;
-          let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
-          let ti = (y2 << CHUNK_SHIFT) + lx0;
-          for (let x2 = lx0; x2 <= lx1; x2++, di += 4, ti++) {
-            const f = lum[ti];
-            // bound esatto: ma <= div255(maMaxRow * f) (div255 è monotona)
-            if (d[di + 3] >= div255(maMaxRow * f)) continue;
-            const px = ox + x2 + 0.5;
-            let t2 = ((px - x0) * dx + (py - y0) * dy) * invLen2;
-            if (t2 < 0) t2 = 0; else if (t2 > 1) t2 = 1;
-            const qx = px - (x0 + dx * t2);
-            const qy = py - (y0 + dy * t2);
-            const rT = r0 + dr * t2;
-            const dist2 = qx * qx + qy * qy;
-            const lim = rT + 1;
-            if (dist2 >= lim * lim) continue;
-            const a = falloff(Math.sqrt(dist2), rT, h) * (a0 + da * t2);
-            if (a <= 0) continue;
-            const ma = div255(((a * 255 + 0.5) | 0) * f);
-            if (ma > d[di + 3]) {
-              if (rgbx !== null) {
-                const ci = ti << 2;
-                d[di] = div255(rgbx[ci] * ma);
-                d[di + 1] = div255(rgbx[ci + 1] * ma);
-                d[di + 2] = div255(rgbx[ci + 2] * ma);
-              } else {
-                d[di] = lutR[ma];
-                d[di + 1] = lutG[ma];
-                d[di + 2] = lutB[ma];
+      if (this.heap) {
+        const ex = this.heap.exports;
+        forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
+          (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+            const t = this._tile(chunk, useColor);
+            store.markDirty(chunk, lx0, ly0, lx1, ly1);
+            const wrote = ex.capsule_tex_int(chunk.ptr, lx0, ly0, lx1, ly1, ox, oy,
+              X0, Y0, DX, DY, den, R0, DR, A0, DA, hq, cr, cg, cb,
+              t.lumPtr, useColor ? t.rgbxPtr : 0);
+            if (wrote) chunk.touched = true;
+          }, this.clip);
+        continue;
+      }
+
+      forEachChunkInRect(store, box.x0, box.y0, box.x1, box.y1, true,
+        (chunk, lx0, ly0, lx1, ly1, ox, oy) => {
+          const t = this._tile(chunk, useColor);
+          const lum = t.lum, rgbx = useColor ? t.rgbx : null;
+          store.markDirty(chunk, lx0, ly0, lx1, ly1);
+          const d = chunk.data;
+          let wrote = false;
+          for (let y2 = ly0; y2 <= ly1; y2++) {
+            const pyq = (oy + y2) * CAP_FP + (CAP_FP >> 1);
+            const rowDist = pyq < yLo ? yLo - pyq : pyq > yHi ? pyq - yHi : 0;
+            const bound = capsuleIntBound(rowDist, rMax, aMax, hq);
+            if (bound === 0) continue;
+            let di = ((y2 << CHUNK_SHIFT) + lx0) << 2;
+            let ti = (y2 << CHUNK_SHIFT) + lx0;
+            for (let x2 = lx0; x2 <= lx1; x2++, di += 4, ti++) {
+              const f = lum[ti];
+              // bound esatto: ma <= div255(bound * f) (div255 è monotona)
+              if (d[di + 3] >= div255(bound * f)) continue;
+              const maB = capsuleIntMa(recs, s, ox + x2, oy + y2, hq);
+              if (maB === 0) continue;
+              const ma = div255(maB * f);
+              if (ma > d[di + 3]) {
+                if (rgbx !== null) {
+                  const ci = ti << 2;
+                  d[di] = div255(rgbx[ci] * ma);
+                  d[di + 1] = div255(rgbx[ci + 1] * ma);
+                  d[di + 2] = div255(rgbx[ci + 2] * ma);
+                } else {
+                  d[di] = lutR[ma];
+                  d[di + 1] = lutG[ma];
+                  d[di + 2] = lutB[ma];
+                }
+                d[di + 3] = ma;
+                wrote = true;
               }
-              d[di + 3] = ma;
-              wrote = true;
             }
           }
-        }
-        if (wrote) chunk.touched = true;
-      }, this.clip);
+          if (wrote) chunk.touched = true;
+        }, this.clip);
+    }
   }
 }
 

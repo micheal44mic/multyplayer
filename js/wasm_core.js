@@ -5,6 +5,8 @@
 // ATTENZIONE: memory.grow stacca il buffer e invalida OGNI vista esistente;
 // onGrow viene chiamata subito dopo per rigenerarle (store + stamp cache).
 
+import { FALLOFF_LUT } from './capsule_int.js';
+
 export class WasmHeap {
   /**
    * Carica e istanzia il modulo. Ritorna null se il fetch fallisce o il
@@ -43,15 +45,16 @@ export class WasmHeap {
      *                  tilePtr: number, rgbPtr: number,
      *                  a255: number, cr: number, cg: number, cb: number,
      *                  buildup: number) => number,
-     *   capsule: (chunkPtr: number, lx0: number, ly0: number, lx1: number, ly1: number,
-     *             ox: number, oy: number, x0: number, y0: number, r0: number, a0: number,
-     *             x1: number, y1: number, r1: number, a1: number, hardness: number,
-     *             cr: number, cg: number, cb: number) => number,
-     *   capsule_tex: (chunkPtr: number, lx0: number, ly0: number, lx1: number, ly1: number,
-     *                 ox: number, oy: number, x0: number, y0: number, r0: number, a0: number,
-     *                 x1: number, y1: number, r1: number, a1: number, hardness: number,
-     *                 cr: number, cg: number, cb: number,
-     *                 tilePtr: number, rgbPtr: number) => number,
+     *   set_falloff_lut: (ptr: number) => void,
+     *   capsule_int: (chunkPtr: number, lx0: number, ly0: number, lx1: number, ly1: number,
+     *                 cox: number, coy: number, x0: number, y0: number, dx: number, dy: number,
+     *                 den: number, r0: number, dr: number, a0: number, da: number,
+     *                 hq: number, cr: number, cg: number, cb: number) => number,
+     *   capsule_tex_int: (chunkPtr: number, lx0: number, ly0: number, lx1: number, ly1: number,
+     *                     cox: number, coy: number, x0: number, y0: number, dx: number, dy: number,
+     *                     den: number, r0: number, dr: number, a0: number, da: number,
+     *                     hq: number, cr: number, cg: number, cb: number,
+     *                     tilePtr: number, rgbPtr: number) => number,
      *   commit: (dstPtr: number, srcPtr: number, op255: number, eraser: number) => void,
      *   blur_blend: (pf: number, pi: number, base: number, out: number,
      *                lx0: number, ly0: number, lx1: number, ly1: number,
@@ -78,6 +81,15 @@ export class WasmHeap {
     this._free = new Map();
     /** @type {(() => void)|null} */
     this.onGrow = null;
+    // LUT del falloff capsule v2 (capsule_int.js) nel heap: unica fonte per
+    // JS/wasm; il puntatore resta valido attraverso i grow
+    if (this.exports.set_falloff_lut) {
+      const bytes = FALLOFF_LUT.length * 2;
+      const ptr = this.alloc(bytes);
+      new Uint8Array(this.memory.buffer, ptr, bytes)
+        .set(new Uint8Array(FALLOFF_LUT.buffer, FALLOFF_LUT.byteOffset, bytes));
+      this.exports.set_falloff_lut(ptr);
+    }
   }
 
   /** Offset di un blocco da `size` byte (allineato a 16). @param {number} size */
