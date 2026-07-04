@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fable Paint — test differenziale kernel WebGPU</title>
+<style>
+  body { background: #131418; color: #d8dbe4; font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 0; padding: 16px; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  p { margin: 0 0 12px; color: #8d92a3; }
+  pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .ok { color: #6fd08c; }
+  .fail { color: #ff6b6b; font-weight: bold; }
+</style>
+  <script type="module" crossorigin src="./assets/webgpuTest-CgOl8i5r.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-Dezn_h7o.js">
+  <link rel="modulepreload" crossorigin href="./assets/capsule_int-DfYiQd3u.js">
+  <link rel="modulepreload" crossorigin href="./assets/raster-DbHDoJQ2.js">
+</head>
+<body>
+<h1>Kernel WebGPU dab vs Rasterizer JS</h1>
+<p>Fase 1 del piano WebGPU: contratto bit-exact (docs/webgpu-engine-plan.md). Ricarica per rieseguire.</p>
+<pre id="out">avvio…</pre>
+</body>
+</html>

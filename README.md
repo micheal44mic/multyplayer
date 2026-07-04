@@ -6,15 +6,24 @@ Architecture: passive input ring buffer -> single frame loop -> mathematical pip
 pixel store (256x256 premultiplied RGBA chunks) -> GPU as projector (WebGL, uploading
 only dirty tiles, pan/zoom in the vertex shader).
 
+## LLM UI Performance Rule
+
+Every LLM/agent changing UI must read this before editing styles: keep app
+chrome cheap to composite. Avoid `backdrop-filter`, blur, filters, large
+shadows, animated glow, decorative gradients, or any effect that adds paint or
+compositor work to persistent UI. Prefer flat or lightly transparent solid
+colors, reuse existing toolbar colors, and only add visual polish when it has a
+clear product value and a small performance cost.
+
 ## Start
 
-Use the static server. ES modules do not run from `file://`:
+Use a static server. ES modules do not run from `file://`:
 
 ```bash
-npm start
+npx serve .          # or: python -m http.server 8000
 ```
 
-Then open `http://localhost:8000`.
+Then open `http://localhost:3000`, or the port shown by the server.
 
 ## Release
 
@@ -26,9 +35,9 @@ npm test
 npm run build
 ```
 
-`npm run build` writes the deployable artifact to `dist/` without Vite or any
-bundler. The GitHub Actions workflow in `.github/workflows/deploy.yml` runs
-tests, builds `dist/`, and deploys it to GitHub Pages on pushes to `main`.
+`npm run build` writes the deployable artifact to `dist/`. The GitHub Actions
+workflow in `.github/workflows/deploy.yml` runs tests, builds `dist/`, and
+deploys it to GitHub Pages on pushes to `main`.
 
 To enable GitHub Pages, set the repository Pages source to **GitHub Actions**.
 
@@ -43,6 +52,23 @@ Runtime launch settings live in `config.js`:
 
 Current first-user policy: project saving is manual. Users should press
 **Salva in cartella** or export a `.fablepaint` file before closing the browser.
+
+## AI Fill
+
+The selection AI tool calls Gemini from the local Node server so the API key
+never ships to the browser. Create `.env.local` from `.env.example`:
+
+```bash
+GEMINI_API_KEY=your-key
+GEMINI_IMAGE_MODEL=gemini-2.5-flash-image
+```
+
+Then start with `npm start` or `npm run serve`. The Vite dev server also serves
+`/api/ai/fill` for local development.
+
+The AI Fill panel can choose between Nano Banana (`gemini-2.5-flash-image`),
+Nano Banana 2 (`gemini-3.1-flash-image`), and Nano Banana Pro
+(`gemini-3-pro-image`) per generation.
 
 ## Controls
 

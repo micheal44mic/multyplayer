@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capsule v1 float vs v2 interi — confronto visivo</title>
+<style>
+  body { background: #131418; color: #d8dbe4; font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 0; padding: 16px; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  p { margin: 0 0 14px; color: #8d92a3; max-width: 900px; }
+  .row { margin-bottom: 18px; }
+  .row h2 { font-size: 13px; margin: 0 0 6px; color: #aeb3c2; }
+  .cells { display: flex; gap: 10px; flex-wrap: wrap; }
+  .cell { text-align: center; }
+  .cell span { display: block; margin-top: 4px; color: #8d92a3; font-size: 11px; }
+  canvas { background: #fff; border-radius: 4px; image-rendering: pixelated; }
+</style>
+  <script type="module" crossorigin src="./assets/capsuleCompare-DjDwsy95.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-Dezn_h7o.js">
+  <link rel="modulepreload" crossorigin href="./assets/capsule_int-DfYiQd3u.js">
+</head>
+<body>
+<h1>Capsule: v1 float (vecchio motore) vs v2 interi (atterrata)</h1>
+<p>Stessi tratti, due matematiche. La colonna "diff ×8" amplifica di 8 volte la
+differenza di alpha: quello che vedi lì è ciò che a occhio nudo NON si vede
+(le differenze reali sono ≤ ~32/255, confinate nella banda anti-aliasing).</p>
+<div id="rows"></div>
+</body>
+</html>
