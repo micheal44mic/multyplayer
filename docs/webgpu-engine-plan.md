@@ -134,6 +134,37 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   coda all'encoder del frame. Verificata: miss→HIT pixel identici→miss al
   cambio contenuto→HIT. screenCacheHitThisFrame esposto per il pannello.
 
+- **Perf present + PROXY ZOOM-OUT WEBGPU (FATTI 04/07 pomeriggio)**:
+  (a) CACHE DEI BIND GROUP nel present — prima UN createBindGroup per draw
+  per frame (5120 col profilo ultra): ora riusati tra draw e frame (chiave
+  texture-livello → tratto×sampler, _bgEpoch invalida quando _uniBuf cresce
+  o _bdTex rinasce — i bind group CATTURANO quelle risorse alla creazione),
+  mirror CPU degli uniform riusato, bind del blit mip cacheati per
+  texture+livello. (b) MIP A LIVELLI LIMITATI durante il tratto: a zoom<1 i
+  chunk vivi rigenerano solo ceil(log2(1/s))+2 livelli invece della catena
+  intera (8 blit/chunk/frame); vale per gpu-direct E fallback worker (= il
+  pennello texture misurato su Android); la catena piena si rifà da sola al
+  commit (upload → mips=false). (c) PROXY DEI BOARD WEBGPU
+  (js/board_proxy_wgpu.js, WgpuBoardProxyCache): stessa macchina a stati
+  del proxy GL (board_proxy.js È lo spec — contentKey/budget/hasSvgLayer
+  ora esportati), build in render pass WebGPU nella texture 1024² (catena
+  mip 11 livelli) con le pipeline di parità + varianti rgba8 di
+  screen/add/fsBlend, UN encoder per tick sottomesso prima del present
+  (stessa coda). main.js sceglie la cache dal renderer, startStroke gate
+  esteso, quad disegnati per primi nel primo segmento con sampler
+  trilinear. VERIFICATO nel preview (6 board × 4 layer con testo):
+  liveVisibleChunks 288→48 (solo il board attivo), texCount 288→48, 5
+  proxy pronti, warm-up al click, TRATTO GPU-DIRECT OK con proxy attivi,
+  rebuild su cambio blend mode di un board coperto con serial nuovo nella
+  chiave screen-cache (senza, presenterebbe la cache stantia per sempre),
+  0 errori di validazione. TRAPPOLE PAGATE QUI: il build campiona i chunk
+  a 0.5 con sampler a LOD BLOCCATO (lodMaxClamp:0 = bilinear sul livello 0,
+  media 2×2 esatta — il default con mipmapFilter nearest salta al livello 1
+  stantio); le texture transitorie del build si distruggono DOPO il submit
+  (destroy prima = command buffer invalidato); UN SOLO testo per tick
+  (copyExternalImageToTexture è op di coda: esegue PRIMA dei pass, due
+  upload si sovrascriverebbero).
+
 ## MISURE DAL CAMPO 04/07 (Field/Auto)
 
 - Aggiunto harness nel pannello perf: **Field** manuale e **Auto** sintetico
@@ -163,24 +194,23 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
 
 ## PROSSIMI PASSI (in ordine)
 
-1. **Proxy zoom-out o equivalente** (ultimo pezzo per togliere il flag):
-   oggi null sotto wgpu (come sotto 2D). Con mip + screen-cache restano
-   coperti qualità e frame fermi; il costo scoperto è il PAN/ZOOM con
-   decine di board. Le misure 04/07 lo rendono P0: senza proxy/flatten il
-   WebGPU present crolla su 16 canvas/1.25GiB e lagga già durante stroke
-   perché presenta centinaia di chunk vivi. Port del bake proxy (oggi
-   accoppiato al GL) o equivalente wgpu-nativo; in fase 2.3 (layer
-   GPU-residenti) diventa quasi gratis (flatten del board = un pass). Poi
+1. **RITEST Auto v5 sul campo** (desktop/Android ultra 16c, iPhone profilo
+   iOS) con proxy + cache bind group + mip limitati: target p95 stroke ≤
+   16.7ms, liveVisibleChunks limitato (~chunk del board attivo + quad),
+   pan/zoom senza frame multi-secondo. HTTPS Cloudflare o proxy LAN 8443;
+   sul telefono aprire UNA volta ?renderer=wgpu (poi persiste). Poi
    giudizio visivo umano complessivo e via il flag.
-2. **Misure dal campo**: pannello perf (riga GPU tratto) su desktop a mano
-   e telefoni via HTTPS LAN (proxy scratchpad su 8443 → 8002, cert 30gg;
-   navigator.gpu/SAB SOLO in contesto sicuro; sul telefono aprire UNA volta
-   ?renderer=wgpu — da lì il flag persiste). I numeri del preview in
-   background sono gonfiati dalla pompa (land max 199ms non è reale).
-3. **Fase 2.3 — layer GPU-residenti**: commit come compute sul device
+2. **Tier memoria/dispositivo** per l'harness: cap del profilo generato su
+   iOS/mobile (report targetPixelBytes/estimatedPaintBytes già esposti).
+3. **Pennello texture su GPU** (P1, dopo che il present regge): il gate del
+   ponte esclude snap.tex — lo spec bit-exact esiste già (capsule_tex_int
+   JS+wasm), va portato in WGSL con l'atlas per hash. Poi selezione
+   (maschera come texture read-only); aqua per ULTIMO (campiona il
+   documento sotto il tratto, che vive sul main: divergenza facile).
+4. **Fase 2.3 — layer GPU-residenti**: commit come compute sul device
    (texture di layer possedute dalla GPU), undo 2-tier (riferimento: editor
    cbos), export/fill/selezioni via mapAsync. Poi sfumino/liquify sullo
-   stesso stato (fase 3).
+   stesso stato (fase 3). Qui il flatten del board diventa quasi gratis.
 
 ## NOTE DELLA REVIEW 03/07 (hardening, non urgenti)
 
@@ -189,8 +219,8 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   SIZE_MAX=2000 → r=1000: ~30% di margine. Se mai una dinamica/jitter può
   superare r~1300, JS (f64 esatto) DIVERGE da wasm/WGSL (wrap): clampare il
   raggio in capsuleIntParams o alzare lo split.
-- renderer_wgpu: createBindGroup per draw per frame + ArrayBuffer uniform
-  ricreato — churn da sistemare con la parità feature (cache per texture).
+- ~~renderer_wgpu: createBindGroup per draw per frame + ArrayBuffer uniform
+  ricreato~~ — FATTO 04/07 (cache con epoch, vedi sopra).
 - Il path sendEntries→record del ponte non ha test permanente (kernel e
   spec sì): la verifica è il confronto firme nel preview.
 

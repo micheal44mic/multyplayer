@@ -6,11 +6,11 @@
 // matematica di commitChunk / _drawPaintLive del renderer 2D: tratto over
 // chunk nello scratch, poi × opacità del livello) e la gomma il
 // destination-out — entrambi nel fragment shader, niente scratch.
-// v0 NON copre (warn una volta, dietro flag): gruppi di ritaglio (disegna la
-// sola base), blend mode ≠ normal (resi come normal), sessioni
-// Trasforma/Effetti, quad testo/svg, proxy zoom-out (main li gate su
-// GLRenderer: qui sono null e si va per-chunk). L'init del device è ASINCRONO
-// e va fatto PRIMA di new App: WgpuRenderer.preinit() + available.
+// Parità raggiunta: gruppi di ritaglio, blend mode, sessioni Trasforma/
+// Effetti, quad testo/svg, screen-cache, mipmap e proxy zoom-out dei board
+// (board_proxy_wgpu.js: quad piatti in proxies.quads, layer coperti in
+// proxies.skip). L'init del device è ASINCRONO e va fatto PRIMA di new App:
+// WgpuRenderer.preinit() + available.
 
 import { CHUNK } from './store.js';
 import { acquireWgpuDevice, onWgpuDeviceLost } from './wgpu_device.js';
@@ -125,8 +125,9 @@ fn fsBlend(in: VOut) -> @location(0) vec4<f32> {
 }
 `;
 
-// indici di blendFn nel WGSL (i 6 modi non esprimibili nel blending fisso)
-const SHADER_MODE_IDX = /** @type {Record<string, number>} */ ({
+// indici di blendFn nel WGSL (i 6 modi non esprimibili nel blending fisso);
+// esportati: il proxy dei board (board_proxy_wgpu.js) compone con gli stessi
+export const SHADER_MODE_IDX = /** @type {Record<string, number>} */ ({
   multiply: 0, overlay: 1, softlight: 2, darken: 3, lighten: 4, difference: 5,
 });
 
@@ -229,6 +230,9 @@ export class WgpuRenderer {
     /** @type {any} */ this._pipeScreen = null;
     /** @type {any} */ this._pipeAdd = null;
     /** @type {any} */ this._pipeBlend = null;
+    /** @type {any} */ this._pipeScreenR8 = null;
+    /** @type {any} */ this._pipeAddR8 = null;
+    /** @type {any} */ this._pipeBlendR8 = null;
     /** @type {any} */ this._bdTex = null; // backdrop dei modi shader
     // sessioni Sposta/Trasforma ed Effetti: i BAKE (canvas piatto, warp a
     // triangoli, effetto CPU) sono quelli del renderer 2D — un'istanza
@@ -304,6 +308,17 @@ export class WgpuRenderer {
       });
       // modi shader: formula W3C col backdrop, blending SPENTO
       this._pipeBlend = makePipe(this._format, undefined, 'fsBlend');
+      // varianti rgba8 dei modi: il build del proxy dei board compone in una
+      // texture 1024² (non nel formato del canvas, che può essere bgra8)
+      this._pipeScreenR8 = makePipe('rgba8unorm', {
+        color: { srcFactor: 'one', dstFactor: 'one-minus-src' },
+        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      });
+      this._pipeAddR8 = makePipe('rgba8unorm', {
+        color: { srcFactor: 'one', dstFactor: 'one' },
+        alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+      });
+      this._pipeBlendR8 = makePipe('rgba8unorm', undefined, 'fsBlend');
       this._sampler = this.device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
       this._samplerNearest = this.device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' });
       // minificazione (zoom<1): trilinear sui mip — il LINEAR_MIPMAP_LINEAR
@@ -482,6 +497,31 @@ export class WgpuRenderer {
       m.set(key, e);
     }
     return e.bind;
+  }
+
+  /** Texture di un chunk (o undefined): il proxy dei board la usa per
+   * warm-up e build. @param {Chunk} chunk */
+  texOf(chunk) { return this._tex.get(chunk); }
+
+  /** Rigenera i primi lv livelli della catena mip di una texture nel command
+   * encoder dato (un blit per livello, media 2×2); lv assente = catena intera.
+   * @param {any} enc @param {any} tex @param {number} [lv] */
+  encodeMips(enc, tex, lv) {
+    const v = this._viewsOf(tex);
+    const n = Math.min(lv ?? v.level.length, v.level.length);
+    for (let l = 1; l < n; l++) {
+      const mp = enc.beginRenderPass({
+        colorAttachments: [{
+          view: v.level[l],
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: 'clear', storeOp: 'store',
+        }],
+      });
+      mp.setPipeline(this._mipPipeline);
+      mp.setBindGroup(0, this._mipBindOf(tex, l));
+      mp.draw(3);
+      mp.end();
+    }
   }
 
   /** @param {Chunk} chunk */
@@ -833,6 +873,19 @@ export class WgpuRenderer {
       }
     };
 
+    // quad dei board proxati, per primi (i board non si sovrappongono:
+    // ordine libero, come il GL); trilinear sempre — il proxy ha la catena
+    // mip completa e sotto zoom 0.5 minifica
+    if (proxies) {
+      for (const q of proxies.quads) {
+        sink.push({
+          lt: q.tex, st: null,
+          x0: Math.round(q.x * s + tx), y0: Math.round(q.y * s + ty),
+          x1: Math.round((q.x + q.w) * s + tx), y1: Math.round((q.y + q.h) * s + ty),
+          mode: 0, a: 1, samp: this._samplerMip,
+        });
+      }
+    }
     const skip = proxies ? proxies.skip : null;
     for (let i = 0; i < layers.length; i++) {
       const layer = layers[i];
@@ -1003,23 +1056,7 @@ export class WgpuRenderer {
     }
     // rigenerazione mip: un blit per livello, ogni livello media 2×2 il
     // precedente (dopo le copie arena: il livello 0 è quello del frame)
-    for (const g of mipGen) {
-      const v = this._viewsOf(g.tex);
-      const n = Math.min(g.lv, v.level.length);
-      for (let l = 1; l < n; l++) {
-        const mp = enc.beginRenderPass({
-          colorAttachments: [{
-            view: v.level[l],
-            clearValue: { r: 0, g: 0, b: 0, a: 0 },
-            loadOp: 'clear', storeOp: 'store',
-          }],
-        });
-        mp.setPipeline(this._mipPipeline);
-        mp.setBindGroup(0, this._mipBindOf(g.tex, l));
-        mp.draw(3);
-        mp.end();
-      }
-    }
+    for (const g of mipGen) this.encodeMips(enc, g.tex, g.lv);
     // i draw di un segmento nel pass corrente (pipeline per-draw: i figli
     // clippati usano il blend DST_ALPHA — colore sostituito, forma della base)
     const drawList = (/** @type {any} */ pass, /** @type {Draw[]} */ list,
@@ -1128,7 +1165,10 @@ export class WgpuRenderer {
       svgQuads ? (svgQuads.cacheSerial || 0) : 0,
     ];
     if (proxies) {
-      parts.push(proxies.quads.length, proxies.skip.size);
+      // serial: bumpato dal proxy a ogni build completata — senza, un proxy
+      // ricostruito a chiave ferma presenterebbe per sempre la cache stantia
+      parts.push(proxies.quads.length, proxies.skip.size,
+        proxies.serial || 0, proxies.loading.size);
       for (const id of proxies.skip) parts.push(id);
     } else {
       parts.push(0, 0);

@@ -28,6 +28,7 @@ import { FxTool } from './fx_ui.js';
 import { LayerStyleTool } from './layer_style_ui.js';
 import { FillUI } from './fill_ui.js';
 import { BoardProxyCache } from './board_proxy.js';
+import { WgpuBoardProxyCache } from './board_proxy_wgpu.js';
 import { TextQuadCache } from './text_quad.js';
 import { SvgQuadCache } from './svg_quad.js';
 import { WasmHeap } from './wasm_core.js';
@@ -163,8 +164,10 @@ export class App {
 
     this.planes = new Planes(this.planesEl, this.gridEl, this.boardsEl);
     // zoom-out: i board non attivi diventano UN quad con texture piatta
-    // 1024² (build GPU a budget), invece di un draw+texture per chunk
-    this.proxy = new BoardProxyCache();
+    // 1024² (build GPU a budget), invece di un draw+texture per chunk;
+    // la variante segue il bottom renderer (stessa macchina a stati)
+    this.proxy = renderer instanceof WgpuRenderer
+      ? new WgpuBoardProxyCache() : new BoardProxyCache();
     // vettori non in editing: cotti in texture e disegnati DENTRO la pila del
     // renderer (i run raster non si spezzano più sui piani DOM); il piano SVG
     // vivo resta solo per il layer vettoriale attivo.
@@ -1599,7 +1602,8 @@ export class App {
     }
     // appena selezionato e ancora in caricamento: il tratto partirebbe
     // alla cieca sotto il quad del proxy
-    if (this.renderer instanceof GLRenderer && this.proxy.isLoading(board.id)) return;
+    if ((this.renderer instanceof GLRenderer || this.renderer instanceof WgpuRenderer) &&
+      this.proxy.isLoading(board.id)) return;
     // un undo/redo collaborativo è in applicazione (asincrono): i suoi tile
     // stanno venendo scambiati, niente tratti sotto
     if (this.collab.applying) return;
@@ -2298,13 +2302,16 @@ export class App {
     const snap = this.curRaster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
-    // proxy dei board per lo zoom-out (solo WebGL): quad piatti al posto dei
-    // chunk per i board non attivi. Durante un tratto la build resta ferma.
+    // proxy dei board per lo zoom-out (WebGL e WebGPU, ognuno con la sua
+    // cache): quad piatti al posto dei chunk per i board non attivi.
+    // Durante un tratto la build resta ferma.
     const tProxy0 = performance.now();
     const androidBoostActive = this.isAndroid && t0 < this._androidBoostUntil;
-    const proxies = this.renderer instanceof GLRenderer && this.renderer.ok
-      ? this.proxy.update(this.renderer, this.boards, activeBoardIdForRender,
-        this.camera, !strokePriority && !androidBoostActive, this.planes)
+    const proxies = (this.renderer instanceof GLRenderer || this.renderer instanceof WgpuRenderer) &&
+      this.renderer.ok
+      ? this.proxy.update(/** @type {any} */ (this.renderer), this.boards,
+        activeBoardIdForRender, this.camera,
+        !strokePriority && !androidBoostActive, this.planes)
       : null;
     const tProxy1 = performance.now();
     // Solo il vettore attivo resta SVG vivo: pannelli/gizmo lo editano puro.

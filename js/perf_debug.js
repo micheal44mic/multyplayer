@@ -661,26 +661,30 @@ export class PerfDebugConsole {
     const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
     const ua = navigator.userAgent || '';
     const mem = navigator.deviceMemory || 8;
-    const ios = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+    const iphone = /iPhone|iPod/i.test(ua);
+    const ipad = /iPad/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+    const ios = iphone || ipad;
     const mobile = coarse || /Android|iPhone|iPad|iPod/i.test(ua);
     const capped = mem > 0 && mem <= 4;
-    const boardTarget = ios ? 12 : 16;
-    const paintedLayers = ios ? 4 : 5;
+    const boardTarget = iphone ? 6 : ipad ? 8 : 16;
+    const paintedLayers = ios ? 3 : 5;
     const targetPixelBytes = boardTarget * paintedLayers * 64 * CHUNK_BYTES;
     return {
       seed: 0xFABA11,
-      profile: ios ? 'ios-limit-12c-0p75g-v1' : 'ultra-16c-1p2g-v1',
+      profile: iphone ? 'iphone-safe-6c-0p28g-v1' :
+        ipad ? 'ipad-safe-8c-0p38g-v1' : 'ultra-16c-1p2g-v1',
       deviceClass: ios ? 'ios' : mobile ? 'mobile' : 'desktop',
       boardTarget,
-      rasterLayers: ios ? 7 : 8,
+      rasterLayers: ios ? 5 : 8,
       paintedLayers,
-      textLayers: mobile || capped ? 2 : 3,
+      textLayers: ios ? 1 : mobile || capped ? 2 : 3,
       // 2048x2048 board = 8x8 chunks. Desktop/Android stress keeps the full
-      // 16c/1.25GiB target; iOS uses the highest current non-crash probe.
+      // 16c/1.25GiB target; iPhone stays below the crash threshold seen on
+      // Safari/WebGPU, where proxy/mip/upload peaks add a lot above pixels.
       chunksPerLayer: 64,
-      marksPerChunk: mobile || capped ? 8 : 10,
-      brushSize: mobile || capped ? 240 : 320,
-      strokeSamplesPerTick: mobile || capped ? 3 : 4,
+      marksPerChunk: ios ? 6 : mobile || capped ? 8 : 10,
+      brushSize: iphone ? 180 : mobile || capped ? 240 : 320,
+      strokeSamplesPerTick: ios ? 2 : mobile || capped ? 3 : 4,
       targetPixelBytes,
       strokeZoomFit: 0.88,
       textureScale: 0.42,
@@ -1521,7 +1525,7 @@ export class PerfDebugConsole {
     const hasGpuRenderer = hasGl || renderer.kind === 'WebGPU';
     const canvasBackbufferBytes = (app.canvas?.width || 0) * (app.canvas?.height || 0) * 4;
     const gpuChunkBytes = hasGpuRenderer ? (renderer.texCount || 0) * CHUNK_BYTES : 0;
-    const gpuProxyBytes = hasGl ? (proxy.proxyBytes || 0) : 0;
+    const gpuProxyBytes = hasGpuRenderer ? (proxy.proxyBytes || 0) : 0;
     const gpuTextBytes = hasGl ? textQuadBytes : 0;
     const gpuScratchBytes = hasGpuRenderer ? this._rendererScratchBytes(renderer) : 0;
     const gpuEstimateBytes = hasGpuRenderer
