@@ -39,6 +39,13 @@ import { SHADER_MODE_IDX } from './renderer_wgpu.js';
 
 const PROXY_MIPS = 11;   // 1024 -> 1
 const UNI_SLOTS = 64;    // fette uniform da 256B per tick (draw ≤ budget+1)
+// Il tick (warm + build) deve stare sotto questo tempo anche su mobile: sul
+// profilo ultra Android era il build stesso — upload da 256KB/chunk più i
+// pass — a rubare i frame di pan/zoom/idle, non il present dei chunk vivi.
+const TICK_TARGET_MS = 3;
+// un chunk da RICARICARE (writeTexture 256KB) pesa come UPLOAD_COST draw di
+// una texture già in VRAM
+const UPLOAD_COST = 3;
 
 /**
  * @typedef {Object} Entry
@@ -81,6 +88,11 @@ export class WgpuBoardProxyCache {
     this._warmLeft = 0;
     this._wantMips = false;
     this._serial = 0;   // build completate: entra nella chiave screen-cache
+    // budget adattivo moltiplicativo (stesso pattern del raster): scala
+    // 0.12..1 su BUILD_BUDGET e WARM_BUDGET, guidata dai ms misurati dei
+    // tick che hanno lavorato davvero
+    this._budgetScale = 1;
+    this._work = 0;     // unità di lavoro del tick corrente (draw+upload)
     this._rectTmp = { x0: 0, y0: 0, x1: 0, y1: 0 };
     // raster del documento testo nel build: canvas scratch + texture riusati
     /** @type {HTMLCanvasElement|null} */
@@ -104,6 +116,8 @@ export class WgpuBoardProxyCache {
    * @returns {ProxyFrame}
    */
   update(renderer, boards, activeBoardId, camera, allowBuild, planes = null) {
+    const t0 = performance.now();
+    this._work = 0;
     const out = this._out;
     out.quads.length = 0;
     out.skip.clear();
@@ -126,7 +140,7 @@ export class WgpuBoardProxyCache {
       this._dev = dev;
     }
 
-    this._warmLeft = WARM_BUDGET;
+    this._warmLeft = Math.max(6, Math.round(WARM_BUDGET * this._budgetScale));
     this._wantMips = camera.zoom < 1;
     this._seen.clear();
     /** @type {{board: Board, key: number}|null} */
@@ -176,14 +190,25 @@ export class WgpuBoardProxyCache {
         if (visible(b) && visibleCandidate === null) visibleCandidate = c;
         else if (fallbackCandidate === null) fallbackCandidate = c;
       }
+      if (!e.ready || e.key !== key) {
+        // UX prima del risparmio: finché il proxy corrente non è pronto,
+        // l'artboard resta live. Il quad bianco "loading" faceva sparire i
+        // canvas su mobile e rendeva il documento invendibile.
+        if (e.covering) {
+          e.covering = false;
+          e.warmDone = 0;
+          this._serial++;
+        }
+        out.loading.set(b.id, 0);
+        continue;
+      }
       if (!e.covering) {
         e.covering = true;
         e.warmDone = 0;
         this._dropChunkTex(renderer, planes, b);
       }
       for (const l of b.mgr.layers) out.skip.add(l.id);
-      if (e.ready) this._pushQuad(out, b, e);
-      if (!e.ready || e.key !== key) out.loading.set(b.id, 0);
+      this._pushQuad(out, b, e);
     }
 
     // board spariti (clearAll): via texture e entry
@@ -205,6 +230,16 @@ export class WgpuBoardProxyCache {
     if (this._transient.length > 0) {
       for (const c of this._transient) renderer.disposeChunkTex(c);
       this._transient.length = 0;
+    }
+    // adattamento del budget: solo sui tick che hanno lavorato (gli altri
+    // non dicono niente sul costo); sforo → si stringe, margine → riallarga
+    if (this._work > 0) {
+      const ms = performance.now() - t0;
+      if (ms > TICK_TARGET_MS) {
+        this._budgetScale = Math.max(0.12, this._budgetScale * 0.85);
+      } else if (ms < TICK_TARGET_MS * 0.5) {
+        this._budgetScale = Math.min(1, this._budgetScale * 1.15);
+      }
     }
     out.serial = this._serial;
     return out;
@@ -254,6 +289,7 @@ export class WgpuBoardProxyCache {
       // la catena mip pesa ~1/3 in più del livello 0
       proxyBytes: Math.round(proxyTextures * PROXY_SIZE * PROXY_SIZE * 4 * 4 / 3),
       buildingBoardId: this._build ? this._build.boardId : 0,
+      buildScale: +this._budgetScale.toFixed(3),
     };
   }
 
@@ -324,6 +360,7 @@ export class WgpuBoardProxyCache {
         if (renderer.texOf(c) && !c.texDirty) continue;
         if (this._warmLeft > 0) {
           this._warmLeft--;
+          this._work += UPLOAD_COST + 1;
           renderer._uploadNow(c);
           if (this._wantMips) {
             renderer.encodeMips(this._encoder(renderer), renderer.texOf(c));
@@ -447,7 +484,8 @@ export class WgpuBoardProxyCache {
       passOn(e.tex, true);
     }
 
-    let budget = BUILD_BUDGET;
+    const budget0 = Math.max(TEXT_COST, Math.round(BUILD_BUDGET * this._budgetScale));
+    let budget = budget0;
     let txtUsed = false;
     while (budget > 0 && drawIdx < UNI_SLOTS - 1) {
       // gruppo finito: lo scratch si composita nel proxy come UN quad,
@@ -522,7 +560,10 @@ export class WgpuBoardProxyCache {
       const c = bld.chunks[bld.ci++];
       if (!layer.store.map.has(c.key)) continue; // rilasciato nel frattempo
       const created = !renderer.texOf(c) || c.texDirty;
-      if (created) renderer._uploadNow(c);
+      if (created) {
+        renderer._uploadNow(c);
+        budget -= UPLOAD_COST; // il writeTexture da 256KB È il costo vero
+      }
       const ctex = renderer.texOf(c);
       const x = (c.cx * CHUNK - b.x) * sx, y = (c.cy * CHUNK - b.y) * sy;
       const w = CHUNK * sx, h = CHUNK * sy;
@@ -560,6 +601,7 @@ export class WgpuBoardProxyCache {
       if (created && e.covering) this._transient.push(c);
     }
     endPass();
+    this._work += budget0 - Math.min(budget0, Math.max(0, budget));
     // gli uniform delle fette usate atterrano in coda PRIMA del submit
     // dell'encoder (le op di coda eseguono in ordine di emissione)
     if (drawIdx > 0) {

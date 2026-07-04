@@ -11,6 +11,9 @@ const PRINT_COOLDOWN_MS = 250;
 const DOCK_REFRESH_MS = 500;
 const UA_MEMORY_REFRESH_MS = 10000;
 const MB = 1024 * 1024;
+const AUTO_PRELOAD_MAX_MS = 60000;
+const AUTO_PRELOAD_STABLE_FRAMES = 8;
+const AUTO_LAYER_PREFIX = 'Auto Test - ';
 const FIELD_PHASES = [
   {
     id: 'ready',
@@ -444,8 +447,7 @@ export class PerfDebugConsole {
     let automation;
     try {
       automation = this._prepareAutoFieldScene();
-      await nextFrame();
-      await nextFrame();
+      await this._preloadAutoFieldScene(automation, token);
       if (!this._autoStarting || token !== this._autoStartToken) {
         this._restoreAutoFieldState(automation);
         return;
@@ -500,6 +502,80 @@ export class PerfDebugConsole {
       automation: this._autoFieldReport(automation),
     });
     this._fieldTick();
+  }
+
+  async _preloadAutoFieldScene(automation, token) {
+    const app = this.app;
+    const startedAt = performance.now();
+    const expectedProxies = Math.max(0, (automation?.boards?.length || 1) - 1);
+    const prevForceProxyBuild = app._forceProxyBuild;
+    let frames = 0;
+    let stable = 0;
+    let last = null;
+    app._forceProxyBuild = true;
+    try {
+      while (performance.now() - startedAt < AUTO_PRELOAD_MAX_MS) {
+        if (!this._autoStarting || token !== this._autoStartToken) break;
+        app.requestFrame();
+        await nextFrame();
+        frames++;
+        const diag = this._diagnostics(null);
+        const proxy = diag.proxy || {};
+        const proxyBusy = (proxy.loadingProxies || 0) > 0 ||
+          (proxy.buildingBoardId || 0) !== 0 ||
+          !!app.proxy?.needsFrame?.();
+        const bakeBusy = (app.textQuads?.bakedThisFrame || 0) > 0 ||
+          (app.svgQuads?.bakedThisFrame || 0) > 0 ||
+          !!app.svgQuads?.needsFrame?.();
+        const uploadBusy = (app.renderer?.uploadsThisFrame || 0) > 0;
+        const readyEnough = (proxy.readyProxies || 0) >= expectedProxies;
+        last = {
+          frames,
+          elapsedMs: round(performance.now() - startedAt),
+          expectedProxies,
+          readyProxies: proxy.readyProxies || 0,
+          loadingProxies: proxy.loadingProxies || 0,
+          buildingBoardId: proxy.buildingBoardId || 0,
+          buildScale: proxy.buildScale || 0,
+          rendererTextures: diag.rendererTextures || 0,
+          uploads: app.renderer?.uploadsThisFrame || 0,
+          textBakes: app.textQuads?.bakedThisFrame || 0,
+          svgBakes: app.svgQuads?.bakedThisFrame || 0,
+        };
+        if (!proxyBusy && !bakeBusy && !uploadBusy && readyEnough) stable++;
+        else stable = 0;
+        if (frames % 20 === 0 || stable > 0) {
+          this._setFieldMessage(
+            'Auto preload',
+            `Carico canvas/layer/proxy prima della misura: proxy ${last.readyProxies}/${expectedProxies}, ` +
+              `loading ${last.loadingProxies}, stable ${stable}/${AUTO_PRELOAD_STABLE_FRAMES}.`,
+            '',
+          );
+        }
+        if (stable >= AUTO_PRELOAD_STABLE_FRAMES) break;
+      }
+    } finally {
+      app._forceProxyBuild = prevForceProxyBuild;
+    }
+    if (automation?.stats) {
+      automation.stats.preload = {
+        ...(last || {
+          frames,
+          elapsedMs: round(performance.now() - startedAt),
+          expectedProxies,
+          readyProxies: 0,
+          loadingProxies: 0,
+          buildingBoardId: 0,
+          buildScale: 0,
+          rendererTextures: 0,
+          uploads: 0,
+          textBakes: 0,
+          svgBakes: 0,
+        }),
+        stableFrames: stable,
+        complete: stable >= AUTO_PRELOAD_STABLE_FRAMES,
+      };
+    }
   }
 
   _fieldTick() {
@@ -663,25 +739,51 @@ export class PerfDebugConsole {
     const mem = navigator.deviceMemory || 8;
     const iphone = /iPhone|iPod/i.test(ua);
     const ipad = /iPad/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
+    const android = /Android/i.test(ua);
     const ios = iphone || ipad;
     const mobile = coarse || /Android|iPhone|iPad|iPod/i.test(ua);
     const capped = mem > 0 && mem <= 4;
-    const boardTarget = iphone ? 6 : ipad ? 8 : 16;
-    const paintedLayers = ios ? 3 : 5;
-    const targetPixelBytes = boardTarget * paintedLayers * 64 * CHUNK_BYTES;
+    let stress = '';
+    try { stress = (new URLSearchParams(location.search).get('stress') || '').toLowerCase(); } catch { /* ignore */ }
+    const forceUltra = stress === 'ultra';
+    let profile = 'ultra-16c-1p2g-v1';
+    let boardTarget = 16;
+    let rasterLayers = 8;
+    let paintedLayers = 5;
+    let textLayers = mobile || capped ? 2 : 3;
+    if (iphone) {
+      profile = 'iphone-safe-6c-0p28g-v1';
+      boardTarget = 6;
+      rasterLayers = 5;
+      paintedLayers = 3;
+      textLayers = 1;
+    } else if (ipad) {
+      profile = 'ipad-safe-8c-0p38g-v1';
+      boardTarget = 8;
+      rasterLayers = 5;
+      paintedLayers = 3;
+      textLayers = 1;
+    } else if (android && !forceUltra) {
+      profile = capped ? 'android-safe-8c-0p38g-v2' : 'android-heavy-10c-0p64g-v2';
+      boardTarget = capped ? 8 : 10;
+      rasterLayers = capped ? 5 : 6;
+      paintedLayers = capped ? 3 : 4;
+      textLayers = capped ? 1 : 2;
+    }
+    const chunksPerLayer = 64;
+    const targetPixelBytes = boardTarget * paintedLayers * chunksPerLayer * CHUNK_BYTES;
     return {
       seed: 0xFABA11,
-      profile: iphone ? 'iphone-safe-6c-0p28g-v1' :
-        ipad ? 'ipad-safe-8c-0p38g-v1' : 'ultra-16c-1p2g-v1',
-      deviceClass: ios ? 'ios' : mobile ? 'mobile' : 'desktop',
+      profile,
+      deviceClass: ios ? 'ios' : android ? 'android' : mobile ? 'mobile' : 'desktop',
       boardTarget,
-      rasterLayers: ios ? 5 : 8,
+      rasterLayers,
       paintedLayers,
-      textLayers: ios ? 1 : mobile || capped ? 2 : 3,
-      // 2048x2048 board = 8x8 chunks. Desktop/Android stress keeps the full
-      // 16c/1.25GiB target; iPhone stays below the crash threshold seen on
-      // Safari/WebGPU, where proxy/mip/upload peaks add a lot above pixels.
-      chunksPerLayer: 64,
+      textLayers,
+      // 2048x2048 board = 8x8 chunks. Desktop keeps the full 16c/1.25GiB
+      // target; Android defaults to a heavy but preloadable profile. Use
+      // ?stress=ultra to force the original 16-board limit test on non-iOS.
+      chunksPerLayer,
       marksPerChunk: ios ? 6 : mobile || capped ? 8 : 10,
       brushSize: iphone ? 180 : mobile || capped ? 240 : 320,
       strokeSamplesPerTick: ios ? 2 : mobile || capped ? 3 : 4,
@@ -697,10 +799,13 @@ export class PerfDebugConsole {
 
   _prepareAutoFieldScene() {
     const app = this.app;
+    const cleanup = this._cleanupAutoFieldArtifacts();
     const opts = this._autoFieldOptions();
+    const createdBoardIds = [];
     const stats = {
       opts,
       boardsBefore: app.boards.boards.length,
+      cleanup,
       boardsUsed: 0,
       boardsAdded: 0,
       rasterLayersAdded: 0,
@@ -721,10 +826,10 @@ export class PerfDebugConsole {
       startedStrokeMode: '',
     };
     while (app.boards.boards.length < opts.boardTarget && app.boards.canAdd) {
-      const before = app.boards.boards.length;
-      app.addBoard();
-      if (app.boards.boards.length > before) stats.boardsAdded++;
-      else break;
+      const board = app.addBoard();
+      if (!board) break;
+      createdBoardIds.push(board.id);
+      stats.boardsAdded++;
     }
     const boards = app.boards.boards.slice(0, Math.max(1, Math.min(opts.boardTarget, app.boards.boards.length)));
     stats.boardsUsed = boards.length;
@@ -758,6 +863,7 @@ export class PerfDebugConsole {
       boards,
       strokeBoardId: strokeBoard.id,
       strokeLayerId: strokeLayer.id,
+      createdBoardIds,
       strokeActive: false,
       strokeDone: false,
       strokeP: 0,
@@ -1090,6 +1196,63 @@ export class PerfDebugConsole {
     auto.restored = true;
     this._restoreBrushState(auto.brushSnapshot);
     this._restoreSelectionState(auto.selectionSnapshot);
+    auto.stats.cleanupAfter = this._cleanupAutoFieldArtifacts(auto.createdBoardIds);
+  }
+
+  _cleanupAutoFieldArtifacts(createdBoardIds = null) {
+    const app = this.app;
+    const removeBoards = createdBoardIds ? new Set(createdBoardIds) : null;
+    const out = { boardsRemoved: 0, layersRemoved: 0, chunksRemoved: 0 };
+    let changed = false;
+    for (let bi = app.boards.boards.length - 1; bi >= 0; bi--) {
+      const board = app.boards.boards[bi];
+      if (removeBoards && removeBoards.has(board.id)) {
+        for (const layer of board.mgr.layers) {
+          if (layer.store) out.chunksRemoved += layer.store.map?.size || 0;
+          app._destroyOwnedLayer?.(layer);
+          out.layersRemoved++;
+        }
+        board.mgr.layers.length = 0;
+        app.boards.boards.splice(bi, 1);
+        out.boardsRemoved++;
+        changed = true;
+        continue;
+      }
+      for (const layer of [...board.mgr.layers]) {
+        if (!String(layer.name || '').startsWith(AUTO_LAYER_PREFIX)) continue;
+        const detached = board.mgr.detach(layer.id);
+        const owned = detached?.layer || layer;
+        if (owned.store) out.chunksRemoved += owned.store.map?.size || 0;
+        app._destroyOwnedLayer?.(owned);
+        out.layersRemoved++;
+        changed = true;
+      }
+      if (board.mgr.layers.length === 0) {
+        const first = makeRasterLayer('Layer 1', app.heap);
+        board.mgr.insert(first);
+        app._allStores.add(first.store);
+        changed = true;
+      }
+    }
+    if (app.boards.boards.length === 0) {
+      const board = app.boards.add('Canvas 1');
+      const first = makeRasterLayer('Layer 1', app.heap);
+      board.mgr.insert(first);
+      app._allStores.add(first.store);
+      changed = true;
+    }
+    if (!app.boards.byId(app.boards.activeId)) {
+      app.boards.activeId = app.boards.boards[0]?.id || 0;
+      changed = true;
+    }
+    if (changed) {
+      app.boards.bump();
+      app.planes.invalidate();
+      app.ui?.layersUI?.sync(true);
+      app.ui?.layersUI?.scheduleThumbs();
+      app.requestFrame();
+    }
+    return out;
   }
 
   _autoFieldReport(auto) {
@@ -1131,7 +1294,7 @@ export class PerfDebugConsole {
       }));
     return {
       type: 'fable-paint-field-test',
-      version: 5,
+      version: 7,
       mode: run.mode || 'manual',
       cancelled: run.cancelled,
       createdAt: nowIso(),

@@ -192,14 +192,30 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   collo di bottiglia urgente non è solo il pennello: sotto WebGPU manca un
   proxy/flatten/LOD per non presentare migliaia di texture chunk vive.
 
+## RITEST 04/07 SERA + SCHEDULING MOBILE DEL PROXY
+
+- Ritest campo dopo proxy+cache+mip: iPhone profilo iOS PASSA; Android
+  ultra senza più frame multi-secondo e stroke texture buono, MA
+  pan/zoom/idle ancora lenti per PROXY-BUILD/WARM-UP (upload 256KB/chunk ×
+  48 per tick), non più per live-chunk-render.
+- Fix (FATTI 04/07 sera, verificati nel preview): (a) BUDGET ADATTIVO del
+  tick proxy (moltiplicativo 0.85/1.15 sul TICK_TARGET_MS=3, scala
+  0.12..1 su BUILD_BUDGET e WARM_BUDGET, floor 8/6 — adattato SOLO sui
+  tick che hanno lavorato; buildScale esposto in stats); (b) UPLOAD
+  PESATI: un chunk da ricaricare costa 4 (writeTexture 256KB È il costo),
+  uno in VRAM 1; (c) PAUSA BUILD DURANTE PAN/ZOOM (main.js: firma camera
+  x/y/zoom, 150ms di coda dopo l'ultimo movimento → allowBuild=false; il
+  warm-up del board attivo continua — blocca il disegno, non il gesto).
+  Verifica: rebuild ferma con camera in moto continuo (serial fermo,
+  loading segnalato), riparte e completa a camera ferma, 0 errori.
+
 ## PROSSIMI PASSI (in ordine)
 
-1. **RITEST Auto v5 sul campo** (desktop/Android ultra 16c, iPhone profilo
-   iOS) con proxy + cache bind group + mip limitati: target p95 stroke ≤
-   16.7ms, liveVisibleChunks limitato (~chunk del board attivo + quad),
-   pan/zoom senza frame multi-secondo. HTTPS Cloudflare o proxy LAN 8443;
-   sul telefono aprire UNA volta ?renderer=wgpu (poi persiste). Poi
-   giudizio visivo umano complessivo e via il flag.
+1. **RITEST Auto v5 sul campo** (Android ultra 16c in particolare:
+   pan/zoom/idle dopo lo scheduling adattivo; iPhone già ok): target p95
+   stroke ≤ 16.7ms, pan/zoom senza sforamenti da build. HTTPS Cloudflare o
+   proxy LAN 8443; sul telefono aprire UNA volta ?renderer=wgpu (poi
+   persiste). Poi giudizio visivo umano complessivo e via il flag.
 2. **Tier memoria/dispositivo** per l'harness: cap del profilo generato su
    iOS/mobile (report targetPixelBytes/estimatedPaintBytes già esposti).
 3. **Pennello texture su GPU** (P1, dopo che il present regge): il gate del

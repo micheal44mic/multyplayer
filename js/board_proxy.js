@@ -197,14 +197,23 @@ export class BoardProxyCache {
         if (visible(b) && visibleCandidate === null) visibleCandidate = c;
         else if (fallbackCandidate === null) fallbackCandidate = c;
       }
+      if (!e.ready || e.key !== key) {
+        // Non nascondere mai un artboard dietro un proxy vuoto: finché la
+        // cache non è corrente, il board resta live e visibile.
+        if (e.covering) {
+          e.covering = false;
+          e.warmDone = 0;
+        }
+        out.loading.set(b.id, 0);
+        continue;
+      }
       if (!e.covering) {
         e.covering = true;
         e.warmDone = 0;
         this._dropChunkTex(renderer, planes, b);
       }
       for (const l of b.mgr.layers) out.skip.add(l.id);
-      if (e.ready) this._pushQuad(out, b, e);
-      if (!e.ready || e.key !== key) out.loading.set(b.id, 0);
+      this._pushQuad(out, b, e);
     }
 
     // board spariti (clearAll): via texture e entry

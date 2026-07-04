@@ -168,6 +168,11 @@ export class App {
     // la variante segue il bottom renderer (stessa macchina a stati)
     this.proxy = renderer instanceof WgpuRenderer
       ? new WgpuBoardProxyCache() : new BoardProxyCache();
+    // pan/zoom: la build dei proxy va in pausa (i tick con upload da
+    // 256KB/chunk rubavano i frame del gesto su mobile); vedi _frame
+    this._lastCamSig = NaN;
+    this._camMovedAt = -1e9;
+    this._forceProxyBuild = false;
     // vettori non in editing: cotti in texture e disegnati DENTRO la pila del
     // renderer (i run raster non si spezzano più sui piani DOM); il piano SVG
     // vivo resta solo per il layer vettoriale attivo.
@@ -2307,11 +2312,22 @@ export class App {
     // Durante un tratto la build resta ferma.
     const tProxy0 = performance.now();
     const androidBoostActive = this.isAndroid && t0 < this._androidBoostUntil;
+    // camera in movimento (pan/zoom/fling): build dei proxy in pausa fino a
+    // 150ms dopo l'ultimo spostamento — il gesto ha la precedenza; il
+    // warm-up del board attivo continua comunque (blocca il disegno, non
+    // il gesto) perché allowBuild gata solo _buildTick
+    const camSig = this.camera.x * 7 + this.camera.y * 13 + this.camera.zoom * 131071;
+    if (camSig !== this._lastCamSig) {
+      this._lastCamSig = camSig;
+      this._camMovedAt = t0;
+    }
+    const forceProxyBuild = !!this._forceProxyBuild;
+    const cameraBusy = !forceProxyBuild && t0 - this._camMovedAt < 150;
     const proxies = (this.renderer instanceof GLRenderer || this.renderer instanceof WgpuRenderer) &&
       this.renderer.ok
       ? this.proxy.update(/** @type {any} */ (this.renderer), this.boards,
         activeBoardIdForRender, this.camera,
-        !strokePriority && !androidBoostActive, this.planes)
+        forceProxyBuild || (!strokePriority && !androidBoostActive && !cameraBusy), this.planes)
       : null;
     const tProxy1 = performance.now();
     // Solo il vettore attivo resta SVG vivo: pannelli/gizmo lo editano puro.
