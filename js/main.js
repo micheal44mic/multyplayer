@@ -24,6 +24,7 @@ import { drawTextDocument, freeBlockBitmap, setBlockDebug3d, setTextGpu, touchTe
 import { drawSvgLayerToCanvas, freeSvgPlane, listSvgPaints, svgItemFromFile, svgItemFromText, svgLayerName } from './svg_layer.js';
 import { Planes } from './planes.js';
 import { TransformTool } from './transform_ui.js';
+import { PenTool } from './pen_tool.js';
 import { FxTool } from './fx_ui.js';
 import { LayerStyleTool } from './layer_style_ui.js';
 import { FillUI } from './fill_ui.js';
@@ -239,6 +240,7 @@ export class App {
       onStrokePoint: (x, y, p, t) => {
         if (this.lassoSession) return this.lassoMove(x, y);
         if (this.transform.dragging) return this.transform.dragMove(x, y);
+        if (this.penTool.canvasDragging) return this.penTool.canvasMove(x, y);
         if (this.fillUI.adjusting) return this.fillUI.tapMove(x, y);
         if (this.blurSession) return this.blurSession.move(x, y, p);
         if (this.liquifySession) return this.liquifySession.move(x, y, p, t);
@@ -253,6 +255,10 @@ export class App {
         if (this.transform.dragging) {
           this.transform.dragMove(x, y);
           return this.transform.dragEnd();
+        }
+        if (this.penTool.canvasDragging) {
+          this.penTool.canvasMove(x, y);
+          return this.penTool.canvasUp();
         }
         if (this.fillUI.adjusting) return this.fillUI.tapEnd();
         if (this.blurSession) {
@@ -274,6 +280,7 @@ export class App {
       onStrokeCancel: () => {
         if (this.lassoSession) return this.cancelLasso();
         if (this.transform.dragging) return this.transform.dragCancel();
+        if (this.penTool.canvasDragging) return this.penTool.canvasCancel();
         if (this.fillUI.adjusting) return this.fillUI.tapCancel();
         if (this.blurSession) {
           this.blurSession.cancel();
@@ -340,6 +347,7 @@ export class App {
     this._patternRepeatRenderer = new Canvas2DRenderer(this._patternRepeatScratch);
     this._patternRepeatCamera = new Camera();
 
+    this.penTool = new PenTool(this);
     this.ui = new UI(this);
     // ColorDrop: goccia di colore trascinabile dal rail + "riempi al tocco"
     this.fillUI = new FillUI(this);
@@ -474,9 +482,8 @@ export class App {
    */
   _createRenderer(canvas, desynchronized) {
     // fase 2 (flag): present WebGPU — richiede WgpuRenderer.preinit()
-    // già awaitata in fondo a main.js prima di new App. Flag anche in
-    // localStorage (fable-paint.renderer='wgpu'): la query viene riscritta
-    // dalla home e sui telefoni è scomoda.
+    // già awaitata in fondo a main.js prima di new App. Il prodotto resta su
+    // WebGL2; WebGPU è laboratorio esplicito via ?renderer=wgpu.
     if (wantsWgpuRenderer() && WgpuRenderer.available) {
       const wr = new WgpuRenderer(canvas);
       if (wr.ok) {
@@ -1643,6 +1650,7 @@ export class App {
     }
     // strumento Sposta/Trasforma: il drag sul canvas trasla la sessione
     if (brush.tool === 'move') return this.transform.dragStart(x, y);
+    if (brush.tool === 'pen') return this.penTool.canvasDown(board, x, y);
     const target = board.mgr.paintTarget;
     if (!target) return; // attivo non dipingibile (testo/nascosto): ignora
     if (!this._firstStrokeTracked) {
@@ -2124,6 +2132,7 @@ export class App {
   async undo() {
     // trasformazione/effetto pendente: prima ✓ o ✗ (i bottoni sono lì apposta)
     if (this.collab.remoteTransformActive || this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging || this.fx.pending || this.layerStyle.pending || this.fillUI.pending) return;
+    if (this.penTool.dropPending()) return;
     await this.undoMgr.undo(this._undoHost());
     // l'undo può aver cambiato i pixel sotto la sessione: si rifotografa
     this.transform.rebind();
@@ -2211,6 +2220,7 @@ export class App {
     if (!this._mirrorEl.hidden) this._mirrorEl.hidden = true;
     if (!this._patternEl.hidden) this._patternEl.hidden = true;
     if (!this._patternRepeatCanvas.hidden) this._patternRepeatCanvas.hidden = true;
+    this.penTool.hide();
   }
 
   _frameShouldContinue(frameSample, proxyStats, proxies, textBakes, svgBakes) {
@@ -2416,6 +2426,7 @@ export class App {
       // gabbia della distorsione testo: segue camera e modifiche (uscita a
       // confronto di stringa quando non c'è niente da fare)
       this.ui.textUI.gizmo.sync(this.camera);
+      this.penTool.sync(this.camera);
       // overlay della selezione: ricostruisce al cambio di maschera,
       // riposiziona al cambio camera (no-op altrimenti)
       this._syncLassoPreview();
@@ -2572,32 +2583,40 @@ export class App {
 await loadRuntimeConfig();
 installTelemetry();
 wireFeedbackLinks();
-const forceJs = new URLSearchParams(location.search).get('engine') === 'js';
+const launchParams = new URLSearchParams(location.search);
+const forceJs = launchParams.get('engine') === 'js';
 const heap = forceJs ? null : await WasmHeap.load(new URL('./raster_core.wasm', import.meta.url));
 // present WebGPU (fase 2, flag): il device va inizializzato PRIMA del
 // costruttore dell'App perché la scelta del renderer è sincrona
+const WGPU_RENDERER_FLAGS = new Set(['wgpu', 'webgpu']);
+const WGPU_STROKE_ON_FLAGS = new Set(['on', '1', 'true', 'wgpu', 'webgpu']);
+const WGPU_STROKE_OFF_FLAGS = new Set(['off', '0', 'false', 'worker', 'cpu']);
+function clearStickyWgpuRenderer() {
+  try { localStorage.removeItem('fable-paint.renderer'); } catch { /* storage negato */ }
+}
 function wantsWgpuRenderer() {
-  // il flag in query SI PERSISTE in localStorage: la home riscrive l'URL e
-  // sul telefono non c'è console — ?renderer=wgpu accende (e resta),
-  // ?renderer=gl (o altro) spegne e pulisce
-  const q = new URLSearchParams(location.search).get('renderer');
-  if (q === 'wgpu') {
-    try { localStorage.setItem('fable-paint.renderer', 'wgpu'); } catch { /* storage negato */ }
-    return true;
-  }
-  if (q) {
-    try { localStorage.removeItem('fable-paint.renderer'); } catch { /* storage negato */ }
-    return false;
-  }
-  try { return localStorage.getItem('fable-paint.renderer') === 'wgpu'; } catch { return false; }
+  // WebGPU non è più sticky: un vecchio localStorage non deve ribaltare il
+  // default prodotto. Solo il flag esplicito riaccende il present WebGPU.
+  const q = (launchParams.get('renderer') || '').toLowerCase();
+  if (!WGPU_RENDERER_FLAGS.has(q)) clearStickyWgpuRenderer();
+  return WGPU_RENDERER_FLAGS.has(q);
+}
+function wantsWgpuStrokeBridge() {
+  // Default prodotto: WebGL2 + raster worker. Il ponte stroke WebGPU resta
+  // testabile con ?gpu=on; sotto ?renderer=wgpu resta acceso per il lab direct.
+  const q = (launchParams.get('gpu') || '').toLowerCase();
+  if (WGPU_STROKE_ON_FLAGS.has(q)) return true;
+  if (WGPU_STROKE_OFF_FLAGS.has(q)) return false;
+  return wantsWgpuRenderer();
 }
 if (wantsWgpuRenderer()) {
   await WgpuRenderer.preinit();
 }
 const app = new App(heap);
 // stroke buffer WebGPU (fase 1): feature-detect a runtime, aggancio quando
-// pronto (i tratti partiti prima restano su worker/main); ?gpu=off lo esclude
-if (new URLSearchParams(location.search).get('gpu') !== 'off') {
+// pronto (i tratti partiti prima restano su worker/main); default off,
+// ?gpu=on lo accende anche col renderer WebGL, ?renderer=wgpu lo accende nel lab
+if (wantsWgpuStrokeBridge()) {
   WgpuStrokeBridge.create(() => app.requestFrame()).then((bridge) => {
     app.gpuStroke = bridge;
     // fase 2.2: col present WebGPU attivo il renderer legge il tratto vivo

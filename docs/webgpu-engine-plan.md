@@ -38,7 +38,8 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   ESPLICITO: 'auto' non abilita i dynamic offsets). Endpass = replay INTERO
   da zero (chunk scoperti azzerati a fine atterraggio). Flush sincrono
   impossibile su GPU → _runQueueSync ributta il tratto sul CPU (stessi
-  byte). Gate per-tratto: gpu→worker→main; !aqua !tex !selezione; ?gpu=off.
+  byte). Gate per-tratto: default worker/main; ?gpu=on abilita gpu→worker→main;
+  !aqua !tex !selezione; ?gpu=off forza worker/main.
   Commit: heap=null anche per 'gpu' in _beginCommit (i chunk CPU hanno
   ptr=0: col heap wasm si compositavano ZERI dall'indirizzo 0 — il bug
   "il tratto scompare al pen-up", FIXATO e dimostrato con la firma dei
@@ -49,8 +50,7 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   markDirty preciso. Riga 'GPU tratto' nel pannello perf (backlog, land ms,
   MB riletti; summary gpuFrames/avgGpuBacklog/maxGpuLandMs/avgFpsGpu).
 - **Fase 2.1 — present WebGPU v0** (js/renderer_wgpu.js, DIETRO FLAG
-  ?renderer=wgpu o localStorage 'fable-paint.renderer'='wgpu' — la home
-  RISCRIVE la query URL): bottom renderer WebGPU col contratto di
+  esplicito `?renderer=wgpu`; il default prodotto resta WebGL2): bottom renderer WebGPU col contratto di
   renderer_2d (uploadDirty specchia il GL: store.dirty + rect parziale via
   writeTexture, markDirty NON setta texDirty), quad per chunk, blend OVER
   premultiplied, pass combinato paint/gomma nel fragment (= commitChunk).
@@ -82,8 +82,8 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   maschere per tratto, es. pennelloni con angle jitter); device LOST gestito
   (ponte→usable=false e l'App ributta il tratto sul CPU via _gpuReplayOnCpu
   — prima il commit aspettava per sempre; renderer→warn, senza recovery
-  v0); ?renderer=wgpu ora SI PERSISTE in localStorage (?renderer=gl
-  spegne) — sul telefono non c'è console e la home riscrive la query.
+  v0). Nota 04/07: la persistenza localStorage è stata rimossa; WebGPU si
+  accende solo con `?renderer=wgpu`, e il default prodotto è WebGL2/worker.
 
 - **Parità renderer, prima tranche (FATTA 03/07 sera, tutto verificato al
   pixel nel preview)**: (a) MIPMAP in minificazione — pipeline blit WGSL
@@ -261,7 +261,7 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   classe+badge "perf mid", tratto ok, UI sync schedulato, boost armato
   dall'attività input reale; 0 errori console; main.js ai 12 tsc noti.
 
-## TEXTURE BRUSH GPU-DIRECT (FATTO 04/07 notte — DEFAULT FAST)
+## TEXTURE BRUSH GPU-DIRECT (FATTO 04/07 notte — DIETRO FLAG WEBGPU)
 
 - Il ponte accetta la texture (gate: solo aqua/selezione escluse; serve il
   Rasterizer del main come 5° arg di beginStroke — fonte tile/bake).
@@ -293,33 +293,54 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   record, log per-batch sui tratti texture. FREEZE VISTO 2 VOLTE in sviluppo
   (rAF fermo, device NON perso, DOM vivo) e MAI PIÙ riprodotto dopo — tap,
   tratti 40/60/120/220px tutti ok, batch fino a 99M rp lisci e cap mai
-  scattato: causa non confermata. Test campo: `fast` vero è risultato il
-  migliore e non freeza → default di prodotto = `fast`; `?texgpu=off`
-  persiste come kill-switch/fallback worker, `?texgpu=safe` resta solo per
-  diagnosi. Punto 5 del piano utente (spike commit/readback a fine tratto)
-  ancora da misurare; aqua/smudge dopo.
+  scattato: causa non confermata. Dentro il laboratorio WebGPU `fast` resta
+  il path migliore; `?texgpu=off` persiste come kill-switch/fallback worker,
+  `?texgpu=safe` resta solo per diagnosi.
+
+## DECISIONE CAMPO 04/07: WEBGL VINCE ORA, WEBGPU PARCHEGGIATO
+
+- Confronto campo su PC, iPhone, iPad e Android via Cloudflare HTTPS:
+  WebGL2 + worker (`?renderer=gl&gpu=off`) risulta più veloce e più fluido
+  del path WebGPU su tutti i device provati, soprattutto sulla punta
+  d'inizio/fine taper.
+- Report allegati 09:54/09:56: sul caso Android piccolo/idle il WebGPU
+  `?renderer=wgpu` ha frame/present circa 2x più costosi del WebGL
+  (`presentMs` medio ~0.88ms vs ~0.41ms) e si porta dietro un atterraggio
+  tratto pesante (`gpuLandMs=285ms`, `gpuReadBytes=14.4MB`,
+  `gpuBatches=67`). Nel run WebGL2 + `gpu=off` quei contatori sono zero.
+- Ipotesi tecnica: non è "WebGPU sbagliato" in generale; è il nostro stroke
+  buffer direct che oggi paga troppo su mobile. Per taper/endpass fa replay
+  della punta + copia arena→texture + readback intero al commit; il kernel
+  lavora per record×pixel×chunk anche quando la punta utile è sottile. Sul
+  campo questi costi di submit/copie/mapAsync battono il worker/WASM +
+  renderer WebGL sia su desktop sia su mobile.
+- Decisione prodotto: default/supporto = WebGL2/worker. WebGPU resta dietro
+  flag (`?renderer=wgpu`) come laboratorio: non si butta, perché parità
+  bit-exact, proxy, cache, mip e texture GPU sono lavoro riusabile per una
+  futura fase GPU-residente. Non va promosso finché non batte WebGL sul
+  gesto reale su PC, iPhone, iPad e Android, in particolare su inizio/fine
+  taper.
 
 ## PROSSIMI PASSI (in ordine)
 
-1. **Giro Auto v3 sul campo coi profili tier** (nomi nuovi = baseline
-   nuove): confermare che i numeri del 04/07 sera reggono e che il tier
-   classifica giusto sui tuoi device (guardare tier/tierUnclamped/caps nel
-   report; sul telefono si può forzare con localStorage fable-paint.tier).
-   Giudicare A OCCHIO l'iPhone a dpr 2. Poi giudizio visivo complessivo e
-   via il flag ?renderer=wgpu.
-2. **Texture GPU sul campo**: ora default `fast`; ritestare desktop/
-   Android/iPad a fit guardando la riga GPU tratto e assenza freeze. Poi
-   misurare gli spike di commit/readback a fine tratto.
+1. **Baseline prodotto WebGL2/worker**: usare `?renderer=gl&gpu=off` per i
+   test campo principali su PC, iPhone, iPad e Android e confrontare i
+   profili tier contro questa baseline, non contro WebGPU.
+2. **WebGPU parcheggiato, non promosso**: tenere `?renderer=wgpu` solo per
+   laboratorio. Se si riapre, prima misurare/fissare punta taper/endpass:
+   evitare readback intero al commit, ridurre lavoro record×pixel×chunk e
+   dimostrare che WebGPU batte WebGL nel gesto reale su PC, iPhone, iPad e
+   Android.
 3. **Collab su board coperti**: misurare lo spigolo scopri/ricopri (vedi
    sopra) prima di dichiarare il proxy finito.
-2. **Tier memoria/dispositivo** per l'harness: cap del profilo generato su
+4. **Tier memoria/dispositivo** per l'harness: cap del profilo generato su
    iOS/mobile (report targetPixelBytes/estimatedPaintBytes già esposti).
-3. **Pennello texture su GPU** (P1, dopo che il present regge): il gate del
+5. **Pennello texture su GPU** (solo se WebGPU torna competitivo): il gate del
    ponte esclude snap.tex — lo spec bit-exact esiste già (capsule_tex_int
    JS+wasm), va portato in WGSL con l'atlas per hash. Poi selezione
    (maschera come texture read-only); aqua per ULTIMO (campiona il
    documento sotto il tratto, che vive sul main: divergenza facile).
-4. **Fase 2.3 — layer GPU-residenti**: commit come compute sul device
+6. **Fase 2.3 — layer GPU-residenti**: commit come compute sul device
    (texture di layer possedute dalla GPU), undo 2-tier (riferimento: editor
    cbos), export/fill/selezioni via mapAsync. Poi sfumino/liquify sullo
    stesso stato (fase 3). Qui il flatten del board diventa quasi gratis.
@@ -361,6 +382,8 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   https://192.168.0.16:8443 (proxy HTTPS nello scratchpad della sessione
   precedente — se spento, rigenerare: cert New-SelfSignedCertificate con
   SAN {text}DNS=localhost&IPAddress=... + proxy node su 8443→8002).
-- Flag: ?renderer=wgpu / localStorage; ?gpu=off (ponte tratto); ?engine=js.
+- Flag campo/default consigliato: URL pulito o `?renderer=gl&gpu=off`.
+  Laboratorio: `?renderer=wgpu`; `?gpu=on` accende solo il ponte tratto;
+  `?texgpu=off|safe|fast`; `?engine=js`.
 - Test: npm test (wasm+blur+puppet+stroke+worker), webgpu_test.html,
   capsule_compare.html.

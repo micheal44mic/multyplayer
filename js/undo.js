@@ -78,6 +78,8 @@ import { CHUNK_BYTES, keyCx, keyCy } from './store.js';
  * @property {string} [cid] collaborazione: id dell'op ('uid:n') — l'undo
  *   mirato (undoCid) trova l'entry per id ovunque sia nello stack; il
  *   counter EREDITA il cid, così il round-trip undo↔redo resta aggangiato
+ * @property {string} [penTag] penna: entry della sessione di creazione in
+ *   corso; alla CHIUSURA della forma coalescePen le collassa in un'unità
  */
 
 /**
@@ -221,6 +223,42 @@ export class UndoManager {
     this.rawBytes += e.rawSize;
     if (!this.selectiveRedo) this._dropRedo();
     this._trim();
+    this.onChange();
+  }
+
+  // ATTENZIONE: esiste già tagTop(cid) per il collab più sotto — nome diverso
+  // apposta (metodi duplicati in una classe: l'ultimo definito vince).
+  /** marca l'ultima entry come parte di una sessione penna @param {string} tag */
+  tagPenTop(tag) {
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (top) top.penTag = tag;
+  }
+
+  // La Penna ha CHIUSO una forma: le entry per-ancora della sessione (tag)
+  // collassano in un'unità — da qui in poi undo/redo trattano la forma
+  // intera. Solo il TAIL contiguo e MAI entry con cid: in sessione collab il
+  // round-trip per-id non si riscrive a posteriori (lì resta per-ancora).
+  /** @param {string} tag */
+  coalescePen(tag) {
+    if (!tag) return;
+    const st = this.undoStack;
+    let i = st.length;
+    while (i > 0 && st[i - 1].op === 'svgitem' && st[i - 1].penTag === tag && !st[i - 1].cid) i--;
+    const group = st.length - i;
+    if (!group) return;
+    const base = i > 0 ? st[i - 1] : null;
+    if (base && base.op === 'attach' && base.penTag === tag && !base.cid) {
+      // il layer è NATO con questa forma: basta l'attach — undo stacca il
+      // layer vivo (forma completa dentro), redo lo riattacca intero
+      st.length = i;
+    } else if (group >= 2) {
+      // fusione: si0 della più vecchia (stato pre-forma) + si1 dell'ultima
+      st[i].si1 = st[st.length - 1].si1;
+      st.length = i + 1;
+    } else {
+      return; // una sola entry: è già l'unità
+    }
+    // le svgitem hanno rawSize 0: nessun aggiustamento di budget
     this.onChange();
   }
 

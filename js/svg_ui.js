@@ -35,6 +35,10 @@ export class SvgUI {
     this.listEl = document.getElementById('svg-colors');
     this.moreBtn = /** @type {HTMLButtonElement} */ (document.getElementById('svg-colors-more'));
     this.emptyEl = document.getElementById('svg-empty');
+    this.penWrap = document.getElementById('svg-pen');
+    this.penSection = document.getElementById('svg-pen-section');
+    /** @type {{root: HTMLElement, sync: () => void}|null} */
+    this._penControls = null;
     this.rasterBtn = /** @type {HTMLButtonElement} */ (document.getElementById('svg-rasterize'));
     this._sig = '';
     /** @type {import('./svg_layer.js').SvgItem|null} */
@@ -96,6 +100,13 @@ export class SvgUI {
     this.app.ui.layersUI.open(false);
     this.app.ui.textUI.open(false);
     if (this.app.fxTools) for (const t of this.app.fxTools) t.openPanel(false);
+    if (!this._penControls && this.app.penTool && this.app.ui.buildPenStyleControls) {
+      this._penControls = this.app.ui.buildPenStyleControls(() => {
+        const l = this.layer;
+        return l && l.svgItem && l.svgItem.pen ? l : null;
+      });
+      this.penWrap.appendChild(this._penControls.root);
+    }
     this.sync(true);
   }
 
@@ -115,14 +126,21 @@ export class SvgUI {
       this._colorLayerId = l.id;
       this._colorsExpanded = false;
     }
+    const isPen = !!l.svgItem.pen;
+    if (this.penWrap) {
+      this.penWrap.hidden = !isPen;
+      this.penSection.hidden = !isPen;
+    }
     const sig = svgLayerSig(l);
     if (this._before) {
       this._sig = sig;
       return;
     }
+    if (this.app.penTool && this.app.penTool.styleEditing) return;
     if (!force && sig === this._sig) return;
     this._sig = sig;
     this._buildColors(l);
+    if (isPen && this._penControls) this._penControls.sync();
   }
 
   _beginEdit() {

@@ -16,6 +16,7 @@ import { SpaceNodes } from './space_nodes.js';
 import { drawLayerStack } from './layer_composite.js';
 import { track } from './telemetry.js';
 import { createRangeRow } from './panel_controls.js';
+import { cssColorToHex } from './pen_tool.js';
 
 /** @typedef {import('./main.js').App} App */
 /** @typedef {import('./brush.js').Tool} Tool */
@@ -24,14 +25,19 @@ import { createRangeRow } from './panel_controls.js';
 
 const TOOL_BUTTONS = /** @type {[string, Tool][]} */ ([
   ['tool-brush', 'brush'], ['tool-eraser', 'eraser'], ['tool-blur', 'blur'],
-  ['tool-liquify', 'liquify'], ['tool-select', 'select'], ['tool-move', 'move'], ['tool-pan', 'pan'],
+  ['tool-liquify', 'liquify'], ['tool-pen', 'pen'], ['tool-select', 'select'], ['tool-move', 'move'], ['tool-pan', 'pan'],
 ]);
-const SIMPLE_TOOL_BUTTONS = TOOL_BUTTONS.filter(([, t]) => !['brush', 'blur', 'liquify'].includes(t));
+const SIMPLE_TOOL_BUTTONS = TOOL_BUTTONS.filter(([, t]) => !['brush', 'blur', 'liquify', 'pen'].includes(t));
+/** @typedef {'draw'|'add'|'remove'|'nodes'} PenSubTool */
+const PEN_SUBTOOL_BUTTONS = /** @type {[string, PenSubTool][]} */ ([
+  ['pen-tool-draw', 'draw'], ['pen-tool-add', 'add'],
+  ['pen-tool-remove', 'remove'], ['pen-tool-nodes', 'nodes'],
+]);
 const PAINT_TOOLS = new Set(['brush', 'eraser', 'blur', 'liquify']);
 const SELECT_KIND_BUTTONS = [['sel-kind-color', 'color'], ['sel-kind-lasso', 'lasso'], ['sel-kind-polygon', 'polygon']];
 const SELECT_OP_BUTTONS = [['sel-op-replace', 'replace'], ['sel-op-add', 'add'], ['sel-op-subtract', 'subtract']];
 const SPACES_BLOCKED_KEYS = new Set([
-  'b', 'e', 'r', 'q', 'w', 'v', 'h', 'p', 't', 'l',
+  'b', 'e', 'r', 'q', 'w', 'v', 'h', 'n', 'p', 't', 'l',
   'enter', 'escape', 'delete', 'backspace', '0', '[', ']', '+', '=', '-', ' ',
 ]);
 const SPACES_ZOOM_MAX = 4.3;
@@ -244,6 +250,7 @@ export class UI {
     this.aiStatus = document.getElementById('ai-status');
     this.blurPopup = document.getElementById('blurpopup');
     this.liquifyPopup = document.getElementById('liquifypopup');
+    this.penPopup = document.getElementById('penpopup');
     this.badge = document.getElementById('bs-badge');
     this.cursorEl = document.getElementById('cursor');
     this.zoomLabel = document.getElementById('zoom-label');
@@ -280,6 +287,14 @@ export class UI {
     /** @type {HTMLElement|null} */
     this._railSpaces = null;
     /** @type {HTMLElement|null} */
+    this._railPen = null;
+    /** @type {Tool} */
+    this._toolBeforePen = 'brush';
+    /** @type {PenSubTool} */
+    this._penSubTool = 'draw';
+    /** @type {{root: HTMLElement, sync: () => void}|null} */
+    this._penControls = null;
+    /** @type {HTMLElement|null} */
     this._spacesCreateMenu = null;
     /** @type {HTMLButtonElement|null} */
     this._spaceAddBtn = null;
@@ -295,6 +310,7 @@ export class UI {
     this._buildStudio();
     this._buildBlurPopup();
     this._buildLiquifyPopup();
+    this._buildPenPopup();
     this._bindToolbar();
     this._bindAiPanel();
     this._buildSideSliders();
@@ -368,9 +384,11 @@ export class UI {
     app.transform?.cancel();
     if (app.fillUI) app.fillUI.dismiss();
     if (app.fxTools) for (const tool of app.fxTools) tool.openPanel(false);
+    app.penTool?.finishPath();
     this.toggleStudio(false);
     this.toggleBlurPopup(false);
     this.toggleLiquifyPopup(false);
+    this.togglePenPopup(false);
     this.textUI.open(false);
     this.svgUI.open(false);
     this.layersUI.open(false);
@@ -391,8 +409,8 @@ export class UI {
       toggle.setAttribute('aria-label', label);
       toggle.title = label;
     }
-    if (this._railDraw) this._railDraw.hidden = spaces;
     if (this._railSpaces) this._railSpaces.hidden = !spaces;
+    this._syncPenRail();
     document.body.classList.toggle('spaces-mode', spaces);
     this.app.planesEl.classList.toggle('spaces-mode', spaces);
     this.app.camera.maxZoom = spaces ? SPACES_ZOOM_MAX : ZOOM_MAX;
@@ -409,6 +427,27 @@ export class UI {
     for (const [id] of TOOL_BUTTONS) document.getElementById(id).classList.remove('active');
     this.app.planesEl.classList.remove('panning', 'moving', 'painting', 'fill-tap');
     document.getElementById('select-opts').hidden = true;
+  }
+
+  _syncPenRail() {
+    const pen = !this.spacesMode && brush.tool === 'pen';
+    if (this._railEl) this._railEl.classList.toggle('pen-rail', pen);
+    if (this._railDraw) this._railDraw.hidden = this.spacesMode || pen;
+    if (this._railPen) this._railPen.hidden = !pen;
+    if (this._railModeToggle) this._railModeToggle.hidden = pen;
+  }
+
+  /** @param {PenSubTool} sub */
+  _setPenSubTool(sub) {
+    this._penSubTool = sub;
+    const pen = this.app.penTool;
+    if (pen) {
+      pen.subTool = sub;
+      if (sub !== 'draw') pen.finishPath();
+    }
+    for (const [id, s] of PEN_SUBTOOL_BUTTONS) {
+      document.getElementById(id).classList.toggle('active', s === sub);
+    }
   }
 
   _bindAiPanel() {
@@ -1072,6 +1111,7 @@ export class UI {
       this.svgUI.open(false);
       this.toggleBlurPopup(false);
       this.toggleLiquifyPopup(false);
+      this.togglePenPopup(false);
       this._updateBadge();
       this.preview.render();
     }
@@ -1130,6 +1170,7 @@ export class UI {
     if (open) {
       this.toggleStudio(false);
       this.toggleLiquifyPopup(false);
+      this.togglePenPopup(false);
       this.presetsUI.open(false);
       this.syncBlurPopup();
       this._positionBlurPopup();
@@ -1209,6 +1250,7 @@ export class UI {
     if (open) {
       this.toggleStudio(false);
       this.toggleBlurPopup(false);
+      this.togglePenPopup(false);
       this.presetsUI.open(false);
       this.syncLiquifyPopup();
       this._positionLiquifyPopup();
@@ -1221,6 +1263,202 @@ export class UI {
 
   _positionBlurPopup() {
     this._positionToolPopup(this.blurPopup, 'tool-blur', 300, 245);
+  }
+
+  /**
+   * @param {() => import('./layers.js').Layer|null} getLayer
+   * @returns {{root: HTMLElement, sync: () => void}}
+   */
+  buildPenStyleControls(getLayer) {
+    const pen = this.app.penTool;
+    const root = document.createElement('div');
+    root.className = 'pen-controls';
+    /** @param {string} label */
+    const row = (label) => {
+      const r = document.createElement('div');
+      r.className = 'pen-row';
+      const s = document.createElement('span');
+      s.textContent = label;
+      r.appendChild(s);
+      root.appendChild(r);
+      return r;
+    };
+    const arm = () => pen.beginStyleEdit(getLayer());
+    const done = () => pen.commitStyleEdit();
+    /** @param {any} patch */
+    const apply = (patch) => pen.applyStyle(patch, getLayer());
+
+    const strokeIn = document.createElement('input');
+    strokeIn.type = 'color';
+    strokeIn.title = 'Stroke color';
+    row('Stroke').appendChild(strokeIn);
+
+    const widthIn = document.createElement('input');
+    widthIn.type = 'range';
+    widthIn.min = '1';
+    widthIn.max = '64';
+    widthIn.step = '1';
+    widthIn.title = 'Stroke width';
+    const widthVal = document.createElement('span');
+    widthVal.className = 'pen-val';
+    row('Width').append(widthIn, widthVal);
+
+    const fillOn = document.createElement('input');
+    fillOn.type = 'checkbox';
+    fillOn.title = 'Fill on/off';
+    const fillIn = document.createElement('input');
+    fillIn.type = 'color';
+    fillIn.title = 'Fill color';
+    row('Fill').append(fillOn, fillIn);
+
+    /** @param {string} label @param {[string, string][]} opts @param {(v: string) => any} patchOf */
+    const seg = (label, opts, patchOf) => {
+      /** @type {HTMLButtonElement[]} */
+      const btns = [];
+      const wrap = document.createElement('div');
+      wrap.className = 'pen-align';
+      for (const [v, text] of opts) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'pen-align-btn';
+        b.textContent = text;
+        b.dataset.v = v;
+        b.addEventListener('click', () => {
+          arm();
+          apply(patchOf(v));
+          done();
+          sync();
+        });
+        btns.push(b);
+        wrap.appendChild(b);
+      }
+      row(label).appendChild(wrap);
+      return btns;
+    };
+    const alignBtns = seg('Align',
+      [['center', 'Center'], ['inside', 'Inside'], ['outside', 'Outside']],
+      (v) => ({ align: v }));
+    const cornerBtns = seg('Corners',
+      [['round', 'Rounded'], ['sharp', 'Sharp']],
+      (v) => ({ corners: v }));
+    const dashBtns = seg('Dash',
+      [['solid', 'Solid'], ['dashed', 'Dashed']],
+      (v) => {
+        if (v === 'solid') return { dash: 0 };
+        const st = pen.readActiveStyle(getLayer()) || pen.style;
+        return {
+          dash: st.dash > 0 ? st.dash : (pen.style.dash > 0 ? pen.style.dash : 12),
+          gap: st.gap > 0 ? st.gap : (pen.style.gap > 0 ? pen.style.gap : 6),
+        };
+      });
+
+    const dashIn = document.createElement('input');
+    dashIn.type = 'range';
+    dashIn.min = '1';
+    dashIn.max = '64';
+    dashIn.step = '1';
+    dashIn.title = 'Dash length';
+    const dashVal = document.createElement('span');
+    dashVal.className = 'pen-val';
+    const dashRow = row('Length');
+    dashRow.append(dashIn, dashVal);
+
+    const gapIn = document.createElement('input');
+    gapIn.type = 'range';
+    gapIn.min = '1';
+    gapIn.max = '64';
+    gapIn.step = '1';
+    gapIn.title = 'Gap length';
+    const gapVal = document.createElement('span');
+    gapVal.className = 'pen-val';
+    const gapRow = row('Gap');
+    gapRow.append(gapIn, gapVal);
+
+    for (const el of [strokeIn, widthIn, fillOn, fillIn, dashIn, gapIn]) {
+      el.addEventListener('pointerdown', arm);
+      el.addEventListener('focus', arm);
+      el.addEventListener('change', done);
+    }
+    strokeIn.addEventListener('input', () => apply({ stroke: strokeIn.value }));
+    widthIn.addEventListener('input', () => {
+      widthVal.textContent = widthIn.value;
+      apply({ width: Number(widthIn.value) });
+    });
+    const applyFill = () => apply({ fill: fillOn.checked ? fillIn.value : 'none' });
+    fillOn.addEventListener('input', applyFill);
+    fillIn.addEventListener('input', applyFill);
+    dashIn.addEventListener('input', () => {
+      dashVal.textContent = dashIn.value;
+      apply({ dash: Number(dashIn.value) });
+    });
+    gapIn.addEventListener('input', () => {
+      gapVal.textContent = gapIn.value;
+      apply({ gap: Number(gapIn.value) });
+    });
+
+    const sync = () => {
+      if (pen.styleEditing) return;
+      const st = pen.readActiveStyle(getLayer()) || pen.style;
+      strokeIn.value = cssColorToHex(st.stroke, '#1A1A1F');
+      const w = Math.max(1, Math.round(st.width));
+      widthIn.value = String(w);
+      widthVal.textContent = String(w);
+      const hasFill = !!st.fill && st.fill !== 'none';
+      fillOn.checked = hasFill;
+      if (hasFill) fillIn.value = cssColorToHex(st.fill, '#4D7CFE');
+      for (const b of alignBtns) b.classList.toggle('active', b.dataset.v === (st.align || 'center'));
+      for (const b of cornerBtns) b.classList.toggle('active', b.dataset.v === (st.corners || 'round'));
+      const dashed = (st.dash || 0) > 0;
+      for (const b of dashBtns) b.classList.toggle('active', b.dataset.v === (dashed ? 'dashed' : 'solid'));
+      dashRow.hidden = !dashed;
+      gapRow.hidden = !dashed;
+      if (dashed) {
+        const dv = Math.max(1, Math.round(st.dash));
+        const gv = Math.max(1, Math.round(st.gap));
+        dashIn.value = String(dv);
+        dashVal.textContent = String(dv);
+        gapIn.value = String(gv);
+        gapVal.textContent = String(gv);
+      }
+    };
+    return { root, sync };
+  }
+
+  _buildPenPopup() {
+    const panel = this.penPopup;
+    panel.textContent = '';
+    const head = this._toolPopupHead('Pen', () => this.togglePenPopup(false));
+    const body = document.createElement('div');
+    body.className = 'blur-body';
+    this._penControls = this.buildPenStyleControls(() => this.app.penTool.layer);
+    body.appendChild(this._penControls.root);
+    panel.append(head, body);
+    this._bindToolPopupDismiss(panel, ['tool-pen', 'pen-tool-draw'],
+      () => this.togglePenPopup(false), () => this._positionPenPopup());
+  }
+
+  syncPenPopup() {
+    this._penControls?.sync();
+  }
+
+  /** @param {boolean} [force] */
+  togglePenPopup(force) {
+    const panel = this.penPopup;
+    const open = force !== undefined ? force : !panel.classList.contains('open');
+    panel.classList.toggle('open', open);
+    if (open) {
+      this.toggleStudio(false);
+      this.toggleBlurPopup(false);
+      this.toggleLiquifyPopup(false);
+      this.presetsUI.open(false);
+      this.syncPenPopup();
+      this._positionPenPopup();
+    }
+  }
+
+  _positionPenPopup() {
+    const anchor = this._railPen && !this._railPen.hidden ? 'pen-tool-draw' : 'tool-pen';
+    this._positionToolPopup(this.penPopup, anchor, 250, 245);
   }
 
   /** @param {string} title @param {() => void} closeFn */
@@ -1241,7 +1479,7 @@ export class UI {
 
   /**
    * @param {HTMLElement} panel
-   * @param {string} btnId
+   * @param {string|string[]} btnId
    * @param {() => void} closeFn
    * @param {() => void} positionFn
    */
@@ -1249,8 +1487,10 @@ export class UI {
     document.addEventListener('pointerdown', (e) => {
       if (!panel.classList.contains('open')) return;
       const t = /** @type {Node|null} */ (e.target);
-      const btn = document.getElementById(btnId);
-      if (t && (panel.contains(t) || btn.contains(t))) return;
+      const btns = (Array.isArray(btnId) ? btnId : [btnId])
+        .map(id => document.getElementById(id))
+        .filter(Boolean);
+      if (t && (panel.contains(t) || btns.some(btn => btn.contains(t)))) return;
       closeFn();
     });
     window.addEventListener('resize', () => {
@@ -1323,12 +1563,14 @@ export class UI {
     const railModeToggle = document.getElementById('toolspace-toggle');
     const railDraw = /** @type {HTMLElement} */ (document.querySelector('.rail-panel-draw'));
     const railSpaces = /** @type {HTMLElement} */ (document.querySelector('.rail-panel-spaces'));
+    const railPen = /** @type {HTMLElement} */ (document.querySelector('.rail-panel-pen'));
     const spaceAddBtn = /** @type {HTMLButtonElement} */ (document.querySelector('.space-add'));
     const spacesCreateMenu = document.getElementById('spaces-create-menu');
     this._railEl = rail;
     this._railModeToggle = railModeToggle;
     this._railDraw = railDraw;
     this._railSpaces = railSpaces;
+    this._railPen = railPen;
     this._spaceAddBtn = spaceAddBtn;
     this._spacesCreateMenu = spacesCreateMenu;
     railModeToggle.addEventListener('click', () => {
@@ -1377,6 +1619,19 @@ export class UI {
       if (brush.tool === 'liquify') this.toggleLiquifyPopup();
       else this.setTool('liquify');
     });
+    on('tool-pen', () => {
+      if (this.spacesMode) return;
+      if (brush.tool === 'pen') this.togglePenPopup();
+      else this.setTool('pen');
+    });
+    on('pen-back', () => this.setTool(this._toolBeforePen));
+    on('pen-tool-draw', () => {
+      if (this._penSubTool !== 'draw') this._setPenSubTool('draw');
+      else this.togglePenPopup();
+    });
+    on('pen-tool-add', () => this._setPenSubTool('add'));
+    on('pen-tool-remove', () => this._setPenSubTool('remove'));
+    on('pen-tool-nodes', () => this._setPenSubTool('nodes'));
 
     // opzioni del tool Selezione: lo slider ricampiona la selezione viva
     for (const [id, kind] of SELECT_KIND_BUTTONS) {
@@ -1511,6 +1766,11 @@ export class UI {
       this.app._flushPendingStroke();
       this.app.liquifyClearBaseline();
     }
+    if (prev === 'pen' && tool !== 'pen') this.app.penTool.finishPath();
+    if (tool === 'pen' && prev !== 'pen') {
+      this._toolBeforePen = prev;
+      this._setPenSubTool('draw');
+    }
     // cambiare strumento congeda il ColorDrop: modalità spenta, pillola
     // e slider della soglia spariscono
     if (this.app.fillUI) this.app.fillUI.dismiss();
@@ -1526,7 +1786,9 @@ export class UI {
     if (tool !== 'brush') this.presetsUI.open(false);
     if (tool !== 'blur') this.toggleBlurPopup(false);
     if (tool !== 'liquify') this.toggleLiquifyPopup(false);
+    if (tool !== 'pen') this.togglePenPopup(false);
     if (tool === 'blur' || tool === 'liquify') this.toggleStudio(false);
+    this._syncPenRail();
     if (this._ssSync) for (const f of this._ssSync) f();
   }
 
@@ -1609,16 +1871,18 @@ export class UI {
       else if (k === 'w') this.setTool('select');
       else if (k === 'v') this.setTool('move');
       else if (k === 'h') this.setTool('pan');
+      else if (k === 'n') this.setTool('pen');
       else if (k === 'p') this.toggleStudio();
       else if (k === 't') { app.stressTest?.open(false); this.textUI.placeAtView(); }
       else if (k === 'l') { app.stressTest?.open(false); this.layersUI.toggle(); }
       else if (k === 'enter') {
         if (app.finishPolygonLasso()) { e.preventDefault(); }
+        else if (app.penTool.creating) { e.preventDefault(); app.penTool.finishPath(); }
         else if (app.transform.pending) { e.preventDefault(); app.transform.confirm(true); }
         else if (app.fx.pending) { e.preventDefault(); app.fx.confirm(); }
         else if (app.layerStyle.pending) { e.preventDefault(); app.layerStyle.confirm(); }
       }
-      else if (k === 'escape') { app.cancelLasso(); app.selection.clear(); app.transform.cancel(); app.fx.escape(); app.layerStyle.escape(); if (app.fillUI) app.fillUI.dismiss(); this.toggleStudio(false); this.toggleBlurPopup(false); this.toggleLiquifyPopup(false); this.textUI.open(false); this.svgUI.open(false); this.layersUI.open(false); app.stressTest?.open(false); this.presetsUI.open(false); this.mockups.open(false); }
+      else if (k === 'escape') { app.penTool.finishPath(); app.cancelLasso(); app.selection.clear(); app.transform.cancel(); app.fx.escape(); app.layerStyle.escape(); if (app.fillUI) app.fillUI.dismiss(); this.toggleStudio(false); this.toggleBlurPopup(false); this.toggleLiquifyPopup(false); this.togglePenPopup(false); this.textUI.open(false); this.svgUI.open(false); this.layersUI.open(false); app.stressTest?.open(false); this.presetsUI.open(false); this.mockups.open(false); }
       else if (k === 'delete' || k === 'backspace') {
         // Canc: prima le puntine della Marionetta (se il tab è attivo),
         // poi i pixel selezionati; preventDefault anche a vuoto
@@ -1699,9 +1963,9 @@ export class UI {
   updateCursor(input, camera) {
     const el = this.cursorEl;
     const h = input.hover;
-    // select usa il crosshair CSS: il cerchio-pennello non c'entra
+    // select e pen usano il crosshair CSS: il cerchio-pennello non c'entra
     const show = !this.spacesMode && h.visible && brush.tool !== 'pan' && brush.tool !== 'move' &&
-      brush.tool !== 'select' && !input.gesture;
+      brush.tool !== 'select' && brush.tool !== 'pen' && !input.gesture;
     if (!show) {
       this._hideBrushCursor();
       return;

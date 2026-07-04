@@ -931,6 +931,51 @@ body.ai-generating #sel-ai {
 #distortgizmo .dg-anchor { fill: #fff; stroke: var(--accent); }
 #distortgizmo .dg-handle { fill: var(--accent); stroke: #fff; }
 
+/* gizmo della Penna: root trasparente ai pointer, ancore/maniglie catturano;
+   durante la creazione i pallini sono passivi per chiudere dal canvas. */
+#pengizmo {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 6;
+  display: none;
+  pointer-events: none;
+}
+#pengizmo .pg-skel-halo {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.8);
+  stroke-width: 3;
+}
+#pengizmo .pg-skel {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.2;
+}
+#pengizmo .pg-spoke {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1;
+  opacity: 0.45;
+}
+#pengizmo .pg-rubber {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 4;
+  opacity: 0.75;
+}
+#pengizmo circle {
+  pointer-events: auto;
+  touch-action: none;
+  cursor: grab;
+  stroke-width: 1.5;
+}
+#pengizmo circle:active { cursor: grabbing; }
+#pengizmo.pg-creating circle { pointer-events: none; }
+#pengizmo .pg-a { fill: #fff; stroke: var(--accent); }
+#pengizmo .pg-h { fill: var(--accent); stroke: #fff; }
+
 /* gizmo dello strumento Sposta/Trasforma: stessa filosofia della gabbia —
    root trasparente ai pointer, maniglie e bottoni catturano */
 #tfgizmo {
@@ -1050,7 +1095,7 @@ body.ai-generating #sel-ai {
    hairline esterna e riflesso speculare interno sul bordo alto. Lo sheen
    è un layer di background (non ::before): non scrolla col contenuto. */
 #toolbar, #toolrail, #zoomdock, .ss-track,
-#presetspopup, #blurpopup, #liquifypopup, #mockuppanel, #studio, #layerspanel, #textpanel, #svgpanel, #stresspanel, #fxpanel, #lspanel, #aipanel,
+#presetspopup, #blurpopup, #liquifypopup, #penpopup, #mockuppanel, #studio, #layerspanel, #textpanel, #svgpanel, #stresspanel, #fxpanel, #lspanel, #aipanel,
 #collabpanel {
   background: var(--glass-sheen), var(--ui-bg);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -1062,7 +1107,7 @@ body.ai-generating #sel-ai {
    diventa quasi opaco, la leggibilità non dipende dal blur */
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   #toolbar, #toolrail, #zoomdock, .ss-track,
-  #presetspopup, #blurpopup, #liquifypopup, #mockuppanel, #studio, #layerspanel, #textpanel, #svgpanel, #stresspanel, #fxpanel, #lspanel, #aipanel,
+  #presetspopup, #blurpopup, #liquifypopup, #penpopup, #mockuppanel, #studio, #layerspanel, #textpanel, #svgpanel, #stresspanel, #fxpanel, #lspanel, #aipanel,
   #collabpanel {
     background: var(--glass-sheen), rgba(28, 28, 30, 0.94);
   }
@@ -1097,8 +1142,66 @@ body.ai-generating #sel-ai {
   display: none;
 }
 #blurpopup { width: min(300px, calc(100vw - 16px)); }
+#penpopup {
+  position: fixed;
+  width: min(250px, calc(100vw - 16px));
+  padding: 10px 14px 14px;
+  border-radius: var(--radius);
+  z-index: 24;
+  display: none;
+}
 #blurpopup.open,
-#liquifypopup.open { display: block; }
+#liquifypopup.open,
+#penpopup.open { display: block; }
+.pen-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+}
+.pen-row[hidden] { display: none; }
+.pen-row > span:first-child {
+  width: 52px;
+  font-size: 13px;
+  opacity: 0.75;
+}
+.pen-row input[type="range"] { flex: 1; min-width: 0; }
+.pen-row input[type="color"] {
+  width: 36px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--ui-line);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+.pen-val {
+  min-width: 24px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+}
+.pen-align {
+  display: flex;
+  flex: 1;
+  gap: 4px;
+}
+.pen-align-btn {
+  flex: 1;
+  padding: 4px 0;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--ui-line);
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+.pen-align-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+#svg-pen { padding: 0 0 6px; }
 .blur-head {
   display: flex;
   align-items: center;
@@ -5624,6 +5727,20 @@ body.home-open #toolspace-toggle {
 #toolrail[data-rail-mode="spaces"] .space-profile svg {
   width: 23px;
   height: 23px;
+}
+
+/* ---------- rail Penna (modalità vettoriale) ---------- */
+#toolspace-toggle[hidden] {
+  display: none !important;
+}
+
+#toolrail .pen-back {
+  opacity: 0.7;
+}
+
+#toolrail .pen-back:hover,
+#toolrail .pen-back:active {
+  opacity: 1;
 }
 
 #spaces-create-menu,
