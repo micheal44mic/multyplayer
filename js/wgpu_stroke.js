@@ -25,6 +25,30 @@ const SLOT_WORDS = CHUNK * CHUNK; // 65536 u32 = 256KB per chunk
 const ARENA_START = 96;      // slot iniziali (24MB), cresce ×2
 const ATLAS_START = 4 << 20; // atlas maschere iniziale (4MB)
 const INK_RING = 2048;
+// SAFETY (solo modalità 'safe'): il kernel cicla TUTTI i record del batch
+// per ogni pixel di ogni chunk toccato — lavoro ≈ chunk × 65536 × recCount.
+// Il tetto spezza i batch texture enormi in più submit; il freeze visto in
+// sviluppo non è mai stato riprodotto sul campo, quindi il tetto è una
+// guardia estrema da A/B, non il path di default.
+const WORK_CAP = 256 << 20;  // record-pixel per submit (modalità safe)
+// Texture GPU-direct, A/B dietro flag (?texgpu=..., persiste in localStorage):
+//   'fast' = path originale puro (un batch per tick, zero log) — il
+//            default di prodotto dopo test campo senza freeze;
+//   'safe' = tetto di lavoro a fette + log per-batch (diagnostica);
+//   'off'  = fallback worker/main persistente (kill-switch/supporto).
+const TEX_GPU_MODE = (() => {
+  try {
+    const q = (new URLSearchParams(location.search).get('texgpu') || '').toLowerCase();
+    if (q === 'fast' || q === 'safe') { localStorage.setItem('fable-paint.texgpu', q); return q; }
+    if (q === 'on' || q === '1' || q === 'true') {
+      localStorage.setItem('fable-paint.texgpu', 'fast');
+      return 'fast';
+    }
+    if (q === 'off') { localStorage.setItem('fable-paint.texgpu', 'off'); return 'off'; }
+    const s = localStorage.getItem('fable-paint.texgpu');
+    return s === 'fast' || s === 'safe' || s === 'off' ? s : s === '1' ? 'fast' : 'fast';
+  } catch { return 'fast'; }
+})();
 
 export const WGSL_STROKE = /* wgsl */ `
 struct Params {
@@ -51,6 +75,11 @@ struct Params {
 @group(0) @binding(2) var<storage, read> lut: array<u32>;
 @group(0) @binding(3) var<storage, read> recs: array<u32>;
 @group(0) @binding(4) var<uniform> P: Params;
+// tile della grana ANCORATA al canvas, per slot (fattore 1B/px e RGBX
+// 4B/px, stessi byte dei tile CPU del Rasterizer): dummy quando il tratto
+// non ha texture — i record senza flag non li leggono mai
+@group(0) @binding(5) var<storage, read> tileLum: array<u32>;
+@group(0) @binding(6) var<storage, read> tileRgb: array<u32>;
 
 fn div255(x: u32) -> u32 {
   let t = x + 128u;
@@ -145,6 +174,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let gy = P.chunkOY + i32(gid.y);
   if (gx < P.clipX0 || gx > P.clipX1 || gy < P.clipY0 || gy > P.clipY1) { return; }
   let pi = P.slotBase + (gid.y << 8u) + gid.x;
+  // indici tile del pixel: slotBase = slot·65536 -> slot = slotBase>>16;
+  // lum a 1B/px (16384 u32/slot), rgbx a 4B/px (65536 u32/slot)
+  let li = (gid.y << 8u) + gid.x;
+  let lumBase = (P.slotBase >> 16u) * 16384u;
+  let rgbBase = P.slotBase + li;
   let p = arena[pi];
   var pr = p & 0xffu;
   var pg = (p >> 8u) & 0xffu;
@@ -154,36 +188,69 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var i = 0u; i < P.recCount; i = i + 1u) {
     let o = i * 12u;
     if (recs[o] == 0u) {
-      // dab: maschera CPU + interi (wash >= / buildup), come wgpu_dab.js
+      // dab: maschera CPU + interi (wash >= / buildup), come wgpu_dab.js;
+      // flags: 1 = ×fattore tile (grana fissa: m2=div255(m·f) PRIMA di
+      // a255, come _dabTile), 2 = colore dal tile RGBX, 4 = colore per
+      // stamp dall'atlas (grana moving in modalità colore — la maschera
+      // moving arriva già pre-modulata dal bake CPU, qui è un dab normale)
       let mx = gx - bitcast<i32>(recs[o + 1u]);
       let my = gy - bitcast<i32>(recs[o + 2u]);
       let size = recs[o + 3u];
       if (mx < 0 || my < 0 || mx >= i32(size) || my >= i32(size)) { continue; }
-      let m = maskByte(recs[o + 4u] + u32(my) * size + u32(mx));
+      let flags = recs[o + 9u];
+      var m = maskByte(recs[o + 4u] + u32(my) * size + u32(mx));
       if (m == 0u) { continue; }
+      if ((flags & 1u) != 0u) {
+        let f = (tileLum[lumBase + (li >> 2u)] >> (8u * (li & 3u))) & 0xffu;
+        m = div255(m * f);
+        if (m == 0u) { continue; }
+      }
       let ma = div255(m * recs[o + 5u]);
       if (ma == 0u) { continue; }
+      var cr = recs[o + 6u];
+      var cg = recs[o + 7u];
+      var cb = recs[o + 8u];
+      if ((flags & 2u) != 0u) {
+        let px4 = tileRgb[rgbBase];
+        cr = px4 & 0xffu; cg = (px4 >> 8u) & 0xffu; cb = (px4 >> 16u) & 0xffu;
+      } else if ((flags & 4u) != 0u) {
+        let ci = recs[o + 10u] + (u32(my) * size + u32(mx)) * 3u;
+        cr = maskByte(ci); cg = maskByte(ci + 1u); cb = maskByte(ci + 2u);
+      }
       if (P.buildup != 0u) {
         let inv = 255u - ma;
-        pr = div255(recs[o + 6u] * ma) + div255(pr * inv);
-        pg = div255(recs[o + 7u] * ma) + div255(pg * inv);
-        pb = div255(recs[o + 8u] * ma) + div255(pb * inv);
+        pr = div255(cr * ma) + div255(pr * inv);
+        pg = div255(cg * ma) + div255(pg * inv);
+        pb = div255(cb * ma) + div255(pb * inv);
         pa = ma + div255(pa * inv);
         wrote = true;
       } else if (ma >= pa) {
-        pr = div255(recs[o + 6u] * ma);
-        pg = div255(recs[o + 7u] * ma);
-        pb = div255(recs[o + 8u] * ma);
+        pr = div255(cr * ma);
+        pg = div255(cg * ma);
+        pb = div255(cb * ma);
         pa = ma;
         wrote = true;
       }
     } else {
-      // capsule v2: sempre wash, tie al primo (>)
-      let ma = capsuleMa(o, gx * 32 + 16, gy * 32 + 16);
+      // capsule v2: sempre wash, tie al primo (>); flags[10]: 1 = ×fattore
+      // tile (ma=div255(maB·f), come _capsuleTex), 2 = colore dal tile RGBX
+      var ma = capsuleMa(o, gx * 32 + 16, gy * 32 + 16);
+      let flags = recs[o + 10u];
+      if (ma != 0u && (flags & 1u) != 0u) {
+        let f = (tileLum[lumBase + (li >> 2u)] >> (8u * (li & 3u))) & 0xffu;
+        ma = div255(ma * f);
+      }
       if (ma > pa) {
-        pr = div255(P.capR * ma);
-        pg = div255(P.capG * ma);
-        pb = div255(P.capB * ma);
+        var cr = P.capR;
+        var cg = P.capG;
+        var cb = P.capB;
+        if ((flags & 2u) != 0u) {
+          let px4 = tileRgb[rgbBase];
+          cr = px4 & 0xffu; cg = (px4 >> 8u) & 0xffu; cb = (px4 >> 16u) & 0xffu;
+        }
+        pr = div255(cr * ma);
+        pg = div255(cg * ma);
+        pb = div255(cb * ma);
         pa = ma;
         wrote = true;
       }
@@ -232,6 +299,21 @@ export class WgpuStrokeBridge {
     this._atlasOff = new Map();
     /** @type {{off: number, mask: Uint8Array}[]} */
     this._maskWrites = [];
+    // GRANA ANCORATA al canvas: tile per slot (fattore 1B/px, RGBX 4B/px in
+    // modalità colore) cotti dal Rasterizer del main (this._raster._tile —
+    // stessi byte del CPU per costruzione) e caricati quando il chunk
+    // prende lo slot. Buffer creati pigri al primo tratto texture, dummy
+    // nel bind group fino ad allora.
+    /** @type {any} */ this._tileLum = null;
+    /** @type {any} */ this._tileRgb = null;
+    /** @type {any} */ this._dummyTile = null;
+    /** @type {{key: number, slot: number}[]} */
+    this._tileWrites = [];
+    this._tileMode = 0;      // 0 = niente grana fissa, 1 = fattore, 2 = +RGBX
+    this._movingTex = false; // grana moving: maschere pre-modulate dal bake
+    this._texSafe = false;   // tratto texture in modalità 'safe' (cap+log)
+    /** @type {import('./raster.js').Rasterizer|null} fonte tile/bake (main) */
+    this._raster = null;
     // store specchio: i chunk CPU dove atterrano i readback (il renderer e
     // il commit leggono da qui, come per il worker)
     this.store = new ChunkStore('gpu-stroke', null);
@@ -302,6 +384,8 @@ export class WgpuStrokeBridge {
         { binding: 2, visibility: 4, buffer: { type: 'read-only-storage' } },
         { binding: 3, visibility: 4, buffer: { type: 'read-only-storage' } },
         { binding: 4, visibility: 4, buffer: { type: 'uniform', hasDynamicOffset: true } },
+        { binding: 5, visibility: 4, buffer: { type: 'read-only-storage' } },
+        { binding: 6, visibility: 4, buffer: { type: 'read-only-storage' } },
       ],
     });
     this.pipeline = await dev.createComputePipelineAsync({
@@ -316,6 +400,8 @@ export class WgpuStrokeBridge {
     this._growArena(ARENA_START);
     // COPY_SRC anche sull'atlas: la crescita copia il vecchio nel nuovo
     this._atlas = dev.createBuffer({ size: this._atlasCap, usage: 0x80 | 0x8 | 0x4 });
+    // segnaposto dei binding tile quando il tratto non ha grana fissa
+    this._dummyTile = dev.createBuffer({ size: 16, usage: /* STORAGE */ 0x80 });
     this.usable = true;
     // device perso (Android in background, TDR): il ponte si spegne e sveglia
     // l'app, che ributta l'eventuale tratto in corso sul CPU (stessi byte) —
@@ -338,10 +424,32 @@ export class WgpuStrokeBridge {
       dev.queue.submit([enc.finish()]);
       this._arena.destroy();
     }
+    // i tile seguono l'arena slot per slot: stessa crescita, con copia (gli
+    // slot già assegnati mantengono la grana caricata)
+    if (this._tileLum) {
+      this._tileLum = this._growCopy(this._tileLum, this._arenaSlots * CHUNK * CHUNK,
+        slots * CHUNK * CHUNK);
+    }
+    if (this._tileRgb) {
+      this._tileRgb = this._growCopy(this._tileRgb, this._arenaSlots * SLOT_WORDS * 4,
+        slots * SLOT_WORDS * 4);
+    }
     for (let i = this._arenaSlots; i < slots; i++) this._freeSlots.push(i);
     this._arena = nb;
     this._arenaSlots = slots;
     this._bind = null; // il bind group referenzia l'arena vecchia
+  }
+
+  /** Ricrea un buffer storage più grande copiando il contenuto vecchio.
+   * @param {any} buf @param {number} oldBytes @param {number} newBytes */
+  _growCopy(buf, oldBytes, newBytes) {
+    const dev = this.device;
+    const nb = dev.createBuffer({ size: newBytes, usage: 0x80 | 0x8 | 0x4 });
+    const enc = dev.createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, nb, 0, oldBytes);
+    dev.queue.submit([enc.finish()]);
+    buf.destroy();
+    return nb;
   }
 
   get idle() {
@@ -353,24 +461,55 @@ export class WgpuStrokeBridge {
   get backlog() { return Math.max(0, this.sent - (this.direct ? this.presentDrained : this.tickDrained)); }
 
   /**
-   * Gate per-tratto (come il bridge worker): niente aqua/texture/selezione.
+   * Gate per-tratto (come il bridge worker): niente aqua/selezione. La
+   * TEXTURE passa: grana fissa = tile per chunk cotti dal Rasterizer del
+   * main e caricati per slot; grana moving = maschere pre-modulate dal bake
+   * CPU nell'atlas (il kernel non se ne accorge). Serve `raster` come fonte
+   * di tile e bake — senza, i tratti texture ripiegano su worker/main.
    * @param {import('./stroke.js').Snap} snap
    * @param {{x0:number,y0:number,x1:number,y1:number}} clip
    * @param {object|null} sel
    * @param {import('./brush.js').StampCache} cache
+   * @param {import('./raster.js').Rasterizer|null} [raster]
    */
-  beginStroke(snap, clip, sel, cache) {
-    if (!this.usable || sel !== null || snap.aqua || snap.tex) return false;
+  beginStroke(snap, clip, sel, cache, raster = null) {
+    if (!this.usable || sel !== null || snap.aqua) return false;
+    const tex = !!(snap.tex && snap.texLut);
+    if (tex && (!raster || TEX_GPU_MODE === 'off')) return false;
+    // 'safe' = tetto di lavoro + log per-batch; 'fast' = path originale
+    this._texSafe = tex && TEX_GPU_MODE === 'safe';
     this._snap = snap;
     this._clip = { ...clip };
     this._cache = cache;
+    this._raster = raster;
+    this._movingTex = tex && snap.texMoving;
+    this._tileMode = tex && !snap.texMoving ? (snap.texColor ? 2 : 1) : 0;
     this._hq = quantHardness(snap.hardness);
+    this._ensureTileBufs();
     this._resetGpuState();
     this._endpassZero = null;
     this.presentDrained = this.sent;
     this.statBytes = 0;
     this.statBatches = 0;
     return true;
+  }
+
+  // Buffer dei tile della grana fissa, pigri (solo chi usa texture li paga)
+  // e in lockstep con gli slot dell'arena.
+  _ensureTileBufs() {
+    const dev = this.device;
+    if (this._tileMode > 0 && !this._tileLum) {
+      this._tileLum = dev.createBuffer({
+        size: this._arenaSlots * CHUNK * CHUNK, usage: 0x80 | 0x8 | 0x4,
+      });
+      this._bind = null;
+    }
+    if (this._tileMode === 2 && !this._tileRgb) {
+      this._tileRgb = dev.createBuffer({
+        size: this._arenaSlots * SLOT_WORDS * 4, usage: 0x80 | 0x8 | 0x4,
+      });
+      this._bind = null;
+    }
   }
 
   _resetGpuState() {
@@ -382,6 +521,7 @@ export class WgpuStrokeBridge {
     this._atlasOff.clear();
     this._atlasUsed = 0;
     this._maskWrites.length = 0;
+    this._tileWrites.length = 0;
     this._recs.length = 0;
     this._chunks.clear();
     this._dirty.clear();
@@ -413,6 +553,9 @@ export class WgpuStrokeBridge {
     this._recs.length = 0;
     this._chunks.clear();
     this._dirty.clear();
+    // il replay riassegna gli slot: i tile pendenti puntano a slot vecchi
+    // (i nuovi _touch li rimettono in coda per gli slot giusti)
+    this._tileWrites.length = 0;
   }
 
   /** @param {object} stamp @param {Uint8Array} mask */
@@ -473,19 +616,40 @@ export class WgpuStrokeBridge {
             snap.shape, snap.shapeInvert);
           const ix = Math.round(x - stamp.half);
           const iy = Math.round(y - stamp.half);
-          const off = this._atlasFor(stamp, stamp.mask);
+          // stesse diramazioni texture di Rasterizer._dab (parità = stessi
+          // rami): moving = maschera pre-modulata (+RGB per stamp nel
+          // colore), fissa = flag tile (fattore, +RGBX nel colore)
+          let mask = stamp.mask;
+          /** @type {object} */ let maskKey = stamp;
+          let flags = 0, rgbOff = 0;
+          if (this._movingTex) {
+            const baked = /** @type {NonNullable<typeof this._raster>} */ (this._raster)
+              ._bakedStamp(stamp, snap.texColor);
+            mask = baked.mask;
+            maskKey = baked;
+            if (snap.texColor && baked.rgb) {
+              flags = 4;
+              rgbOff = this._atlasFor(baked.rgb, baked.rgb);
+            }
+          } else if (this._tileMode > 0) {
+            flags = this._tileMode === 2 ? 3 : 1;
+          }
+          const off = this._atlasFor(maskKey, mask);
           this._recs.push(0, ix, iy, stamp.size, off, a255,
-            q[o + 6], q[o + 7], q[o + 8], 0, 0, 0);
+            q[o + 6], q[o + 7], q[o + 8], flags, rgbOff, 0);
           this._touch(ix, iy, ix + stamp.size - 1, iy + stamp.size - 1, clip);
         }
       } else {
         const s0 = this._recs.length;
+        // capsule: la grana FISSA modula (flags come _capsuleTex); la
+        // moving NO — sul CPU _capsule con texMoving dipinge liscio
+        const capFlags = this._tileMode > 0 ? (this._tileMode === 2 ? 3 : 1) : 0;
         const tmp = /** @type {number[]} */ ([]);
         capsuleIntParams(q[o + 1], q[o + 2], q[o + 3], q[o + 4],
           q[o + 5], q[o + 6], q[o + 7], q[o + 8], tmp);
         for (let t = 0; t < tmp.length; t += CAP_STRIDE_I32) {
           this._recs.push(1, tmp[t], tmp[t + 1], tmp[t + 2], tmp[t + 3], tmp[t + 4],
-            tmp[t + 5], tmp[t + 6], tmp[t + 7], tmp[t + 8], 0, 0);
+            tmp[t + 5], tmp[t + 6], tmp[t + 7], tmp[t + 8], capFlags, 0);
           const rMax = tmp[t + 6] > 0 ? tmp[t + 5] + tmp[t + 6] : tmp[t + 5];
           const mR = rMax / CAP_FP + 1;
           const xLo = Math.min(tmp[t], tmp[t] + tmp[t + 2]) / CAP_FP;
@@ -518,6 +682,9 @@ export class WgpuStrokeBridge {
           const slot = /** @type {number} */ (this._freeSlots.pop());
           this._slotOf.set(key, slot);
           this._needClear.add(slot);
+          // grana fissa: lo slot nuovo riceve il tile del chunk (upload al
+          // prossimo tick, prima del dispatch)
+          if (this._tileMode > 0) this._tileWrites.push({ key, slot });
           // slot fresco su un chunk CPU preesistente (endpass): la copia CPU
           // è stantia rispetto al GPU azzerato — la prima rilettura dev'essere
           // il chunk INTERO, o le righe fuori banda terrebbero pixel vecchi
@@ -554,13 +721,31 @@ export class WgpuStrokeBridge {
     const dev = this.device;
     const snap = /** @type {NonNullable<typeof this._snap>} */ (this._snap);
     const clip = /** @type {NonNullable<typeof this._clip>} */ (this._clip);
-    const recs = new Uint32Array(this._recs.length);
-    const recsI = new Int32Array(recs.buffer);
-    for (let i = 0; i < this._recs.length; i++) recsI[i] = this._recs[i];
-    const recCount = this._recs.length / REC_U32;
+    if (this._recs.length % REC_U32 !== 0) {
+      console.warn('[wgpu_stroke] record DISALLINEATI:', this._recs.length);
+    }
     const chunkKeys = [...this._chunks];
-    this._recs.length = 0;
-    this._chunks.clear();
+    // Solo texgpu=safe usa il tetto di lavoro: texgpu=fast deve restare il
+    // path originale, un batch per tick, per il confronto A/B sul campo.
+    const totalRecs = this._recs.length / REC_U32;
+    const maxRecs = this._texSafe
+      ? Math.max(64, Math.floor(WORK_CAP / Math.max(1, chunkKeys.length * SLOT_WORDS)))
+      : totalRecs;
+    const recCount = Math.min(totalRecs, maxRecs);
+    const partial = totalRecs > recCount;
+    const recs = new Uint32Array(recCount * REC_U32);
+    const recsI = new Int32Array(recs.buffer);
+    for (let i = 0; i < recCount * REC_U32; i++) recsI[i] = this._recs[i];
+    if (partial) this._recs.splice(0, recCount * REC_U32);
+    else this._recs.length = 0;
+    if (!partial) this._chunks.clear();
+    if (this._texSafe) {
+      console.info('[wgpu_stroke] batch tex', {
+        recCount, totalRecs, chunks: chunkKeys.length,
+        workMrp: Math.round(recCount * chunkKeys.length * SLOT_WORDS / 1e6),
+        tileMode: this._tileMode, moving: this._movingTex, partial,
+      });
+    }
 
     for (const w of this._maskWrites) {
       // multipli di 4: parte allineata diretta, coda paddata
@@ -573,6 +758,23 @@ export class WgpuStrokeBridge {
       }
     }
     this._maskWrites.length = 0;
+
+    // tile della grana fissa per gli slot appena assegnati: cotti dal
+    // Rasterizer del main (LRU suo: stessi byte del path CPU) e scritti
+    // prima del dispatch (le op di coda sono ordinate)
+    if (this._tileWrites.length > 0) {
+      const raster = /** @type {NonNullable<typeof this._raster>} */ (this._raster);
+      for (const w of this._tileWrites) {
+        const chunk = this.store.getByKey(w.key);
+        if (!chunk) continue;
+        const t = raster._tile(chunk, this._tileMode === 2);
+        dev.queue.writeBuffer(this._tileLum, w.slot * CHUNK * CHUNK, t.lum);
+        if (this._tileMode === 2 && t.rgbx) {
+          dev.queue.writeBuffer(this._tileRgb, w.slot * SLOT_WORDS * 4, t.rgbx);
+        }
+      }
+      this._tileWrites.length = 0;
+    }
 
     // buffer PERSISTENTI: si riallocano solo alla crescita (i destroy sono
     // differiti dal driver a GPU-idle; i writeBuffer sono ordinati sulla
@@ -617,6 +819,8 @@ export class WgpuStrokeBridge {
           { binding: 2, resource: { buffer: this._lutBuf } },
           { binding: 3, resource: { buffer: this._recBuf } },
           { binding: 4, resource: { buffer: this._uniBuf, size: 64 } },
+          { binding: 5, resource: { buffer: this._tileLum || this._dummyTile } },
+          { binding: 6, resource: { buffer: this._tileRgb || this._dummyTile } },
         ],
       });
     }
@@ -641,8 +845,12 @@ export class WgpuStrokeBridge {
       pass.end();
       dev.queue.submit([enc.finish()]);
       this.statBatches++;
-      this.presentDrained = this.sent;
-      this._dirty.clear();
+      // fetta parziale: entry non ancora tutte a schermo — l'overlay
+      // continua a coprire finché l'ultima fetta non è dispatchata
+      if (!partial) {
+        this.presentDrained = this.sent;
+        this._dirty.clear();
+      }
       return;
     }
 
@@ -656,7 +864,7 @@ export class WgpuStrokeBridge {
       bands.push({ key, ry0: d.y0, ry1: d.y1, x0: d.x0, x1: d.x1, off: stagingBytes });
       stagingBytes += (d.y1 - d.y0 + 1) * CHUNK * 4;
     }
-    this._dirty.clear();
+    if (!partial) this._dirty.clear();
 
     const sb = this._acquireStaging(stagingBytes);
 
@@ -682,7 +890,9 @@ export class WgpuStrokeBridge {
     this.statBytes += stagingBytes;
 
     const gen = this.gen;
-    const drainedTo = this.sent;
+    // fetta parziale: le entry non sono tutte dispatchate, il drained non
+    // avanza (l'ultima fetta porta tutto a this.sent)
+    const drainedTo = partial ? this.tickDrained : this.sent;
     const tSubmit = performance.now();
     this._inflight++;
     sb.buf.mapAsync(1, 0, stagingBytes).then(() => {

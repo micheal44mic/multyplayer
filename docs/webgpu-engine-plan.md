@@ -261,6 +261,44 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   classe+badge "perf mid", tratto ok, UI sync schedulato, boost armato
   dall'attività input reale; 0 errori console; main.js ai 12 tsc noti.
 
+## TEXTURE BRUSH GPU-DIRECT (FATTO 04/07 notte — DEFAULT FAST)
+
+- Il ponte accetta la texture (gate: solo aqua/selezione escluse; serve il
+  Rasterizer del main come 5° arg di beginStroke — fonte tile/bake).
+- **Grana FISSA** (ancorata al canvas): tile per slot in 2 storage buffer
+  nuovi in lockstep con l'arena (tileLum 1B/px, tileRgb RGBX 4B/px solo in
+  modalità colore; pigri, dummy nel bind group senza texture; crescono con
+  copia in _growArena) — cotti su CPU da raster._tile (STESSI byte del
+  path CPU) e caricati quando il chunk prende lo slot. Kernel: flag per
+  record — dab bit0 = m2=div255(m·f) PRIMA di a255 (ordine di _dabTile),
+  bit1 = colore dal tile RGBX, capsule flag in parola 10 (ma=div255(maB·f),
+  tie > invariato — semantica _capsuleTex).
+- **Grana MOVING**: maschera pre-modulata dal bake CPU (_bakedStamp)
+  nell'atlas al posto di quella liscia — kernel invariato; in modalità
+  colore l'RGB per stamp va nell'atlas (dab bit2 + offset in parola 10).
+  Le capsule con moving restano LISCE, come fa il CPU (!texMoving in
+  _capsule). Stride record invariato (12 parole).
+- **VERIFICA bit-exact nel preview** (differenziale: descrittori del
+  tratto GPU reale registrati e rigiocati su un Rasterizer CPU fresco,
+  confronto byte del layer committato): 8 scenari TUTTI 0-diff — fissa 0°,
+  fissa 27°, fissa texColor, moving+buildup, moving+texColor+buildup,
+  taper 60%+27°, fissa buildup 27°, fissa texColor 220px multi-chunk.
+  TRAPPOLA DELL'HARNESS: registrare i pop della coda raccoglie live+replay
+  — l'endpass azzera gli slot e rigioca tutto, quindi la registrazione va
+  AZZERATA a endPassBegin o il confronto conta la punta provvisoria.
+- **SAFETY**: solo in `?texgpu=safe`, tetto di lavoro per submit
+  (WORK_CAP 256M record-pixel — il
+  kernel cicla tutti i record per pixel; le fette parziali non avanzano
+  drained/dirty finché l'ultima non è dispatchata), assert di allineamento
+  record, log per-batch sui tratti texture. FREEZE VISTO 2 VOLTE in sviluppo
+  (rAF fermo, device NON perso, DOM vivo) e MAI PIÙ riprodotto dopo — tap,
+  tratti 40/60/120/220px tutti ok, batch fino a 99M rp lisci e cap mai
+  scattato: causa non confermata. Test campo: `fast` vero è risultato il
+  migliore e non freeza → default di prodotto = `fast`; `?texgpu=off`
+  persiste come kill-switch/fallback worker, `?texgpu=safe` resta solo per
+  diagnosi. Punto 5 del piano utente (spike commit/readback a fine tratto)
+  ancora da misurare; aqua/smudge dopo.
+
 ## PROSSIMI PASSI (in ordine)
 
 1. **Giro Auto v3 sul campo coi profili tier** (nomi nuovi = baseline
@@ -269,7 +307,10 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
    report; sul telefono si può forzare con localStorage fable-paint.tier).
    Giudicare A OCCHIO l'iPhone a dpr 2. Poi giudizio visivo complessivo e
    via il flag ?renderer=wgpu.
-2. **Collab su board coperti**: misurare lo spigolo scopri/ricopri (vedi
+2. **Texture GPU sul campo**: ora default `fast`; ritestare desktop/
+   Android/iPad a fit guardando la riga GPU tratto e assenza freeze. Poi
+   misurare gli spike di commit/readback a fine tratto.
+3. **Collab su board coperti**: misurare lo spigolo scopri/ricopri (vedi
    sopra) prima di dichiarare il proxy finito.
 2. **Tier memoria/dispositivo** per l'harness: cap del profilo generato su
    iOS/mobile (report targetPixelBytes/estimatedPaintBytes già esposti).

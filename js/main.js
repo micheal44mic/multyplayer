@@ -1682,10 +1682,12 @@ export class App {
     // stroke buffer WebGPU (fase 1): il tratto vivo rasterizza su GPU coi
     // kernel sigillati bit-exact; i pixel atterrano async nello store
     // specchio (l'ink overlay copre il volo). Gate per-tratto: niente
-    // aqua/texture/selezione — fallback worker, poi main.
+    // aqua/selezione — fallback worker, poi main. La TEXTURE passa: il
+    // Rasterizer del main fa da fonte di tile e maschere cotte (stessi byte).
     const snap = /** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap);
     if (this.gpuStroke &&
-      this.gpuStroke.beginStroke(snap, this._strokeClip, this._strokeSel, this.raster.cache)) {
+      this.gpuStroke.beginStroke(snap, this._strokeClip, this._strokeSel,
+        this.raster.cache, this.raster)) {
       this.rasterMode = 'gpu';
       this.strokeStore = this.gpuStroke.store;
       this.curRaster = this.raster;
