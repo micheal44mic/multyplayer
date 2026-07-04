@@ -134,15 +134,44 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   coda all'encoder del frame. Verificata: miss→HIT pixel identici→miss al
   cambio contenuto→HIT. screenCacheHitThisFrame esposto per il pannello.
 
+## MISURE DAL CAMPO 04/07 (Field/Auto)
+
+- Aggiunto harness nel pannello perf: **Field** manuale e **Auto** sintetico
+  con report JSON (`fable-paint-field-test`). Auto v5 distingue i profili:
+  desktop/Android = `ultra-16c-1p2g-v1` (16 canvas, 5 layer pieni/canvas,
+  5120 chunk, ~1.25 GiB pixel live); iOS = `ios-limit-12c-0p75g-v1`
+  (12 canvas, 4 layer pieni/canvas, ~0.75 GiB pixel live) perché il profilo
+  1.25 GiB chiude/crasha la tab su iPhone prima del report.
+- **Desktop Chrome + Cloudflare HTTPS + WebGPU/SAB ok**, ultra 16c/1.25GiB:
+  pennello texture/taper 0/0 passa in worker (texture esclude gpuStroke), non
+  in GPU; stroke non è il collo principale. Il collasso è pan/zoom/overview:
+  `liveVisibleChunks=5120`, `presentMs/planesMs` fino a ~1.17s,
+  slow bucket `live-chunk-render`. Memoria: ~1.27GiB WASM/pixel e ~1.31GiB
+  stima GPU.
+- **Android Chrome + Cloudflare HTTPS + WebGPU/SAB ok**, ultra 16c/1.25GiB:
+  completa ma inutilizzabile: stroke texture a fit già ~30fps con p95 ~43ms
+  e max ~150ms; pan/zoom ha frame multi-secondo (fino a ~5-6s). Anche qui il
+  problema dominante è `planes/present` con centinaia/migliaia di chunk vivi,
+  non il raster del pennello (`rasterMs` medio basso).
+- **iPhone/Safari**: via HTTP LAN il report era WebGL2 (`secureContext=false`,
+  `webgpu=false`), quindi non valido per WebGPU. Via HTTPS Cloudflare il
+  profilo 16c/1.25GiB crasha direttamente; usare il profilo iOS v5 per
+  trovare il limite reale senza perdere il report.
+- Conclusione: obiettivo "0 lag" NON raggiunto sui progetti grandi. Il
+  collo di bottiglia urgente non è solo il pennello: sotto WebGPU manca un
+  proxy/flatten/LOD per non presentare migliaia di texture chunk vive.
+
 ## PROSSIMI PASSI (in ordine)
 
 1. **Proxy zoom-out o equivalente** (ultimo pezzo per togliere il flag):
    oggi null sotto wgpu (come sotto 2D). Con mip + screen-cache restano
    coperti qualità e frame fermi; il costo scoperto è il PAN/ZOOM con
-   decine di board. DECIDERE dopo le misure dal campo: o port del bake
-   proxy (board_proxy è accoppiato al GL) o equivalente wgpu-nativo — che
-   in fase 2.3 (layer GPU-residenti) diventa quasi gratis (flatten del
-   board = un pass). Poi giudizio visivo umano complessivo e via il flag.
+   decine di board. Le misure 04/07 lo rendono P0: senza proxy/flatten il
+   WebGPU present crolla su 16 canvas/1.25GiB e lagga già durante stroke
+   perché presenta centinaia di chunk vivi. Port del bake proxy (oggi
+   accoppiato al GL) o equivalente wgpu-nativo; in fase 2.3 (layer
+   GPU-residenti) diventa quasi gratis (flatten del board = un pass). Poi
+   giudizio visivo umano complessivo e via il flag.
 2. **Misure dal campo**: pannello perf (riga GPU tratto) su desktop a mano
    e telefoni via HTTPS LAN (proxy scratchpad su 8443 → 8002, cert 30gg;
    navigator.gpu/SAB SOLO in contesto sicuro; sul telefono aprire UNA volta

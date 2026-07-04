@@ -196,6 +196,22 @@ export class WgpuRenderer {
     /** @type {any} */ this._bgl = null;
     /** @type {any} */ this._uniBuf = null;
     this._uniCap = 0;
+    // mirror CPU degli uniform, riusato tra i frame (cresce con _uniCap)
+    /** @type {ArrayBuffer|null} */ this._uniArr = null;
+    /** @type {Float32Array|null} */ this._uniF32 = null;
+    /** @type {Uint32Array|null} */ this._uniU32 = null;
+    // cache dei bind group: texture del livello -> Map(strokeId·8+sampId).
+    // Con gli uniform a offset dinamici il bind group è riusabile tra draw e
+    // tra frame; _bgEpoch invalida tutto quando _uniBuf o _bdTex rinascono
+    // (i bind group catturano QUELLE risorse alla creazione).
+    /** @type {WeakMap<any, Map<number, {epoch: number, bind: any}>>} */
+    this._bg = new WeakMap();
+    this._bgEpoch = 0;
+    /** @type {WeakMap<any, number>} id stabile per le texture del tratto */
+    this._texId = new WeakMap();
+    this._texIdNext = 1;
+    /** @type {Map<any, number>} id stabile per i sampler (insieme piccolo) */
+    this._sampIds = new Map();
     /** @type {string} */ this._format = 'bgra8unorm';
     /** @type {WeakMap<Chunk, any>} texture per chunk (possedute qui) */
     this._tex = new WeakMap();
@@ -396,18 +412,76 @@ export class WgpuRenderer {
     return tex;
   }
 
-  /** View cache: full (trilinear nel pass principale) + per livello (blit).
+  /** View cache: full (trilinear nel pass principale) + per livello (blit)
+   * + bind group del blit mip per livello (creati pigri, stabili per texture).
    * @param {any} tex */
   _viewsOf(tex) {
     let v = this._views.get(tex);
     if (!v) {
-      v = { full: tex.createView(), level: [] };
+      v = { full: tex.createView(), level: [], mipBind: [] };
       for (let l = 0; l < tex.mipLevelCount; l++) {
         v.level.push(tex.createView({ baseMipLevel: l, mipLevelCount: 1 }));
       }
       this._views.set(tex, v);
     }
     return v;
+  }
+
+  /** Bind group del blit mip verso il livello l (campiona l-1): riusato.
+   * @param {any} tex @param {number} l */
+  _mipBindOf(tex, l) {
+    const v = this._viewsOf(tex);
+    let bg = v.mipBind[l];
+    if (!bg) {
+      bg = v.mipBind[l] = this.device.createBindGroup({
+        layout: this._mipBgl,
+        entries: [
+          { binding: 0, resource: this._mipSampler },
+          { binding: 1, resource: v.level[l - 1] },
+        ],
+      });
+    }
+    return bg;
+  }
+
+  /** Bind group del pass principale, dalla cache (vedi _bg nel costruttore).
+   * @param {any} lt texture del livello @param {any} st texture del tratto
+   * @param {any} sampler */
+  _bindFor(lt, st, sampler) {
+    let m = this._bg.get(lt);
+    if (!m) { m = new Map(); this._bg.set(lt, m); }
+    let sampId = this._sampIds.get(sampler);
+    if (sampId === undefined) {
+      sampId = this._sampIds.size;
+      this._sampIds.set(sampler, sampId);
+    }
+    let stId = this._texId.get(st);
+    if (stId === undefined) {
+      stId = this._texIdNext++;
+      this._texId.set(st, stId);
+    }
+    const key = stId * 8 + sampId;
+    let e = m.get(key);
+    if (!e || e.epoch !== this._bgEpoch) {
+      // le entry stantie (tratto finito, epoch vecchia) non tornano mai in
+      // lookup: un cap tiene la mappa piccola senza contabilità fine
+      if (m.size >= 64) m.clear();
+      e = {
+        epoch: this._bgEpoch,
+        bind: this.device.createBindGroup({
+          layout: this._bgl,
+          entries: [
+            { binding: 0, resource: sampler },
+            { binding: 1, resource: this._viewsOf(lt).full },
+            { binding: 2, resource: this._viewsOf(st).full },
+            { binding: 3, resource: { buffer: this._uniBuf, size: 64 } },
+            { binding: 4, resource: this._viewsOf(this._bdTex || this._white).full },
+          ],
+        }),
+      };
+      m.set(key, e);
+    }
+    return e.bind;
   }
 
   /** @param {Chunk} chunk */
@@ -453,7 +527,8 @@ export class WgpuRenderer {
     this.device.queue.copyExternalImageToTexture(
       { source: cv }, { texture: tex, premultipliedAlpha: true },
       [cv.width, cv.height]);
-    mipGen.push(tex); // catena subito buona: lo zoom può scendere quando vuole
+    // catena subito buona e intera: lo zoom può scendere quando vuole
+    mipGen.push({ tex, lv: tex.mipLevelCount });
     q.texDirty = false;
     this.uploadsThisFrame++;
     return tex;
@@ -606,11 +681,18 @@ export class WgpuRenderer {
     // minificazione: sotto zoom 1 si campionano i mip (come il GL); i chunk
     // col livello 0 cambiato rigenerano la catena in questo stesso encoder
     const wantMips = camera.zoom < 1;
-    /** @type {any[]} texture con catena mip da rigenerare questo frame */
+    // i chunk del tratto vivo cambiano OGNI frame: rigenerare la catena
+    // intera (8 blit/chunk/frame) è una tassa — bastano i livelli
+    // campionabili allo zoom corrente (+1 di margine); la catena piena si
+    // rifà da sola al commit (upload → mips=false → rigenerazione completa)
+    const liveLv = wantMips
+      ? Math.min(MIP_LEVELS, Math.max(2, Math.ceil(Math.log2(1 / s)) + 2))
+      : 1;
+    /** @type {{tex: any, lv: number}[]} catene mip da rigenerare (lv livelli) */
     const mipGen = [];
-    const needMips = (/** @type {Chunk} */ chunk) => {
+    const needMips = (/** @type {Chunk} */ chunk, lv = MIP_LEVELS) => {
       if (wantMips && !chunk.mips) {
-        mipGen.push(this._tex.get(chunk));
+        mipGen.push({ tex: this._tex.get(chunk), lv });
         chunk.mips = true; // la catena si rigenera in questo frame
       }
     };
@@ -628,13 +710,14 @@ export class WgpuRenderer {
           if (!tex) tex = this._newTex(sc);
           copies.push({ slot, tex });
           // la copia riscrive il livello 0 a ogni frame: mip da rifare
-          if (wantMips) mipGen.push(tex);
+          // (solo i livelli usati a questo zoom — vedi liveLv)
+          if (wantMips) mipGen.push({ tex, lv: liveLv });
           return tex;
         }
       }
       // niente slot (ponte spento, chunk scoperto dall'endpass): via CPU
       if (sc.texDirty || !this._tex.has(sc)) this._uploadNow(sc);
-      needMips(sc);
+      needMips(sc, liveLv);
       return this._tex.get(sc);
     };
     const pushChunk = (/** @type {Chunk} */ chunk, /** @type {any} */ st,
@@ -874,28 +957,35 @@ export class WgpuRenderer {
       if (this._uniBuf) this._uniBuf.destroy();
       this._uniCap = need * 2;
       this._uniBuf = this.device.createBuffer({ size: this._uniCap, usage: 0x40 | 0x8 });
+      // mirror CPU in lockstep col buffer; i bind group cacheati puntano
+      // ancora al buffer vecchio: epoch nuova = si ricreano al prossimo uso
+      this._uniArr = new ArrayBuffer(this._uniCap);
+      this._uniF32 = new Float32Array(this._uniArr);
+      this._uniU32 = new Uint32Array(this._uniArr);
+      this._bgEpoch++;
     }
-    const uni = new ArrayBuffer(need);
+    const f = /** @type {Float32Array} */ (this._uniF32);
+    const u32 = /** @type {Uint32Array} */ (this._uniU32);
     for (let i = 0; i < flat.length; i++) {
       const d = flat[i];
-      const f = new Float32Array(uni, i * 256, 10);
-      const u32 = new Uint32Array(uni, i * 256, 12);
+      const o = i * 64; // 256 byte = 64 slot da 4
       if (d.quad) {
         // quad affine: p0 + assi (sessione Sposta/Trasforma)
-        f[0] = d.quad[0]; f[1] = d.quad[1];
-        f[2] = d.quad[2]; f[3] = d.quad[3];
-        f[4] = d.quad[4]; f[5] = d.quad[5];
+        f[o] = d.quad[0]; f[o + 1] = d.quad[1];
+        f[o + 2] = d.quad[2]; f[o + 3] = d.quad[3];
+        f[o + 4] = d.quad[4]; f[o + 5] = d.quad[5];
       } else {
-        f[0] = d.x0; f[1] = d.y0;
-        f[2] = d.x1 - d.x0; f[3] = 0;
-        f[4] = 0; f[5] = d.y1 - d.y0;
+        f[o] = d.x0; f[o + 1] = d.y0;
+        f[o + 2] = d.x1 - d.x0; f[o + 3] = 0;
+        f[o + 4] = 0; f[o + 5] = d.y1 - d.y0;
       }
-      f[6] = W; f[7] = H;
-      f[8] = d.a; f[9] = strokeOpacity;
-      u32[10] = d.mode;
-      u32[11] = d.blendFn || 0;
+      f[o + 6] = W; f[o + 7] = H;
+      f[o + 8] = d.a; f[o + 9] = strokeOpacity;
+      u32[o + 10] = d.mode;
+      u32[o + 11] = d.blendFn || 0;
     }
-    this.device.queue.writeBuffer(this._uniBuf, 0, uni);
+    this.device.queue.writeBuffer(this._uniBuf, 0,
+      /** @type {ArrayBuffer} */ (this._uniArr), 0, need);
 
     // filtri come il GL: mip in minificazione, linear fino a 3.8×, poi
     // nearest per il lavoro di dettaglio
@@ -913,16 +1003,10 @@ export class WgpuRenderer {
     }
     // rigenerazione mip: un blit per livello, ogni livello media 2×2 il
     // precedente (dopo le copie arena: il livello 0 è quello del frame)
-    for (const tex of mipGen) {
-      const v = this._viewsOf(tex);
-      for (let l = 1; l < v.level.length; l++) {
-        const bg = this.device.createBindGroup({
-          layout: this._mipBgl,
-          entries: [
-            { binding: 0, resource: this._mipSampler },
-            { binding: 1, resource: v.level[l - 1] },
-          ],
-        });
+    for (const g of mipGen) {
+      const v = this._viewsOf(g.tex);
+      const n = Math.min(g.lv, v.level.length);
+      for (let l = 1; l < n; l++) {
         const mp = enc.beginRenderPass({
           colorAttachments: [{
             view: v.level[l],
@@ -931,7 +1015,7 @@ export class WgpuRenderer {
           }],
         });
         mp.setPipeline(this._mipPipeline);
-        mp.setBindGroup(0, bg);
+        mp.setBindGroup(0, this._mipBindOf(g.tex, l));
         mp.draw(3);
         mp.end();
       }
@@ -958,16 +1042,7 @@ export class WgpuRenderer {
           scissOn = false;
         }
         const lt = d.lt === 'GRP' ? this._grpTex : d.lt;
-        const bind = this.device.createBindGroup({
-          layout: this._bgl,
-          entries: [
-            { binding: 0, resource: d.samp || samp },
-            { binding: 1, resource: this._viewsOf(lt || this._white).full },
-            { binding: 2, resource: this._viewsOf(d.st || this._white).full },
-            { binding: 3, resource: { buffer: this._uniBuf, size: 64 } },
-            { binding: 4, resource: this._viewsOf(this._bdTex || this._white).full },
-          ],
-        });
+        const bind = this._bindFor(lt || this._white, d.st || this._white, d.samp || samp);
         pass.setBindGroup(0, bind, [/** @type {number} */ (d._ui) * 256]);
         pass.draw(6);
       }
@@ -1088,6 +1163,9 @@ export class WgpuRenderer {
       size: [w, h], format: this._format,
       usage: /* TEXTURE_BINDING|COPY_DST */ 0x4 | 0x2,
     });
+    // i bind group cacheati campionano il backdrop VECCHIO (o il bianco se
+    // questa è la prima creazione): epoch nuova, si ricreano al prossimo uso
+    this._bgEpoch++;
   }
 
   /** FBO dei gruppi di ritaglio: texture canvas-size, ricreata al resize.
