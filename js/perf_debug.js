@@ -1,4 +1,5 @@
 import { brush } from './brush.js';
+import { deviceCaps, measureRefreshHz } from './device_tier.js';
 import { BLEND_MODES, makeRasterLayer, makeTextLayer } from './layers.js';
 import { CHUNK, CHUNK_BYTES } from './store.js';
 import { defaultTextStyle, makeTextItem, TEXT_FONTS, touchText } from './text_layer.js';
@@ -166,6 +167,7 @@ export class PerfDebugConsole {
     this._fieldReportText = '';
     this._autoStarting = false;
     this._autoStartToken = 0;
+    this._displayHz = 0;
     this._installDock();
     this._installLongTaskObserver();
     this._installUiStateObserver();
@@ -444,6 +446,10 @@ export class PerfDebugConsole {
       '',
     );
     await nextFrame();
+    // refresh reale del display, misurato PRIMA di caricare la scena (a
+    // scena su i rAF non sono più rappresentativi): entra nel report per
+    // leggere i p95 nel contesto giusto (16.7ms = 1 frame a 60Hz, 2 a 120)
+    this._displayHz = await measureRefreshHz();
     let automation;
     try {
       automation = this._prepareAutoFieldScene();
@@ -734,59 +740,55 @@ export class PerfDebugConsole {
   }
 
   _autoFieldOptions() {
-    const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
-    const ua = navigator.userAgent || '';
-    const mem = navigator.deviceMemory || 8;
-    const iphone = /iPhone|iPod/i.test(ua);
-    const ipad = /iPad/i.test(ua) || (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1);
-    const android = /Android/i.test(ua);
-    const ios = iphone || ipad;
-    const mobile = coarse || /Android|iPhone|iPad|iPod/i.test(ua);
-    const capped = mem > 0 && mem <= 4;
+    // TIER GENERALIZZATO (device_tier.js): il profilo deriva da segnali
+    // misurabili (memoria, core, DPR, pointer), non da branch rigidi per
+    // OS. Le TAGLIE restano quelle già validate sul campo: high = ultra
+    // 16c/1.25GiB, mid = 10c/0.64GiB, low = 8c/0.38GiB. L'unico vincolo
+    // di piattaforma esplicito è il TETTO iOS (jetsam uccide la tab a
+    // prescindere dalla potenza del chip). ?stress=ultra forza high.
+    const caps = deviceCaps();
     let stress = '';
     try { stress = (new URLSearchParams(location.search).get('stress') || '').toLowerCase(); } catch { /* ignore */ }
     const forceUltra = stress === 'ultra';
-    let profile = 'ultra-16c-1p2g-v1';
-    let boardTarget = 16;
-    let rasterLayers = 8;
-    let paintedLayers = 5;
-    let textLayers = mobile || capped ? 2 : 3;
-    if (iphone) {
-      profile = 'iphone-safe-6c-0p28g-v1';
-      boardTarget = 6;
-      rasterLayers = 5;
-      paintedLayers = 3;
-      textLayers = 1;
-    } else if (ipad) {
-      profile = 'ipad-safe-8c-0p38g-v1';
-      boardTarget = 8;
-      rasterLayers = 5;
-      paintedLayers = 3;
-      textLayers = 1;
-    } else if (android && !forceUltra) {
-      profile = capped ? 'android-safe-8c-0p38g-v2' : 'android-heavy-10c-0p64g-v2';
-      boardTarget = capped ? 8 : 10;
-      rasterLayers = capped ? 5 : 6;
-      paintedLayers = capped ? 3 : 4;
-      textLayers = capped ? 1 : 2;
+    const tier = forceUltra ? 'high' : caps.tier;
+    const SIZES = {
+      high: { profile: 'tier-high-16c-1p2g-v3', boardTarget: 16, rasterLayers: 8, paintedLayers: 5, textLayers: 3, marksPerChunk: 10, brushSize: 320, strokeSamplesPerTick: 4 },
+      mid: { profile: 'tier-mid-10c-0p64g-v3', boardTarget: 10, rasterLayers: 6, paintedLayers: 4, textLayers: 2, marksPerChunk: 8, brushSize: 240, strokeSamplesPerTick: 3 },
+      low: { profile: 'tier-low-8c-0p38g-v3', boardTarget: 8, rasterLayers: 5, paintedLayers: 3, textLayers: 1, marksPerChunk: 8, brushSize: 240, strokeSamplesPerTick: 3 },
+    };
+    let size = SIZES[tier];
+    // tetto iOS: vale anche sotto ?stress=ultra — il profilo grande
+    // chiudeva la tab su iPhone prima del report
+    if (caps.iphone) {
+      size = { profile: 'tier-ios-6c-0p28g-v3', boardTarget: 6, rasterLayers: 5, paintedLayers: 3, textLayers: 1, marksPerChunk: 6, brushSize: 180, strokeSamplesPerTick: 2 };
+    } else if (caps.ipad && tier !== 'low') {
+      size = { ...SIZES.low, profile: 'tier-ios-8c-0p38g-v3', marksPerChunk: 6, strokeSamplesPerTick: 2 };
     }
     const chunksPerLayer = 64;
-    const targetPixelBytes = boardTarget * paintedLayers * chunksPerLayer * CHUNK_BYTES;
+    const targetPixelBytes = size.boardTarget * size.paintedLayers * chunksPerLayer * CHUNK_BYTES;
     return {
       seed: 0xFABA11,
-      profile,
-      deviceClass: ios ? 'ios' : android ? 'android' : mobile ? 'mobile' : 'desktop',
-      boardTarget,
-      rasterLayers,
-      paintedLayers,
-      textLayers,
-      // 2048x2048 board = 8x8 chunks. Desktop keeps the full 16c/1.25GiB
-      // target; Android defaults to a heavy but preloadable profile. Use
-      // ?stress=ultra to force the original 16-board limit test on non-iOS.
+      profile: size.profile,
+      deviceClass: caps.ios ? 'ios' : /Android/i.test(navigator.userAgent || '') ? 'android'
+        : caps.mobile ? 'mobile' : 'desktop',
+      tier,
+      tierUnclamped: caps.unclamped,
+      caps: {
+        memGB: caps.memGB,
+        cores: caps.cores,
+        dpr: +caps.dpr.toFixed(2),
+        mobile: caps.mobile,
+        displayHz: this._displayHz || 0,
+      },
+      boardTarget: size.boardTarget,
+      rasterLayers: size.rasterLayers,
+      paintedLayers: size.paintedLayers,
+      textLayers: size.textLayers,
+      // 2048x2048 board = 8x8 chunks
       chunksPerLayer,
-      marksPerChunk: ios ? 6 : mobile || capped ? 8 : 10,
-      brushSize: iphone ? 180 : mobile || capped ? 240 : 320,
-      strokeSamplesPerTick: ios ? 2 : mobile || capped ? 3 : 4,
+      marksPerChunk: size.marksPerChunk,
+      brushSize: size.brushSize,
+      strokeSamplesPerTick: size.strokeSamplesPerTick,
       targetPixelBytes,
       strokeZoomFit: 0.88,
       textureScale: 0.42,
@@ -1453,7 +1455,7 @@ export class PerfDebugConsole {
       gpuEstimateBytes: bytes(diag.gpuEstimateBytes),
       gpuRenderer: diag.gpuRenderer,
       visibility: document.visibilityState,
-      androidLite: document.body.classList.contains('android-perf-mode'),
+      perfLite: document.body.classList.contains('perf-lite'),
       slow: frame.frameMs >= SLOW_FRAME_MS,
       bad: frame.frameMs >= BAD_FRAME_MS,
       likely: this._classify(frame, diag, proxy),
@@ -1755,7 +1757,7 @@ export class PerfDebugConsole {
       gpuRenderer: diag.gpuRenderer,
       gpuVendor: diag.gpuVendor,
       gpuMaxTextureSize: diag.gpuMaxTextureSize,
-      androidLite: document.body.classList.contains('android-perf-mode'),
+      perfLite: document.body.classList.contains('perf-lite'),
       bodyClass: document.body.className,
       // raster worker: se false, i tratti girano sul main (manca SAB o
       // COOP/COEP, o il worker è morto) e il backlog resterà 0 per definizione

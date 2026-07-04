@@ -209,13 +209,68 @@ e punto" — GPU ovunque ci sia WebGPU, fallback worker/main dove non c'è.
   Verifica: rebuild ferma con camera in moto continuo (serial fermo,
   loading segnalato), riparte e completa a camera ferma, 0 errori.
 
+## REGOLA PRODOTTO 04/07 NOTTE: MAI CANVAS BIANCHI (proxy-live) + TIER
+
+- Ritest dopo scheduling: Android heavy 10c/0.64GiB → preload 9/9 ~10.3s,
+  p95 stroke 5.87ms, pan/zoom 3.7ms, idle pulito; desktop ultra 16c →
+  15/15 ~9.1s, p95 1.83/1.84ms. MA il covering immediato mostrava board
+  bianchi finché il proxy non era pronto → REGOLA PRODOTTO: l'ottimizzazione
+  deve essere invisibile, mai board bianchi o spariti.
+- **Proxy-live (committato in d40579d, entrambe le varianti GL+wgpu)**: un
+  board si copre SOLO quando il suo proxy è ready E allineato alla
+  contentKey; se il contenuto di un board coperto cambia si SCOPRE subito
+  (torna live, serial bump per la screen-cache) e si ricopre a rebuild
+  finita. Budget build col floor a TEXT_COST (un tick adattivo sotto 16
+  bloccava per sempre i board con testo). _forceProxyBuild per il preload
+  dell'harness (ignora pausa pan/zoom e boost).
+- ⚠ SPIGOLO NOTO da misurare in collab: un'edit remota su un board COPERTO
+  lo scopre → il present ricarica TUTTI i suoi chunk visibili in un frame
+  (upload non budgetizzato, ~48MB su un 2048² pieno). Con edit continue
+  (utente remoto che disegna lì) si può oscillare copri/scopri. Se morde:
+  transizione via warm a budget dietro il quad stantio, o isteresi sul
+  ricoprire.
+- **TIER DI DISPOSITIVO GENERALIZZATO (04/07 notte, js/device_tier.js)**:
+  niente branch rigidi per OS nell'harness — deviceCaps() classifica
+  high/mid/low da memoria (comanda), core (correggono), pointer coarse
+  (high mobile → mid: LMK/jetsam è un vincolo fisico, vale per qualunque
+  marca), DPR e refresh REALE misurato con rAF a inizio Auto (mediana dei
+  delta — nel report: 16.7ms = 1 frame a 60Hz ma 2 a 120). Taglie ancorate
+  ai profili validati: high=16c/1.25GiB, mid=10c/0.64GiB, low=8c/0.38GiB;
+  tetto iOS esplicito (iphone 6c/0.28, ipad 8c/0.38) anche sotto
+  ?stress=ultra (che forza high altrove). Profili v3: tier-high/-mid/-low/
+  -ios-*; nel report anche tier, tierUnclamped e caps{memGB,cores,dpr,
+  mobile,displayHz}. Verificato nel preview: mem 4/6/8GB → low/mid/high,
+  8GB+coarse → mid con unclamped high, pannello → tier-high-16c-1p2g-v3.
+
+## RUNTIME TIER INTEGRATION (FATTA 04/07 notte)
+
+- Le euristiche di PRESTAZIONE di main.js non sono più "è Android" ma
+  perf-lite = tier mid/low da device_tier.js (App.caps/perfTier/perfLite):
+  DPR cap (LITE_DPR_MAX=2 — ora vale anche su iPhone e desktop deboli,
+  prima solo Android; iPhone a dpr 2 invece di 3 = backbuffer -55%, da
+  giudicare a occhio), UI sync a intervalli (UI_SYNC_IDLE/ACTIVE_MS),
+  interaction boost (_markInteraction via onActivity dell'input → pausa
+  build proxy + UI sync fitto per 900ms), classe CSS body.perf-lite
+  (badge "perf <tier>" + niente #cursor custom), report perfLite (era
+  androidLite). La PIATTAFORMA resta solo nei workaround per bug:
+  ANDROID_FORCE_CANVAS2D (kill-switch driver), niente desynchronized su
+  Chrome Android (ink overlay), tetto iOS dell'harness.
+- Override manuale del tier per test/supporto: localStorage
+  'fable-paint.tier' = high|mid|low (deviceCaps lo onora, caps.forced).
+- Verificato nel preview: desktop=high senza lite/badge; forzato mid →
+  classe+badge "perf mid", tratto ok, UI sync schedulato, boost armato
+  dall'attività input reale; 0 errori console; main.js ai 12 tsc noti.
+
 ## PROSSIMI PASSI (in ordine)
 
-1. **RITEST Auto v5 sul campo** (Android ultra 16c in particolare:
-   pan/zoom/idle dopo lo scheduling adattivo; iPhone già ok): target p95
-   stroke ≤ 16.7ms, pan/zoom senza sforamenti da build. HTTPS Cloudflare o
-   proxy LAN 8443; sul telefono aprire UNA volta ?renderer=wgpu (poi
-   persiste). Poi giudizio visivo umano complessivo e via il flag.
+1. **Giro Auto v3 sul campo coi profili tier** (nomi nuovi = baseline
+   nuove): confermare che i numeri del 04/07 sera reggono e che il tier
+   classifica giusto sui tuoi device (guardare tier/tierUnclamped/caps nel
+   report; sul telefono si può forzare con localStorage fable-paint.tier).
+   Giudicare A OCCHIO l'iPhone a dpr 2. Poi giudizio visivo complessivo e
+   via il flag ?renderer=wgpu.
+2. **Collab su board coperti**: misurare lo spigolo scopri/ricopri (vedi
+   sopra) prima di dichiarare il proxy finito.
 2. **Tier memoria/dispositivo** per l'harness: cap del profilo generato su
    iOS/mobile (report targetPixelBytes/estimatedPaintBytes già esposti).
 3. **Pennello texture su GPU** (P1, dopo che il present regge): il gate del

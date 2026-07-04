@@ -47,13 +47,19 @@ import { ProjectHub } from './project_io.js';
 import { installTelemetry, loadRuntimeConfig, track, wireFeedbackLinks } from './telemetry.js';
 import { StressTestPanel } from './stress_test.js';
 import { PerfDebugConsole } from './perf_debug.js';
+import { deviceCaps } from './device_tier.js';
 
 const IS_ANDROID = /\bAndroid\b/i.test(navigator.userAgent || '');
+// kill-switch di debug SOLO Android (piattaforma, non prestazione):
+// forza il renderer 2D quando un driver GPU dà problemi sul campo
 const ANDROID_FORCE_CANVAS2D = false;
-const ANDROID_DPR_MAX = 2;
-const ANDROID_INTERACTION_BOOST_MS = 900;
-const ANDROID_UI_SYNC_IDLE_MS = 120;
-const ANDROID_UI_SYNC_ACTIVE_MS = 64;
+// Modalità risparmio (perf-lite): euristiche di PRESTAZIONE guidate dal
+// tier di device_tier.js (high/mid/low da memoria/core/touch), non più
+// da "è Android" — la piattaforma resta solo nei workaround per bug.
+const LITE_DPR_MAX = 2;
+const INTERACTION_BOOST_MS = 900;
+const UI_SYNC_IDLE_MS = 120;
+const UI_SYNC_ACTIVE_MS = 64;
 const IDLE_SETTLE_FRAMES = 8;
 const FRAME_WAKE_EVENTS = [
   'pointerdown', 'pointermove', 'pointerup', 'pointercancel',
@@ -92,12 +98,16 @@ export class App {
     this.gridEl = document.getElementById('grid');
     this.boardsEl = document.getElementById('boards');
     this.isAndroid = IS_ANDROID;
-    this._androidBoostUntil = 0;
-    this._androidNextUiSync = 0;
-    if (this.isAndroid) {
-      document.body.classList.add('android-perf-mode');
-      document.getElementById('android-badge')?.setAttribute('data-mode',
-        ANDROID_FORCE_CANVAS2D ? '2d' : 'webgl2');
+    // tier di prestazione del runtime: high = piena potenza, mid/low =
+    // perf-lite (DPR tappato, UI sync a intervalli, boost d'interazione)
+    this.caps = deviceCaps();
+    this.perfTier = this.caps.tier;
+    this.perfLite = this.perfTier !== 'high';
+    this._boostUntil = 0;
+    this._nextUiSync = 0;
+    if (this.perfLite) {
+      document.body.classList.add('perf-lite');
+      document.getElementById('android-badge')?.setAttribute('data-mode', this.perfTier);
     }
     this.camera = new Camera();
     this.heap = heap;
@@ -281,7 +291,7 @@ export class App {
       },
       onHover: () => this.ui?.updateCursor(this.input, this.camera),
       onActivity: () => {
-        this._markAndroidInteraction();
+        this._markInteraction();
         this.requestFrame();
       },
     });
@@ -480,9 +490,12 @@ export class App {
     return renderer;
   }
 
-  _markAndroidInteraction() {
-    if (!this.isAndroid) return;
-    this._androidBoostUntil = performance.now() + ANDROID_INTERACTION_BOOST_MS;
+  // Interazione recente sui device perf-lite: finestra di boost in cui il
+  // lavoro di sfondo (build proxy) cede il passo e la UI sincronizza più
+  // spesso (vedi _frame).
+  _markInteraction() {
+    if (!this.perfLite) return;
+    this._boostUntil = performance.now() + INTERACTION_BOOST_MS;
   }
 
   _syncPageVisibility() {
@@ -523,7 +536,7 @@ export class App {
     const r = this.planesEl?.getBoundingClientRect();
     const w = Math.max(1, this.planesEl?.clientWidth || window.innerWidth);
     const h = Math.max(1, this.planesEl?.clientHeight || window.innerHeight);
-    const dpr = Math.min(this.isAndroid ? ANDROID_DPR_MAX : 3, window.devicePixelRatio || 1);
+    const dpr = Math.min(this.perfLite ? LITE_DPR_MAX : 3, window.devicePixelRatio || 1);
     this.camera.resize(w, h, dpr, r?.left || 0, r?.top || 0);
     this.renderer.resize(w, h, dpr);
     this.planes.resize(w, h, dpr);
@@ -2311,7 +2324,7 @@ export class App {
     // cache): quad piatti al posto dei chunk per i board non attivi.
     // Durante un tratto la build resta ferma.
     const tProxy0 = performance.now();
-    const androidBoostActive = this.isAndroid && t0 < this._androidBoostUntil;
+    const interactionBoost = this.perfLite && t0 < this._boostUntil;
     // camera in movimento (pan/zoom/fling): build dei proxy in pausa fino a
     // 150ms dopo l'ultimo spostamento — il gesto ha la precedenza; il
     // warm-up del board attivo continua comunque (blocca il disegno, non
@@ -2327,7 +2340,7 @@ export class App {
       this.renderer.ok
       ? this.proxy.update(/** @type {any} */ (this.renderer), this.boards,
         activeBoardIdForRender, this.camera,
-        forceProxyBuild || (!strokePriority && !androidBoostActive && !cameraBusy), this.planes)
+        forceProxyBuild || (!strokePriority && !interactionBoost && !cameraBusy), this.planes)
       : null;
     const tProxy1 = performance.now();
     // Solo il vettore attivo resta SVG vivo: pannelli/gizmo lo editano puro.
@@ -2447,7 +2460,7 @@ export class App {
     // Canvas nodi Spaces in screen-space: va riagganciato alla camera ogni frame,
     // fuori dal gate Android o i nodi "nuotano" durante il pan (early-out interno via _syncKey).
     this.ui.spaceNodes.sync(this.camera);
-    if (!this.isAndroid || tUi0 >= this._androidNextUiSync) {
+    if (!this.perfLite || tUi0 >= this._nextUiSync) {
       if (!strokePriority || diagnosticsActive) {
         this.ui.layersUI.sync();
         this.ui.svgUI.sync();
@@ -2455,8 +2468,8 @@ export class App {
       }
       this.ui.updateCursor(this.input, this.camera);
       this.ui.updateStabilizationDebug(this.input, this.camera, this.engine);
-      if (this.isAndroid) {
-        this._androidNextUiSync = tUi0 + (androidBoostActive ? ANDROID_UI_SYNC_ACTIVE_MS : ANDROID_UI_SYNC_IDLE_MS);
+      if (this.perfLite) {
+        this._nextUiSync = tUi0 + (interactionBoost ? UI_SYNC_ACTIVE_MS : UI_SYNC_IDLE_MS);
       }
     }
     const tUi1 = performance.now();

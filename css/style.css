@@ -365,7 +365,7 @@ body.vectorizing, body.vectorizing #planes { cursor: wait; }
   -webkit-user-select: none;
 }
 #android-badge::after { content: attr(data-mode); margin-left: 4px; }
-body.android-perf-mode #android-badge { display: block; }
+body.perf-lite #android-badge { display: block; }
 
 /* griglia di puntini zoom-aware (era nello shader: il canvas ora è trasparente) */
 #grid {
@@ -4490,7 +4490,7 @@ textarea {
   box-shadow: 0 0 0 2px var(--accent) !important;
 }
 
-body.android-perf-mode #cursor {
+body.perf-lite #cursor {
   display: none !important;
 }
 
