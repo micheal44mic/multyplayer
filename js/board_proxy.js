@@ -25,9 +25,12 @@ import { SHADER_MODES } from './renderer_gl.js';
 /** @typedef {import('./boards.js').Board} Board */
 /** @typedef {import('./camera.js').Camera} Camera */
 /** @typedef {import('./store.js').Chunk} Chunk */
-/** @typedef {{x: number, y: number, w: number, h: number, tex: WebGLTexture}} ProxyQuad */
-/** loading: boardId -> avanzamento 0..1 del warm-up (per l'etichetta del board) */
-/** @typedef {{quads: ProxyQuad[], skip: Set<number>, loading: Map<number, number>}} ProxyFrame */
+/** tex: WebGLTexture (proxy GL) o GPUTexture (proxy WebGPU) */
+/** @typedef {{x: number, y: number, w: number, h: number, tex: any}} ProxyQuad */
+/** loading: boardId -> avanzamento 0..1 del warm-up (per l'etichetta del board);
+ * serial (solo wgpu): bumpato a ogni build completata — entra nella chiave
+ * della screen-cache, o il proxy ricostruito presenterebbe il frame stantio */
+/** @typedef {{quads: ProxyQuad[], skip: Set<number>, loading: Map<number, number>, serial?: number}} ProxyFrame */
 
 // 1024² da un board 2048² è una riduzione esatta 2:1: a zoom 0.5 il
 // campionamento LINEAR del build è la media 2×2 perfetta. A zoom maggiori il
@@ -35,11 +38,12 @@ import { SHADER_MODES } from './renderer_gl.js';
 // VRAM bassa rispetto alla nitidezza di un contenuto non editato.
 export const PROXY_ZOOM = 0.5;
 export const PROXY_SIZE = 1024;
-const BUILD_BUDGET = 48;   // chunk-layer compositati nel framebuffer per frame
-const WARM_BUDGET = 32;    // upload di rientro (zoom-in) per frame
+// budget condivisi col proxy WebGPU (board_proxy_wgpu.js): stessi ritmi
+export const BUILD_BUDGET = 48;   // chunk-layer compositati nel framebuffer per frame
+export const WARM_BUDGET = 32;    // upload di rientro (zoom-in) per frame
 // un livello testo nel build (raster del documento + upload 1024² + quad)
 // pesa come questo numero di chunk-layer
-const TEXT_COST = 16;
+export const TEXT_COST = 16;
 
 /**
  * Chiave del contenuto di un board: struttura della pila + flag dei layer +
@@ -47,7 +51,7 @@ const TEXT_COST = 16;
  * bumpato da touchText). Se non cambia, il proxy resta valido.
  * @param {Board} b
  */
-function contentKey(b) {
+export function contentKey(b) {
   let k = (b.mgr.epoch + b.w * 3 + b.h * 7) | 0;
   for (const l of b.mgr.layers) {
     k = (Math.imul(k, 31) + (l.visible ? 1 : 0) + (l.clip ? 13 : 0) +
@@ -58,7 +62,7 @@ function contentKey(b) {
 }
 
 /** @param {Board} b */
-function hasSvgLayer(b) {
+export function hasSvgLayer(b) {
   return b.mgr.layers.some((l) => l.kind === 'svg');
 }
 
@@ -193,14 +197,23 @@ export class BoardProxyCache {
         if (visible(b) && visibleCandidate === null) visibleCandidate = c;
         else if (fallbackCandidate === null) fallbackCandidate = c;
       }
+      if (!e.ready || e.key !== key) {
+        // Non nascondere mai un artboard dietro un proxy vuoto: finché la
+        // cache non è corrente, il board resta live e visibile.
+        if (e.covering) {
+          e.covering = false;
+          e.warmDone = 0;
+        }
+        out.loading.set(b.id, 0);
+        continue;
+      }
       if (!e.covering) {
         e.covering = true;
         e.warmDone = 0;
         this._dropChunkTex(renderer, planes, b);
       }
       for (const l of b.mgr.layers) out.skip.add(l.id);
-      if (e.ready) this._pushQuad(out, b, e);
-      if (!e.ready || e.key !== key) out.loading.set(b.id, 0);
+      this._pushQuad(out, b, e);
     }
 
     // board spariti (clearAll): via texture e entry

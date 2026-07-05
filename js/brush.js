@@ -4,7 +4,7 @@
 
 import { clamp } from './util.js';
 
-/** @typedef {'brush'|'eraser'|'blur'|'liquify'|'select'|'move'|'pan'} Tool */
+/** @typedef {'brush'|'eraser'|'blur'|'liquify'|'select'|'move'|'pan'|'pen'} Tool */
 
 /**
  * @typedef {Object} Brush
@@ -156,6 +156,44 @@ export function falloff(dist, r, h) {
 const RADIUS_LOG = Math.log(1.09); // bucket di raggio a passi del 9%
 const TWO_PI = Math.PI * 2;
 
+// Mezzo lato dello stamp procedurale/da shape per i valori GIA' bucketed.
+// Unica fonte della taglia: la usano i generatori E la simulazione di
+// creazione chunk del raster worker (raster_shared.js) — parità garantita.
+/** @param {number} r */
+function procHalf(r) { return Math.ceil(r) + 1; }
+/** @param {number} r @param {number} ro @param {number} a */
+function shapeHalf(r, ro, a) {
+  // mezzo ingombro del riquadro (semilati r, r·ro) ruotato: il quadrato dello
+  // stamp deve contenerlo (a 45° gli angoli escono dal raggio)
+  const ac = Math.abs(Math.cos(a)), as = Math.abs(Math.sin(a));
+  const ex = r * (ac + ro * as);
+  const ey = r * (as + ro * ac);
+  return Math.ceil(Math.max(ex, ey)) + 1;
+}
+
+/**
+ * Bucketing di raggio/durezza/rotondità/angolo + geometria dello stamp.
+ * Fattorizzato da getStamp: chiave cache (senza il tag shape), valori del
+ * bucket e ingombro (half/size) escono da un unico posto.
+ * @param {number} radius @param {number} hardness @param {number} roundness
+ * @param {number} angleRad @param {import('./shape.js').BrushShape|null} [shape]
+ */
+export function stampParams(radius, hardness, roundness, angleRad, shape = null) {
+  const rB = Math.max(0, Math.round(Math.log(Math.max(0.5, radius)) / RADIUS_LOG));
+  const hB = shape ? 0 : Math.round(hardness * 12); // la shape ignora la durezza
+  const roB = Math.round(roundness * 8);
+  // L'angolo conta solo se il dab non è tondo (con una shape conta sempre:
+  // anche a rotondità piena il riquadro non è un disco)
+  const aB = !shape && roB >= 8 ? 0 : (Math.round(((angleRad % TWO_PI) + TWO_PI) % TWO_PI / (TWO_PI / 32)) & 31);
+  const key = (rB << 16) | (hB << 12) | (roB << 8) | aB;
+  const r = Math.exp(rB * RADIUS_LOG);          // raggio del bucket
+  const h = clamp(hB / 12, 0, 1);
+  const ro = clamp(roB / 8, 0.05, 1);
+  const a = aB * (TWO_PI / 32);
+  const half = shape ? shapeHalf(r, ro, a) : procHalf(r);
+  return { key, r, h, ro, a, half, size: half * 2 };
+}
+
 // Identità stabile di una shape importata: entra nella chiave della cache
 // (l'oggetto shape è immutabile, cambiare shape = nuovo oggetto = nuovi stamp).
 /** @type {WeakMap<object, number>} */
@@ -189,13 +227,8 @@ export class StampCache {
    * @param {import('./shape.js').BrushShape|null} [shape] @param {boolean} [shapeInvert]
    */
   getStamp(radius, hardness, roundness, angleRad, shape = null, shapeInvert = false) {
-    const rB = Math.max(0, Math.round(Math.log(Math.max(0.5, radius)) / RADIUS_LOG));
-    const hB = shape ? 0 : Math.round(hardness * 12); // la shape ignora la durezza
-    const roB = Math.round(roundness * 8);
-    // L'angolo conta solo se il dab non è tondo (con una shape conta sempre:
-    // anche a rotondità piena il riquadro non è un disco)
-    const aB = !shape && roB >= 8 ? 0 : (Math.round(((angleRad % TWO_PI) + TWO_PI) % TWO_PI / (TWO_PI / 32)) & 31);
-    let key = (rB << 16) | (hB << 12) | (roB << 8) | aB;
+    const p = stampParams(radius, hardness, roundness, angleRad, shape);
+    let key = p.key;
     if (shape) {
       let tag = shapeTags.get(shape);
       if (tag === undefined) { tag = nextShapeTag++; shapeTags.set(shape, tag); }
@@ -212,12 +245,8 @@ export class StampCache {
       return s;
     }
 
-    const r = Math.exp(rB * RADIUS_LOG);          // raggio del bucket
-    const h = clamp(hB / 12, 0, 1);
-    const ro = clamp(roB / 8, 0.05, 1);
-    const a = aB * (TWO_PI / 32);
-    s = shape ? generateShapeStamp(r, ro, a, shape, shapeInvert, this.heap)
-      : generateStamp(r, h, ro, a, this.heap);
+    s = shape ? generateShapeStamp(p.r, p.ro, p.a, shape, shapeInvert, this.heap)
+      : generateStamp(p.r, p.h, p.ro, p.a, this.heap);
 
     this.map.set(key, s);
     this.bytes += s.size * s.size;
@@ -256,7 +285,7 @@ export class StampCache {
  * @returns {Stamp}
  */
 function generateStamp(r, hardness, roundness, angle, heap) {
-  const half = Math.ceil(r) + 1;
+  const half = procHalf(r);
   const size = half * 2;
   const ptr = heap ? heap.alloc(size * size) : 0;
   const mask = heap ? heap.u8(ptr, size * size) : new Uint8Array(size * size);
@@ -291,12 +320,7 @@ function generateStamp(r, hardness, roundness, angle, heap) {
  * @returns {Stamp}
  */
 function generateShapeStamp(r, roundness, angle, shape, invert, heap) {
-  // mezzo ingombro del riquadro (semilati r, r·ro) ruotato: il quadrato dello
-  // stamp deve contenerlo (a 45° gli angoli escono dal raggio)
-  const ac = Math.abs(Math.cos(angle)), as = Math.abs(Math.sin(angle));
-  const ex = r * (ac + roundness * as);
-  const ey = r * (as + roundness * ac);
-  const half = Math.ceil(Math.max(ex, ey)) + 1;
+  const half = shapeHalf(r, roundness, angle);
   const size = half * 2;
   const ptr = heap ? heap.alloc(size * size) : 0;
   const mask = heap ? heap.u8(ptr, size * size) : new Uint8Array(size * size);

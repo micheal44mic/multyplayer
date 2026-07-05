@@ -45,6 +45,11 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, {
       'Content-Type': MIME[extname(filePath).toLowerCase()] || 'application/octet-stream',
       'Cache-Control': 'no-store',
+      // crossOriginIsolated: senza questi lo SharedArrayBuffer (raster
+      // worker) non esiste e il bridge resta spento. Ogni risorsa deve
+      // essere same-origin o con CORP; i WebSocket (PeerJS) non sono toccati.
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
     });
     res.end(body);
   } catch {

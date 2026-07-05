@@ -12,6 +12,7 @@ import { ChunkStore, chunkKey, translateStore, translateStoreWrapped, forEachChu
 import { brush, StampCache } from './brush.js';
 import { DabQueue, StrokeEngine } from './stroke.js';
 import { Rasterizer, commitChunk } from './raster.js';
+import { RasterBridge } from './raster_bridge.js';
 import { GLRenderer } from './renderer_gl.js';
 import { Canvas2DRenderer } from './renderer_2d.js';
 import { InputManager } from './input.js';
@@ -23,10 +24,12 @@ import { drawTextDocument, freeBlockBitmap, setBlockDebug3d, setTextGpu, touchTe
 import { drawSvgLayerToCanvas, freeSvgPlane, listSvgPaints, svgItemFromFile, svgItemFromText, svgLayerName } from './svg_layer.js';
 import { Planes } from './planes.js';
 import { TransformTool } from './transform_ui.js';
+import { PenTool } from './pen_tool.js';
 import { FxTool } from './fx_ui.js';
 import { LayerStyleTool } from './layer_style_ui.js';
 import { FillUI } from './fill_ui.js';
 import { BoardProxyCache } from './board_proxy.js';
+import { WgpuBoardProxyCache } from './board_proxy_wgpu.js';
 import { TextQuadCache } from './text_quad.js';
 import { SvgQuadCache } from './svg_quad.js';
 import { WasmHeap } from './wasm_core.js';
@@ -34,6 +37,9 @@ import { blitImageDataToStore, imageDataFromFile, imageLayerName } from './image
 import { vectorizeDebug, vectorizeRasterLayer as traceRasterLayer } from './vectorize.js';
 import { normalSourceFromBackdrop, renderLayerStackToCanvas } from './layer_composite.js';
 import { SelectionManager, SelectionOverlay } from './selection.js';
+import { InkOverlay } from './ink_overlay.js';
+import { WgpuStrokeBridge } from './wgpu_stroke.js';
+import { WgpuRenderer } from './renderer_wgpu.js';
 import { aiLayerName, aiResultToImageData, prepareAiFillPayload, requestAiFill } from './ai_fill.js';
 import { Collab } from './collab.js';
 import { BlurBrushSession } from './blur_brush.js';
@@ -42,13 +48,19 @@ import { ProjectHub } from './project_io.js';
 import { installTelemetry, loadRuntimeConfig, track, wireFeedbackLinks } from './telemetry.js';
 import { StressTestPanel } from './stress_test.js';
 import { PerfDebugConsole } from './perf_debug.js';
+import { deviceCaps } from './device_tier.js';
 
 const IS_ANDROID = /\bAndroid\b/i.test(navigator.userAgent || '');
+// kill-switch di debug SOLO Android (piattaforma, non prestazione):
+// forza il renderer 2D quando un driver GPU dà problemi sul campo
 const ANDROID_FORCE_CANVAS2D = false;
-const ANDROID_DPR_MAX = 2;
-const ANDROID_INTERACTION_BOOST_MS = 900;
-const ANDROID_UI_SYNC_IDLE_MS = 120;
-const ANDROID_UI_SYNC_ACTIVE_MS = 64;
+// Modalità risparmio (perf-lite): euristiche di PRESTAZIONE guidate dal
+// tier di device_tier.js (high/mid/low da memoria/core/touch), non più
+// da "è Android" — la piattaforma resta solo nei workaround per bug.
+const LITE_DPR_MAX = 2;
+const INTERACTION_BOOST_MS = 900;
+const UI_SYNC_IDLE_MS = 120;
+const UI_SYNC_ACTIVE_MS = 64;
 const IDLE_SETTLE_FRAMES = 8;
 const FRAME_WAKE_EVENTS = [
   'pointerdown', 'pointermove', 'pointerup', 'pointercancel',
@@ -87,12 +99,16 @@ export class App {
     this.gridEl = document.getElementById('grid');
     this.boardsEl = document.getElementById('boards');
     this.isAndroid = IS_ANDROID;
-    this._androidBoostUntil = 0;
-    this._androidNextUiSync = 0;
-    if (this.isAndroid) {
-      document.body.classList.add('android-perf-mode');
-      document.getElementById('android-badge')?.setAttribute('data-mode',
-        ANDROID_FORCE_CANVAS2D ? '2d' : 'webgl2');
+    // tier di prestazione del runtime: high = piena potenza, mid/low =
+    // perf-lite (DPR tappato, UI sync a intervalli, boost d'interazione)
+    this.caps = deviceCaps();
+    this.perfTier = this.caps.tier;
+    this.perfLite = this.perfTier !== 'high';
+    this._boostUntil = 0;
+    this._nextUiSync = 0;
+    if (this.perfLite) {
+      document.body.classList.add('perf-lite');
+      document.getElementById('android-badge')?.setAttribute('data-mode', this.perfTier);
     }
     this.camera = new Camera();
     this.heap = heap;
@@ -122,6 +138,27 @@ export class App {
     this.engine = new StrokeEngine(this.queue);
     this.raster = new Rasterizer(this.strokeStore, this.stampCache, heap);
 
+    // Raster worker (vedi docs/raster-worker-design.md): i tratti LOCALI
+    // rasterizzano su un Web Worker coi pixel in SharedArrayBuffer; qui
+    // restano lo store specchio e il Rasterizer secondario (heap=null: i
+    // chunk SAB non sono memoria wasm) per endPass e run sincroni. Gate
+    // per-tratto in startStroke; senza COOP/COEP il bridge non è usable e
+    // tutto resta identico a prima. La replay collab usa SEMPRE this.raster.
+    this.rasterBridge = new RasterBridge();
+    this.rasterSab = this.rasterBridge.usable
+      ? new Rasterizer(this.rasterBridge.store, this.stampCache, null) : null;
+    if (this.rasterBridge.usable) this._allStores.add(this.rasterBridge.store);
+    this._strokeStoreMain = this.strokeStore;
+    this.curRaster = this.raster;       // il Rasterizer autorevole del tratto corrente
+    /** @type {'main'|'worker'|'gpu'} */
+    this.rasterMode = 'main';
+    // blocco scratch wasm per il commit dei chunk SAB (vedi _runCommit)
+    this._commitScratch = 0;
+    // budget dello sfumino CPU (ms/frame), adattivo: sforo -> si stringe,
+    // arretrato con frame leggeri -> si riallarga (vedi _pumpBlur)
+    this.blurBudgetMs = 3.5;
+    this._lastFrameMs = 0;
+
     // Presentazione desynchronized: meno latenza penna→schermo, ma su Chrome
     // può far lampeggiare il tratto (frame presentati fuori sincrono).
     // Preferenza persistita; toggle nel pannello (sezione Renderer).
@@ -129,7 +166,7 @@ export class App {
     try { desync = localStorage.getItem('fable-paint.desync') === '1'; } catch { /* storage negato */ }
     this.desync = desync;
 
-    /** @type {GLRenderer | Canvas2DRenderer} */
+    /** @type {GLRenderer | Canvas2DRenderer | WgpuRenderer} */
     const renderer = this._createRenderer(this.canvas, desync);
     this.renderer = renderer;
     renderer.trackStores(() => [...this._allStores]);
@@ -138,8 +175,15 @@ export class App {
 
     this.planes = new Planes(this.planesEl, this.gridEl, this.boardsEl);
     // zoom-out: i board non attivi diventano UN quad con texture piatta
-    // 1024² (build GPU a budget), invece di un draw+texture per chunk
-    this.proxy = new BoardProxyCache();
+    // 1024² (build GPU a budget), invece di un draw+texture per chunk;
+    // la variante segue il bottom renderer (stessa macchina a stati)
+    this.proxy = renderer instanceof WgpuRenderer
+      ? new WgpuBoardProxyCache() : new BoardProxyCache();
+    // pan/zoom: la build dei proxy va in pausa (i tick con upload da
+    // 256KB/chunk rubavano i frame del gesto su mobile); vedi _frame
+    this._lastCamSig = NaN;
+    this._camMovedAt = -1e9;
+    this._forceProxyBuild = false;
     // vettori non in editing: cotti in texture e disegnati DENTRO la pila del
     // renderer (i run raster non si spezzano più sui piani DOM); il piano SVG
     // vivo resta solo per il layer vettoriale attivo.
@@ -180,7 +224,7 @@ export class App {
     // deseleziona a metà — un tratto mezzo mascherato sarebbe incoerente
     /** @type {{mask: Uint8Array, x: number, y: number, w: number, h: number}|null} */
     this._strokeSel = null;
-    /** @type {{chunks: Chunk[], index: number, snap: Snap|null, store: ChunkStore, layerId: number}|null} */
+    /** @type {{chunks: Chunk[], index: number, snap: Snap|null, store: ChunkStore, layerId: number, heap?: WasmHeap|null}|null} */
     this.commitJob = null;        // commit incrementale spalmato sui frame
     this.COMMIT_CHUNKS_PER_FRAME = 24;
     this._imageImporting = false;
@@ -196,11 +240,13 @@ export class App {
       onStrokePoint: (x, y, p, t) => {
         if (this.lassoSession) return this.lassoMove(x, y);
         if (this.transform.dragging) return this.transform.dragMove(x, y);
+        if (this.penTool.canvasDragging) return this.penTool.canvasMove(x, y);
         if (this.fillUI.adjusting) return this.fillUI.tapMove(x, y);
         if (this.blurSession) return this.blurSession.move(x, y, p);
         if (this.liquifySession) return this.liquifySession.move(x, y, p, t);
         if (this.strokeLive) {
           this.engine.move(x, y, p, t);
+          this.ink.strokePoint(x, y, p, t);
           this.collab.strokePoint(x, y, p, t);
         }
       },
@@ -209,6 +255,10 @@ export class App {
         if (this.transform.dragging) {
           this.transform.dragMove(x, y);
           return this.transform.dragEnd();
+        }
+        if (this.penTool.canvasDragging) {
+          this.penTool.canvasMove(x, y);
+          return this.penTool.canvasUp();
         }
         if (this.fillUI.adjusting) return this.fillUI.tapEnd();
         if (this.blurSession) {
@@ -221,6 +271,7 @@ export class App {
         }
         if (!this.strokeLive) return;
         this.engine.end(x, y, p, t);
+        this.ink.strokeEnd();
         if (this.engine.snapMode) this._syncSnapStroke();
         else if (this.engine.endPassNeeded) this._endPass();
         this.pendingCommit = true;
@@ -229,6 +280,7 @@ export class App {
       onStrokeCancel: () => {
         if (this.lassoSession) return this.cancelLasso();
         if (this.transform.dragging) return this.transform.dragCancel();
+        if (this.penTool.canvasDragging) return this.penTool.canvasCancel();
         if (this.fillUI.adjusting) return this.fillUI.tapCancel();
         if (this.blurSession) {
           this.blurSession.cancel();
@@ -246,7 +298,7 @@ export class App {
       },
       onHover: () => this.ui?.updateCursor(this.input, this.camera),
       onActivity: () => {
-        this._markAndroidInteraction();
+        this._markInteraction();
         this.requestFrame();
       },
     });
@@ -255,6 +307,16 @@ export class App {
     // (tinta + formiche), fuori dai piani e trasparente all'input
     this.selection = new SelectionManager();
     this.selectionUI = new SelectionOverlay(this.selection);
+
+    // ink overlay: punta provvisoria raw+predizione sopra i piani (fase 0
+    // del piano WebGPU) — fuori da #planes come la selezione
+    this.ink = new InkOverlay();
+
+    // stroke buffer WebGPU (fase 1): agganciato in fondo a main.js dopo
+    // l'init asincrono; null = si resta su worker/main
+    /** @type {import('./wgpu_stroke.js').WgpuStrokeBridge|null} */
+    this.gpuStroke = null;
+    this._gpuStrokeLogged = false;
 
     // Specchio verticale: i descrittori in coda vengono duplicati riflessi
     // sull'asse a metà del canvas attivo (queue.mirrorX, fotografato al
@@ -285,6 +347,7 @@ export class App {
     this._patternRepeatRenderer = new Canvas2DRenderer(this._patternRepeatScratch);
     this._patternRepeatCamera = new Camera();
 
+    this.penTool = new PenTool(this);
     this.ui = new UI(this);
     // ColorDrop: goccia di colore trascinabile dal rail + "riempi al tocco"
     this.fillUI = new FillUI(this);
@@ -415,18 +478,31 @@ export class App {
   /**
    * @param {HTMLCanvasElement} canvas
    * @param {boolean} desynchronized
-   * @returns {GLRenderer | Canvas2DRenderer}
+   * @returns {GLRenderer | Canvas2DRenderer | WgpuRenderer}
    */
   _createRenderer(canvas, desynchronized) {
+    // fase 2 (flag): present WebGPU — richiede WgpuRenderer.preinit()
+    // già awaitata in fondo a main.js prima di new App. Il prodotto resta su
+    // WebGL2; WebGPU è laboratorio esplicito via ?renderer=wgpu.
+    if (wantsWgpuRenderer() && WgpuRenderer.available) {
+      const wr = new WgpuRenderer(canvas);
+      if (wr.ok) {
+        console.info('[renderer_wgpu] present WebGPU attivo (flag ?renderer=wgpu)');
+        return wr;
+      }
+    }
     if (this.isAndroid && ANDROID_FORCE_CANVAS2D) return new Canvas2DRenderer(canvas);
     let renderer = new GLRenderer(canvas, { desynchronized });
     if (!renderer.ok) renderer = new Canvas2DRenderer(canvas);
     return renderer;
   }
 
-  _markAndroidInteraction() {
-    if (!this.isAndroid) return;
-    this._androidBoostUntil = performance.now() + ANDROID_INTERACTION_BOOST_MS;
+  // Interazione recente sui device perf-lite: finestra di boost in cui il
+  // lavoro di sfondo (build proxy) cede il passo e la UI sincronizza più
+  // spesso (vedi _frame).
+  _markInteraction() {
+    if (!this.perfLite) return;
+    this._boostUntil = performance.now() + INTERACTION_BOOST_MS;
   }
 
   _syncPageVisibility() {
@@ -467,10 +543,11 @@ export class App {
     const r = this.planesEl?.getBoundingClientRect();
     const w = Math.max(1, this.planesEl?.clientWidth || window.innerWidth);
     const h = Math.max(1, this.planesEl?.clientHeight || window.innerHeight);
-    const dpr = Math.min(this.isAndroid ? ANDROID_DPR_MAX : 3, window.devicePixelRatio || 1);
+    const dpr = Math.min(this.perfLite ? LITE_DPR_MAX : 3, window.devicePixelRatio || 1);
     this.camera.resize(w, h, dpr, r?.left || 0, r?.top || 0);
     this.renderer.resize(w, h, dpr);
     this.planes.resize(w, h, dpr);
+    this.ink.resize(w, h, dpr, r?.left || 0, r?.top || 0);
     this.requestFrame();
   }
 
@@ -1470,7 +1547,7 @@ export class App {
     vcam.zoom = cam.zoom;
     vcam.resize(cssW, cssH, dpr, 0, 0);
 
-    const snap = this.raster.snap;
+    const snap = this.curRaster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
     this._patternRepeatRenderer.render(vcam, board.mgr.layers, board.mgr.activeId,
@@ -1550,7 +1627,8 @@ export class App {
     }
     // appena selezionato e ancora in caricamento: il tratto partirebbe
     // alla cieca sotto il quad del proxy
-    if (this.renderer instanceof GLRenderer && this.proxy.isLoading(board.id)) return;
+    if ((this.renderer instanceof GLRenderer || this.renderer instanceof WgpuRenderer) &&
+      this.proxy.isLoading(board.id)) return;
     // un undo/redo collaborativo è in applicazione (asincrono): i suoi tile
     // stanno venendo scambiati, niente tratti sotto
     if (this.collab.applying) return;
@@ -1572,6 +1650,7 @@ export class App {
     }
     // strumento Sposta/Trasforma: il drag sul canvas trasla la sessione
     if (brush.tool === 'move') return this.transform.dragStart(x, y);
+    if (brush.tool === 'pen') return this.penTool.canvasDown(board, x, y);
     const target = board.mgr.paintTarget;
     if (!target) return; // attivo non dipingibile (testo/nascosto): ignora
     if (!this._firstStrokeTracked) {
@@ -1608,9 +1687,47 @@ export class App {
     }
     // zoom camera = scala della velocità: la dinamica legge il gesto fisico
     this.engine.begin(x, y, p, t, brush, undefined, this.camera.zoom, direct);
-    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, target.store);
+    // stroke buffer WebGPU (fase 1): il tratto vivo rasterizza su GPU coi
+    // kernel sigillati bit-exact; i pixel atterrano async nello store
+    // specchio (l'ink overlay copre il volo). Gate per-tratto: niente
+    // aqua/selezione — fallback worker, poi main. La TEXTURE passa: il
+    // Rasterizer del main fa da fonte di tile e maschere cotte (stessi byte).
+    const snap = /** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap);
+    if (this.gpuStroke &&
+      this.gpuStroke.beginStroke(snap, this._strokeClip, this._strokeSel,
+        this.raster.cache, this.raster)) {
+      this.rasterMode = 'gpu';
+      this.strokeStore = this.gpuStroke.store;
+      this.curRaster = this.raster;
+      // lo snap serve sul main (live opacity, endPass, commit)
+      this.raster.beginStroke(snap, this._strokeClip, this._strokeSel, target.store);
+      if (!this._gpuStrokeLogged) {
+        this._gpuStrokeLogged = true;
+        console.info('[wgpu_stroke] stroke buffer WebGPU attivo: il tratto vivo rasterizza su GPU');
+      }
+    } else
+    // raster worker per i tratti locali: pixel su un altro thread, output
+    // bit-exact (stesso Rasterizer JS). Gate: bridge usable, niente aqua
+    // (campiona il layer documento, che vive sul main). Fallback = path
+    // di sempre. La replay collab non passa di qui (usa this.raster).
+    if (this.rasterSab && !snap.aqua &&
+      this.rasterBridge.beginStroke(snap, this._strokeClip, this._strokeSel)) {
+      this.rasterMode = 'worker';
+      this.strokeStore = this.rasterBridge.store;
+      this.curRaster = this.rasterSab;
+      // lo snap serve subito sul main (live opacity, endPass, commit)
+      this.rasterSab.beginStroke(snap, this._strokeClip, this._strokeSel, null);
+    } else {
+      this.rasterMode = 'main';
+      this.strokeStore = this._strokeStoreMain;
+      this.curRaster = this.raster;
+      this.raster.beginStroke(snap, this._strokeClip, this._strokeSel, target.store);
+    }
     this.strokeLive = true;
     this.pendingCommit = false;
+    // punta provvisoria: SOLO i tratti locali passano di qui (la replay
+    // collab usa l'engine direttamente); gomma/aqua le scarta frame()
+    this.ink.strokeBegin(x, y, p, t);
     // collaborazione: pennello fotografato + seed + eventi -> replay remoto
     this.collab.strokeBegin(board, target.id, x, y, p, t, direct);
   }
@@ -1633,10 +1750,56 @@ export class App {
     if (!this.strokeLive && !this.commitJob) return;
     if (this.strokeLive) {
       if (this.engine.snapDirty) this._syncSnapStroke();
-      if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+      this._runQueueSync();
       if (this.pendingCommit) this._beginCommit();
     }
     if (this.commitJob) this._runCommit(Infinity);
+  }
+
+  // Drena la coda in sincrono col motore del tratto corrente. In modalità
+  // worker: invia il resto e aspetta (spin) che il worker abbia finito —
+  // stessa semantica del run(Infinity) di sempre, il lavoro è solo altrove.
+  _runQueueSync() {
+    if (this.rasterMode === 'worker') {
+      if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+      this.rasterBridge.flushSync();
+      return;
+    }
+    if (this.rasterMode === 'gpu' && this.gpuStroke) {
+      // il GPU non si può attendere in sincrono (mapAsync vuole l'event
+      // loop): si ributta il TRATTO INTERO sul CPU — stessi byte, la v2 è
+      // ovunque. Caso raro: pen-down dentro la finestra di commit.
+      this._gpuReplayOnCpu();
+      return;
+    }
+    if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+  }
+
+  // Ributta il tratto GPU corrente sul CPU — stessi byte, la capsule v2 è
+  // ovunque. Due chiamanti: il flush sincrono (pen-down nella finestra di
+  // commit) e la PERDITA DEL DEVICE a metà tratto (i pixel in arena non
+  // atterreranno mai: si riparte dai descrittori, che vivono sul main).
+  _gpuReplayOnCpu() {
+    /** @type {NonNullable<typeof this.gpuStroke>} */ (this.gpuStroke).reset();
+    this._dropStrokeBuffer();
+    this.rasterMode = 'main';
+    this.strokeStore = this._strokeStoreMain;
+    this.curRaster = this.raster;
+    this.queue.clear();
+    this.raster.beginStroke(/** @type {NonNullable<typeof this.engine.snap>} */ (this.engine.snap),
+      this._strokeClip, this._strokeSel, this._strokeSampleStore());
+    this.engine.replay();
+    this.raster.run(this.queue, Infinity);
+  }
+
+  // Fine vita di un tratto worker (commit chiuso/annullo): lo store attivo
+  // torna quello main, la collab e il prossimo tratto ripartono da lì.
+  _restoreMainStroke() {
+    if (this.rasterMode !== 'worker' && this.rasterMode !== 'gpu') return;
+    if (this.rasterMode === 'gpu' && this.gpuStroke) this.gpuStroke.reset();
+    this.rasterMode = 'main';
+    this.strokeStore = this._strokeStoreMain;
+    this.curRaster = this.raster;
   }
 
   cancelStroke() {
@@ -1653,8 +1816,12 @@ export class App {
       return;
     }
     this.engine.cancel();
+    this.ink.strokeEnd();
     this.queue.clear();
+    if (this.rasterMode === 'worker') this.rasterBridge.reset();
+    else if (this.rasterMode === 'gpu' && this.gpuStroke) this.gpuStroke.reset();
     this._dropStrokeBuffer();
+    this._restoreMainStroke();
     this.strokeLive = false;
     this.pendingCommit = false;
     this.collab.strokeCancel();
@@ -1753,7 +1920,21 @@ export class App {
   _syncSnapStroke() {
     if (!this.engine.snapMode || !this.engine.snapDirty) return false;
     this.queue.clear();
-    this._dropStrokeBuffer();
+    if (this.rasterMode === 'worker') {
+      // lo snap butta e ridisegna TUTTO il tratto: l'output del worker non
+      // serve più — reset (gli slot si riciclano a drain finito) e il
+      // ridisegno gira sul path main di sempre
+      this.rasterBridge.reset();
+      this._dropStrokeBuffer();
+      this._restoreMainStroke();
+    } else if (this.rasterMode === 'gpu' && this.gpuStroke) {
+      // idem per il GPU: i readback in volo si scartano (gen bump)
+      this.gpuStroke.reset();
+      this._dropStrokeBuffer();
+      this._restoreMainStroke();
+    } else {
+      this._dropStrokeBuffer();
+    }
     this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
     return this.engine.emitSnap();
   }
@@ -1767,8 +1948,30 @@ export class App {
   _endPass() {
     // il live ancora in coda va rasterizzato PRIMA di svuotare i chunk della
     // punta: il replay fuori dal clip viene scartato, e un dab mai disegnato
-    // lascerebbe un buco nel corpo
-    if (this.queue.count > 0) this.raster.run(this.queue, Infinity);
+    // lascerebbe un buco nel corpo. In modalità worker basta l'ORDINE FIFO:
+    // il vivo residuo parte prima dell'endpass, nessuna attesa sul main.
+    const worker = this.rasterMode === 'worker' && this.rasterBridge.usable;
+    const gpu = this.rasterMode === 'gpu' && this.gpuStroke !== null;
+    if (worker) {
+      if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+    } else if (gpu) {
+      if (this.queue.count > 0) /** @type {NonNullable<typeof this.gpuStroke>} */ (this.gpuStroke).sendEntries(this.queue);
+    } else {
+      this._runQueueSync();
+    }
+    if (gpu) {
+      // endpass GPU = replay INTERO da zero (la GPU se lo può permettere:
+      // niente clip per-chunk né pool da scambiare). I pixel vecchi restano
+      // visibili finché il replay non atterra; i chunk che la punta
+      // rastremata scopre si azzerano a fine atterraggio. Il commit tanto
+      // attende gpuStroke.idle.
+      const gs = /** @type {NonNullable<typeof this.gpuStroke>} */ (this.gpuStroke);
+      this.curRaster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
+      gs.endPassBegin();
+      this.engine.replay();
+      if (this.queue.count > 0) gs.sendEntries(this.queue);
+      return;
+    }
     const rect = this.engine.endPassRect();
     /** @type {Set<number>|null} */
     let clip = null;
@@ -1784,18 +1987,32 @@ export class App {
           for (let cx = cx0; cx <= cx1; cx++) {
             const key = chunkKey(cx, cy);
             clip.add(key);
-            this.strokeStore.remove(key, this._disposeTex);
+            // worker: i chunk NON si rimuovono — restano visibili coi pixel
+            // vecchi mentre il worker ridisegna la punta su slot nuovi
+            if (!worker) this.strokeStore.remove(key, this._disposeTex);
           }
         }
       }
-    } else {
+    } else if (!worker) {
       this._dropStrokeBuffer();
     }
-    this.raster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
-    this.raster.clip = clip;
+    this.curRaster.beginStroke(this.engine.snap, this._strokeClip, this._strokeSel, this._strokeSampleStore());
+    if (worker) {
+      // endpass ASINCRONO sul worker (kernel wasm, core suo): il main non
+      // aspetta — sui device veloci lo spin di cortesia mette la punta nello
+      // stesso frame, su quelli lenti appare appena il worker finisce (il
+      // commit tanto attende bridge.idle). beginStroke qui sopra serve solo
+      // allo snap del commit; il worker tiene il suo stato (stessi byte).
+      this.rasterBridge.endPassBegin(clip);
+      this.engine.replay();
+      if (this.queue.count > 0) this.rasterBridge.sendEntries(this.queue);
+      this.rasterBridge.finishEndPass(50);
+      return;
+    }
+    this.curRaster.clip = clip;
     this.engine.replay();
-    this.raster.run(this.queue, Infinity);
-    this.raster.clip = null;
+    this.curRaster.run(this.queue, Infinity);
+    this.curRaster.clip = null;
   }
 
   /** @param {{x0:number,y0:number,x1:number,y1:number}} rect */
@@ -1834,11 +2051,19 @@ export class App {
   // resta corretto chunk per chunk (mai doppia applicazione).
   _beginCommit() {
     this.pendingCommit = false;
+    if (this.rasterMode === 'worker') {
+      // il worker deve aver scritto TUTTO prima di leggere i chunk (il gate
+      // nel frame arriva già idle: qui il flush è quasi sempre un no-op);
+      // touched arriva dai flag SAB scritti dal worker
+      this.rasterBridge.flushSync();
+      this.rasterBridge.syncTouched();
+    }
     const layer = this.boards.layerById(this._strokeLayerId);
     if (!layer || !layer.store) {
       // il livello è stato eliminato durante il tratto: il tratto muore
       this.queue.clear();
       this._dropStrokeBuffer();
+      this._restoreMainStroke();
       this.strokeLive = false;
       return;
     }
@@ -1852,11 +2077,19 @@ export class App {
     }
     if (touched.length === 0) {
       this._dropStrokeBuffer();
+      this._restoreMainStroke();
       this.strokeLive = false;
       return;
     }
     this.undoMgr.captureBegin(layer.id);
-    this.commitJob = { chunks: touched, index: 0, snap: this.raster.snap, store: layer.store, layerId: layer.id };
+    // heap: i chunk SAB/GPU non sono memoria wasm (ptr=0) — heap null qui e
+    // _runCommit li copia nello scratch wasm (bit-exact per contratto,
+    // spalmato sui frame come sempre)
+    this.commitJob = {
+      chunks: touched, index: 0, snap: this.curRaster.snap,
+      store: layer.store, layerId: layer.id,
+      heap: this.rasterMode === 'worker' || this.rasterMode === 'gpu' ? null : this.heap,
+    };
   }
 
   /** @param {number} maxChunks */
@@ -1866,9 +2099,21 @@ export class App {
     let n = 0;
     while (job.index < job.chunks.length && n < maxChunks) {
       const sc = job.chunks[job.index++];
-      commitChunk(job.store, sc, job.snap,
+      let src = sc;
+      let heap = job.heap !== undefined ? job.heap : this.heap;
+      if (heap === null && this.heap && sc.ptr === 0) {
+        // chunk SAB (tratto worker): i kernel wasm non lo indirizzano, ma
+        // una copia da 256KB nello scratch costa ~nulla e il commit torna
+        // al passo wasm (bit-exact col path JS per contratto) — su mobile
+        // il commit JS era il pezzo grosso del frame (misurato ~95ms/24)
+        if (!this._commitScratch) this._commitScratch = this.heap.alloc(CHUNK * CHUNK * 4);
+        this.heap.u8c(this._commitScratch, CHUNK * CHUNK * 4).set(sc.data);
+        src = /** @type {Chunk} */ ({ key: sc.key, cx: sc.cx, cy: sc.cy, data: sc.data, ptr: this._commitScratch });
+        heap = this.heap;
+      }
+      commitChunk(job.store, src, job.snap,
         (key, cx, cy, before) => this.undoMgr.captureChunk(key, cx, cy, before),
-        this.heap);
+        heap);
       this.strokeStore.remove(sc.key, this._disposeTex);
       n++;
     }
@@ -1876,6 +2121,7 @@ export class App {
       this.commitJob = null;
       this.undoMgr.captureEnd();
       this._dropStrokeBuffer(); // residui (non touched) e dirty set
+      this._restoreMainStroke();
       this.strokeLive = false;
       const done = this.boards.layerById(job.layerId);
       if (done) done.thumbDirty = true;
@@ -1886,6 +2132,7 @@ export class App {
   async undo() {
     // trasformazione/effetto pendente: prima ✓ o ✗ (i bottoni sono lì apposta)
     if (this.collab.remoteTransformActive || this.strokeLive || this.commitJob || this.transform.pending || this.transform.dragging || this.fx.pending || this.layerStyle.pending || this.fillUI.pending) return;
+    if (this.penTool.dropPending()) return;
     await this.undoMgr.undo(this._undoHost());
     // l'undo può aver cambiato i pixel sotto la sessione: si rifotografa
     this.transform.rebind();
@@ -1973,6 +2220,7 @@ export class App {
     if (!this._mirrorEl.hidden) this._mirrorEl.hidden = true;
     if (!this._patternEl.hidden) this._patternEl.hidden = true;
     if (!this._patternRepeatCanvas.hidden) this._patternRepeatCanvas.hidden = true;
+    this.penTool.hide();
   }
 
   _frameShouldContinue(frameSample, proxyStats, proxies, textBakes, svgBakes) {
@@ -2028,12 +2276,31 @@ export class App {
     const t1 = performance.now();
 
     // 2. (il sampling avviene dentro drain via engine.move)
-    // 3. raster con budget
+    // 3. raster con budget (modalità worker: la coda parte verso il worker
+    // senza budget — ha un core tutto suo — e il tick applica al mirror i
+    // dirty delle entry già scritte, mai upload di pixel in volo)
     let rasterPx = 0;
     if (this.queue.count > 0) {
-      rasterPx = this.raster.run(this.queue, this.budgetPx);
+      if (this.rasterMode === 'worker') this.rasterBridge.sendEntries(this.queue);
+      else if (this.rasterMode === 'gpu' && this.gpuStroke) this.gpuStroke.sendEntries(this.queue);
+      else rasterPx = this.raster.run(this.queue, this.budgetPx);
     }
-    if (this.blurSession) this._pumpBlur(3.5);
+    if (this.rasterSab) this.rasterBridge.tick();
+    if (this.gpuStroke) {
+      this.gpuStroke.tick();
+      if (this.rasterMode === 'gpu' && !this.commitJob) {
+        if (!this.gpuStroke.usable) {
+          // device perso a metà tratto: senza questo il commit aspetterebbe
+          // per sempre un atterraggio che non arriverà mai
+          this._gpuReplayOnCpu();
+        } else if (this.pendingCommit && this.queue.count === 0 && !this.engine.active) {
+          // modalità direct (renderer wgpu legge l'arena): l'UNICO readback
+          // del tratto parte qui; il gate del commit sotto attende idle
+          this.gpuStroke.requestLand();
+        }
+      }
+    }
+    if (this.blurSession) this._pumpBlur(this.blurBudgetMs);
     if (this.liquifySession) this._pumpLiquify(5.5);
     const t2 = performance.now();
     const strokePriority = this._strokePriorityActive();
@@ -2043,7 +2310,9 @@ export class App {
     const tPrep0 = performance.now();
     // commit differito: parte quando il catch-up è finito, poi procede
     // a fette per non produrre un frame da centinaia di ms
-    if (this.pendingCommit && this.queue.count === 0 && !this.engine.active) {
+    if (this.pendingCommit && this.queue.count === 0 && !this.engine.active &&
+      (this.rasterMode !== 'worker' || this.rasterBridge.idle) &&
+      (this.rasterMode !== 'gpu' || !this.gpuStroke || this.gpuStroke.idle)) {
       this._beginCommit();
     }
     if (this.commitJob) this._runCommit(this.COMMIT_CHUNKS_PER_FRAME);
@@ -2060,16 +2329,30 @@ export class App {
     const spacesMode = !!this.ui?.spacesMode;
     const activeBoardIdForRender = spacesMode ? 0 : this.boards.activeId;
     const activeLayerIdForRender = spacesMode ? 0 : this.layerMgr.activeId;
-    const snap = this.raster.snap;
+    const snap = this.curRaster.snap;
     const liveOpacity = this.strokeLive && snap ? snap.globalOpacity : 1;
     const liveEraser = this.strokeLive && snap ? snap.eraser : false;
-    // proxy dei board per lo zoom-out (solo WebGL): quad piatti al posto dei
-    // chunk per i board non attivi. Durante un tratto la build resta ferma.
+    // proxy dei board per lo zoom-out (WebGL e WebGPU, ognuno con la sua
+    // cache): quad piatti al posto dei chunk per i board non attivi.
+    // Durante un tratto la build resta ferma.
     const tProxy0 = performance.now();
-    const androidBoostActive = this.isAndroid && t0 < this._androidBoostUntil;
-    const proxies = this.renderer instanceof GLRenderer && this.renderer.ok
-      ? this.proxy.update(this.renderer, this.boards, activeBoardIdForRender,
-        this.camera, !strokePriority && !androidBoostActive, this.planes)
+    const interactionBoost = this.perfLite && t0 < this._boostUntil;
+    // camera in movimento (pan/zoom/fling): build dei proxy in pausa fino a
+    // 150ms dopo l'ultimo spostamento — il gesto ha la precedenza; il
+    // warm-up del board attivo continua comunque (blocca il disegno, non
+    // il gesto) perché allowBuild gata solo _buildTick
+    const camSig = this.camera.x * 7 + this.camera.y * 13 + this.camera.zoom * 131071;
+    if (camSig !== this._lastCamSig) {
+      this._lastCamSig = camSig;
+      this._camMovedAt = t0;
+    }
+    const forceProxyBuild = !!this._forceProxyBuild;
+    const cameraBusy = !forceProxyBuild && t0 - this._camMovedAt < 150;
+    const proxies = (this.renderer instanceof GLRenderer || this.renderer instanceof WgpuRenderer) &&
+      this.renderer.ok
+      ? this.proxy.update(/** @type {any} */ (this.renderer), this.boards,
+        activeBoardIdForRender, this.camera,
+        forceProxyBuild || (!strokePriority && !interactionBoost && !cameraBusy), this.planes)
       : null;
     const tProxy1 = performance.now();
     // Solo il vettore attivo resta SVG vivo: pannelli/gizmo lo editano puro.
@@ -2116,6 +2399,10 @@ export class App {
       fxFrame = this.fx.frame() || this.layerStyle.frame();
       this._lastFxFrame = fxFrame;
     }
+    // sfumino GPU: il suo stato viaggia nello slot fx (sessioni esclusive:
+    // iniziare il tratto ha già annullato Effetti/Stile) e DEVE passare
+    // anche con strokePriority — è il tratto vivo
+    if (this.blurSession && this.blurSession.gpu) fxFrame = this.blurSession.gpu;
     const tTransform1 = performance.now();
     const tPlanes0 = performance.now();
     this.planes.render({
@@ -2129,6 +2416,9 @@ export class App {
       patternTile: !spacesMode && this.patternMode ? this.boards.active : null,
     });
     const tPlanes1 = performance.now();
+    // punta provvisoria del tratto: dopo il present (copre solo ciò che il
+    // raster non ha ancora messo sullo schermo), anche in corsia prioritaria
+    this.ink.frame(this);
     const tOverlay0 = performance.now();
     if (strokePriority || spacesMode) {
       this._hideDeferredStrokeOverlays();
@@ -2136,6 +2426,7 @@ export class App {
       // gabbia della distorsione testo: segue camera e modifiche (uscita a
       // confronto di stringa quando non c'è niente da fare)
       this.ui.textUI.gizmo.sync(this.camera);
+      this.penTool.sync(this.camera);
       // overlay della selezione: ricostruisce al cambio di maschera,
       // riposiziona al cambio camera (no-op altrimenti)
       this._syncLassoPreview();
@@ -2182,7 +2473,7 @@ export class App {
     // Canvas nodi Spaces in screen-space: va riagganciato alla camera ogni frame,
     // fuori dal gate Android o i nodi "nuotano" durante il pan (early-out interno via _syncKey).
     this.ui.spaceNodes.sync(this.camera);
-    if (!this.isAndroid || tUi0 >= this._androidNextUiSync) {
+    if (!this.perfLite || tUi0 >= this._nextUiSync) {
       if (!strokePriority || diagnosticsActive) {
         this.ui.layersUI.sync();
         this.ui.svgUI.sync();
@@ -2190,8 +2481,8 @@ export class App {
       }
       this.ui.updateCursor(this.input, this.camera);
       this.ui.updateStabilizationDebug(this.input, this.camera, this.engine);
-      if (this.isAndroid) {
-        this._androidNextUiSync = tUi0 + (androidBoostActive ? ANDROID_UI_SYNC_ACTIVE_MS : ANDROID_UI_SYNC_IDLE_MS);
+      if (this.perfLite) {
+        this._nextUiSync = tUi0 + (interactionBoost ? UI_SYNC_ACTIVE_MS : UI_SYNC_IDLE_MS);
       }
     }
     const tUi1 = performance.now();
@@ -2231,6 +2522,19 @@ export class App {
       proxyStats,
       queueCount: this.queue.count,
       commitChunksLeft: this.commitJob ? this.commitJob.chunks.length - this.commitJob.index : 0,
+      // raster worker: arretrato (entry inviate e non ancora rasterizzate) e
+      // ms spesi in attesa dei flush in questo frame — i numeri che dicono
+      // se il worker singolo tiene il passo (vedi pannello perf, riga Worker)
+      workerRaster: this.rasterMode === 'worker',
+      workerBacklog: this.rasterSab ? this.rasterBridge.backlog : 0,
+      workerFlushMs: this.rasterSab ? this.rasterBridge.takeFlushMs() : 0,
+      // ponte GPU (wgpu_stroke): arretrato, ms dell'ultimo atterraggio e MB
+      // riletti nel tratto — la riga 'GPU tratto' del pannello perf
+      gpuRaster: this.rasterMode === 'gpu',
+      gpuBacklog: this.gpuStroke ? this.gpuStroke.backlog : 0,
+      gpuLandMs: this.gpuStroke ? this.gpuStroke.statLandMs : 0,
+      gpuReadBytes: this.gpuStroke ? this.gpuStroke.statBytes : 0,
+      gpuBatches: this.gpuStroke ? this.gpuStroke.statBatches : 0,
     };
     this.stressTest.sampleFrame(frameSample);
     if (this.perfDebug.active) {
@@ -2239,6 +2543,7 @@ export class App {
       frameSample.proxies = null;
     }
     this._lastFrameWall = tEnd;
+    this._lastFrameMs = tEnd - t0;
     this._completeFrame(this._frameShouldContinue(frameSample, proxyStats, proxies, textBakes, svgBakes));
   }
 
@@ -2246,7 +2551,16 @@ export class App {
   _pumpBlur(maxMs) {
     const s = this.blurSession;
     if (!s) return;
-    if (s.process(maxMs)) {
+    const t0 = performance.now();
+    const done = s.process(maxMs);
+    const ms = performance.now() - t0;
+    // adattivo col pattern del raster: sforo grosso -> stringi; arretrato
+    // con frame leggeri -> allarga fino al tetto
+    if (ms > 7) this.blurBudgetMs = Math.max(2, this.blurBudgetMs * 0.85);
+    else if (!done && s.dabs.length > s.dabRead && this._lastFrameMs < 11) {
+      this.blurBudgetMs = Math.min(8, this.blurBudgetMs * 1.15);
+    }
+    if (done) {
       this.blurSession = null;
       this.strokeLive = false;
     }
@@ -2269,11 +2583,56 @@ export class App {
 await loadRuntimeConfig();
 installTelemetry();
 wireFeedbackLinks();
-const forceJs = new URLSearchParams(location.search).get('engine') === 'js';
+const launchParams = new URLSearchParams(location.search);
+const forceJs = launchParams.get('engine') === 'js';
 const heap = forceJs ? null : await WasmHeap.load(new URL('./raster_core.wasm', import.meta.url));
+// present WebGPU (fase 2, flag): il device va inizializzato PRIMA del
+// costruttore dell'App perché la scelta del renderer è sincrona
+const WGPU_RENDERER_FLAGS = new Set(['wgpu', 'webgpu']);
+const WGPU_STROKE_ON_FLAGS = new Set(['on', '1', 'true', 'wgpu', 'webgpu']);
+const WGPU_STROKE_OFF_FLAGS = new Set(['off', '0', 'false', 'worker', 'cpu']);
+function clearStickyWgpuRenderer() {
+  try { localStorage.removeItem('fable-paint.renderer'); } catch { /* storage negato */ }
+}
+function wantsWgpuRenderer() {
+  // WebGPU non è più sticky: un vecchio localStorage non deve ribaltare il
+  // default prodotto. Solo il flag esplicito riaccende il present WebGPU.
+  const q = (launchParams.get('renderer') || '').toLowerCase();
+  if (!WGPU_RENDERER_FLAGS.has(q)) clearStickyWgpuRenderer();
+  return WGPU_RENDERER_FLAGS.has(q);
+}
+function wantsWgpuStrokeBridge() {
+  // Default prodotto: WebGL2 + raster worker. Il ponte stroke WebGPU resta
+  // testabile con ?gpu=on; sotto ?renderer=wgpu resta acceso per il lab direct.
+  const q = (launchParams.get('gpu') || '').toLowerCase();
+  if (WGPU_STROKE_ON_FLAGS.has(q)) return true;
+  if (WGPU_STROKE_OFF_FLAGS.has(q)) return false;
+  return wantsWgpuRenderer();
+}
+if (wantsWgpuRenderer()) {
+  await WgpuRenderer.preinit();
+}
 const app = new App(heap);
+// stroke buffer WebGPU (fase 1): feature-detect a runtime, aggancio quando
+// pronto (i tratti partiti prima restano su worker/main); default off,
+// ?gpu=on lo accende anche col renderer WebGL, ?renderer=wgpu lo accende nel lab
+if (wantsWgpuStrokeBridge()) {
+  WgpuStrokeBridge.create(() => app.requestFrame()).then((bridge) => {
+    app.gpuStroke = bridge;
+    // fase 2.2: col present WebGPU attivo il renderer legge il tratto vivo
+    // dall'arena del ponte (stesso device, un solo requestDevice per l'app):
+    // il readback CPU resta SOLO al commit (requestLand)
+    if (bridge && app.renderer instanceof WgpuRenderer && app.renderer.ok) {
+      bridge.direct = true;
+      app.renderer.attachStrokeBridge(bridge);
+      console.info('[wgpu_stroke] modalità direct: il present legge l\'arena, readback solo al commit');
+    }
+  });
+}
 const projects = new ProjectHub(app);
 app.projects = projects;
+// TEMPORANEO (verifica fase 2.2): handle per le firme dei chunk nel preview
+/** @type {any} */ (window).__app = app;
 track('app_ready', { engine: heap ? 'wasm' : 'js' });
 // Diagnostica del testo 3D/ombra dalla console: __textDebug3d() fa toggle,
 // __textDebug3d(true|false) imposta. Costosa: accenderla solo per indagare.

@@ -235,7 +235,7 @@ export class Planes {
    * @param {ChunkStore} o.strokeStore
    * @param {number} o.liveOpacity
    * @param {boolean} o.eraserLive
-   * @param {GLRenderer|Canvas2DRenderer} o.bottom
+   * @param {GLRenderer|Canvas2DRenderer|import('./renderer_wgpu.js').WgpuRenderer} o.bottom
    * @param {HTMLCanvasElement} o.bottomCanvas
    * @param {import('./board_proxy.js').ProxyFrame|null} [o.proxies] board coperti dal quad piatto (zoom-out)
    * @param {TransformFrameSet} [o.transform] sessione Sposta/Trasforma

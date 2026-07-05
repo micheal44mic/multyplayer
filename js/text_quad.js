@@ -81,7 +81,7 @@ export class TextQuadCache {
   // board coperti da un quad proxy (il proxy cuoce anche i loro testi).
   // Ritorna il numero di bake fatti (per invalidare i piani 2D del pool).
   /**
-   * @param {import('./renderer_gl.js').GLRenderer | import('./renderer_2d.js').Canvas2DRenderer} renderer
+   * @param {import('./renderer_gl.js').GLRenderer | import('./renderer_2d.js').Canvas2DRenderer | import('./renderer_wgpu.js').WgpuRenderer} renderer
    * @param {BoardManager} boards
    * @param {Camera} camera
    * @param {number} liveTextId testo in editing (SVG vivo): mai cotto qui; -1 = tutti i testi sono SVG
@@ -228,6 +228,11 @@ export class TextQuadCache {
       const gone = !boards.layerById(id);
       if (!gone && this._frame - e.lastUse <= EVICT_FRAMES) continue;
       if (e.tex && this._gl && e.texGen === this._gen) this._gl.deleteTexture(e.tex);
+      // renderer WebGPU: la texture (GPUTexture nel campo condiviso) si
+      // libera esplicitamente — il GC non è deterministico sulla VRAM
+      else if (e.tex && typeof (/** @type {any} */ (e.tex)).destroy === 'function') {
+        /** @type {any} */ (e.tex).destroy();
+      }
       this._map.delete(id);
       removed = true;
     }

@@ -20,6 +20,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
  * @property {[string, string][]} [rootAttrs] attributi sanitizzati della root SVG originale
  * @property {number} [paintGroupVersion]
  * @property {number} [paintGroupNextId]
+ * @property {import('./pen_tool.js').PenData} [pen] tracciato Penna: geometria strutturata (lo stile resta negli attributi del path in content)
  */
 
 /**

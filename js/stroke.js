@@ -70,7 +70,7 @@ import { buildTextureLut, buildTextureColorLut } from './texture.js';
 
 export const T_DAB = 0;
 export const T_SEG = 1;
-const STRIDE = 10;
+export const STRIDE = 10;
 const TWO_PI_STROKE = Math.PI * 2;
 
 // Sotto questa frazione di spacing, in modalità wash, l'unione dei dab tondi
@@ -94,16 +94,19 @@ const MIN_BUILDUP_SPACING = 0.03;
 // registrata; al pen-up il chiamante svuota i SOLI chunk coperti dalla punta
 // (endPassRect) e replay(), clippato lì dal rasterizer, ridisegna il cono
 // finale: costo ∝ area della punta, non del tratto intero.
-// Tetti: ogni punta al massimo TIP_MAX_FRAC del tratto, le due insieme
-// TIP_SUM_FRAC. Se i tetti accorciano la punta d'inizio rispetto a quella
-// disegnata live (tratto corto), il replay rifà il tratto intero: costo
-// comunque piccolo, il tratto è corto.
+// Tetti: la punta di FINE al massimo TIP_MAX_FRAC del tratto. La punta
+// d'INIZIO è AUTORITATIVA: una volta stampata live non si tocca più. Il cono
+// di fine MOLTIPLICA il profilo live: quando i due coni si sovrappongono
+// (tratto corto) non altera l'attacco, lo pizzica soltanto verso zero negli
+// ultimi lb px — una frustata corta chiude comunque a punta (goccia). Il
+// replay non rifà mai l'attacco: al pen-up cambia solo la regione della
+// punta finale (il corpo ri-emesso è identico al live, dab per dab).
 const SENS_MS = 250;   // ms: lunghezza punta = velocità × SENS_MS
 const SW_MS = 70;      // ms: finestra di misura della velocità agli estremi
 const SW_PTS = 10;     // ...o al massimo 10 punti filtrati
 const SW_FILTER = 1.5; // px CSS: distanza minima tra punti per la misura
-const TIP_MAX_FRAC = 0.65; // ogni punta: al massimo 65% della lunghezza del tratto
-const TIP_SUM_FRAC = 0.95; // le due insieme: al massimo 95%
+const TIP_MAX_FRAC = 0.65; // punta di fine: al massimo 65% della lunghezza del tratto
+const TIP_SUM_FRAC = 0.95; // solo linee snappate: le due punte insieme al massimo 95%
 const MIN_R_PX = 0.06; // raggio sotto cui il dab non si stampa: la punta finisce a zero
 const REPLAY_MIN_GAP_PX = 0.5; // passo minimo del ricampionamento delle punte
 // dir: angolo di direzione UNWRAPPATO al momento dell'emissione — il replay
@@ -404,7 +407,6 @@ export class StrokeEngine {
     this._D = 0;                                  // lunghezza della polilinea registrata (px documento)
     this._laX = 0; this._lbX = 0;                 // lunghezze esatte delle punte dopo i tetti
     this._th1 = 0;                                // rapporto al vertice di fine
-    this._full = false;                           // il replay rifà il tratto intero (tetti sull'attacco)
     this.endPassNeeded = false;                   // il chiamante deve fare drop+replay
     this._segStarted = false;                     // via continua: primo nodo emesso
     this._fx = 0; this._fy = 0; this._fr = 0;     // ultimo nodo emesso
@@ -560,7 +562,6 @@ export class StrokeEngine {
     this._lemM = -1;
     this._enValid = false;
     this.endPassNeeded = false;
-    this._full = false;
     this._segStarted = false;
     this._cqN = 0;
     this._straightBegin(x, y, p, t);
@@ -797,8 +798,8 @@ export class StrokeEngine {
     this.active = false;
     this.debug.active = false;
 
-    // serve il pass finale? (il chiamante fa drop dei chunk della punta —
-    // o di tutto il buffer se _full — e poi replay())
+    // serve il pass finale? (il chiamante fa drop dei chunk della punta
+    // finale e poi replay() clippato lì)
     const s = this.snap;
     this.endPassNeeded = false;
     if (this._moved < 1 || this._recN < 2 || this._recN >= REC_MAX) return;
@@ -810,19 +811,25 @@ export class StrokeEngine {
       D += Math.hypot(r[i] - r[i - REC_STRIDE], r[i + 1] - r[i - REC_STRIDE + 1]);
     }
     this._D = D;
-    let la = Math.min(this._la, TIP_MAX_FRAC * D);
-    let lb = Math.min(Math.max(this._tipMin, ve * SENS_MS), TIP_MAX_FRAC * D);
-    if (la + lb > TIP_SUM_FRAC * D) {
-      const k = TIP_SUM_FRAC * D / (la + lb);
-      la *= k; lb *= k;
-    }
+    // La punta d'inizio è AUTORITATIVA: _la/_th0 sono già stampati live e al
+    // pen-up non si toccano più — l'attacco non deve cambiare al rilascio.
+    // La punta di fine prende la sua lunghezza naturale col solo tetto
+    // TIP_MAX_FRAC: il suo cono MOLTIPLICA il profilo live, quindi anche
+    // sovrapposta al cono d'attacco (tratto corto) non lo modifica — pizzica
+    // gli ultimi lb px verso zero e il tratto chiude comunque a punta.
+    const la = s.taperStart < 1 ? this._la : 0;
+    const lb = Math.min(Math.max(this._tipMin, ve * SENS_MS), TIP_MAX_FRAC * D);
     this._laX = la; this._lbX = lb;
     this._th1 = tipRatio(s.taperEnd, ve * s.speedScale);
-    // i tetti hanno accorciato la punta d'inizio già disegnata live? allora
-    // l'attacco è sbagliato e si rifà il tratto intero (succede solo sui
-    // tratti corti: costo piccolo)
-    this._full = s.taperStart < 1 && la < this._la - 0.01;
-    this.endPassNeeded = this._th1 < 1 || this._full;
+    this.endPassNeeded = this._th1 < 1 && lb > 0;
+    // Diagnostica punte (console: __tipDebug = true): geometria decisa al
+    // pen-up — laX DEVE combaciare con la(live), l'attacco non si ricalcola.
+    if (/** @type {any} */ (globalThis).__tipDebug) {
+      console.log('[tip] D=%s la(live)=%s laX=%s lbX=%s th0=%s th1=%s taper=%s/%s ve=%s endPass=%s',
+        D.toFixed(2), this._la.toFixed(2), this._laX.toFixed(2), this._lbX.toFixed(2),
+        this._th0.toFixed(3), this._th1.toFixed(3), s.taperStart, s.taperEnd,
+        ve.toFixed(4), this.endPassNeeded);
+    }
   }
 
   cancel() {
@@ -1163,12 +1170,14 @@ export class StrokeEngine {
   // ---- pass finale ----
 
   // Secondo pass al pen-up (il chiamante ha appena svuotato i chunk della
-  // punta, o tutto il buffer se _full): ri-emette il registro applicando i
-  // coni esatti. Stesso seed del pass live: jitter e scatter identici dove
-  // le punte non toccano. In via discreta la punta viene RICAMPIONATA: i dab
-  // registrati hanno lo spacing del raggio pieno, e riusarli rimpicciolendo
-  // il solo raggio li separa in una collana di cerchi — si cammina invece
-  // lungo la polilinea con passo proporzionale al diametro già rastremato.
+  // punta finale): ri-emette il registro applicando il cono di fine. Stesso
+  // seed del pass live: jitter e scatter identici dove la punta non tocca —
+  // l'attacco e il corpo sono gli stessi identici dab del live, il tratto
+  // non cambia mai a monte del confine della punta. In via discreta la punta
+  // viene RICAMPIONATA: i dab registrati hanno lo spacing del raggio pieno,
+  // e riusarli rimpicciolendo il solo raggio li separa in una collana di
+  // cerchi — si cammina invece lungo la polilinea con passo proporzionale al
+  // diametro già rastremato.
   replay() {
     const s = this.snap, r = this._rec, n = this._recN;
     this.endPassNeeded = false;
@@ -1176,8 +1185,7 @@ export class StrokeEngine {
     this._segStarted = false;
     this._enValid = false; // l'alpha buildup riparte come al pen-down
     const burnGap = s.jSpacing > 0 && !s.continuous;
-    const D = this._D, la = this._laX, lb = this._lbX;
-    const th0 = this._th0, th1 = this._th1;
+    const D = this._D, lb = this._lbX, th1 = this._th1;
 
     if (s.continuous) {
       // catena di capsule: i nodi restano densi a qualunque raggio, bastano
@@ -1186,18 +1194,9 @@ export class StrokeEngine {
       for (let i = 0; i < n; i++) {
         const o = i * REC_STRIDE;
         if (i > 0) cum += Math.hypot(r[o] - r[o - REC_STRIDE], r[o + 1] - r[o - REC_STRIDE + 1]);
-        const m = this._full
-          ? r[o + 3] * tipFactor(cum, la, th0) * tipFactor(D - cum, lb, th1)
-          : r[o + 2] * tipFactor(D - cum, lb, th1);
+        const m = r[o + 2] * tipFactor(D - cum, lb, th1);
         this._emitNow(r[o], r[o + 1], m);
       }
-      return;
-    }
-
-    if (this._full) {
-      // tratto intero ricampionato coi due coni (il registro viene
-      // ridisegnato per intero: lo stream del seed può divergere)
-      this._resample(1, 0, true);
       return;
     }
 
@@ -1220,17 +1219,15 @@ export class StrokeEngine {
       if (burnGap && r[o + 4]) s.rng();
     }
     if (i >= n) return;
-    this._resample(i, cum, false);
+    this._resample(i, cum);
   }
 
   // Ricampiona il registro dal nodo i0 in poi applicando i coni esatti:
   // m base interpolato dai soli moltiplicatori di pressione (mP), passo
   // adattivo ∝ diametro corrente, stessa suddivisione a salto di raggio del
-  // live. cum: distanza all'inizio del nodo i0-1. emitFirst: emette anche il
-  // nodo i0-1 (replay dell'intero tratto; nel pass della sola punta è già
-  // stato emesso dal corpo).
-  /** @param {number} i0 @param {number} cum @param {boolean} emitFirst */
-  _resample(i0, cum, emitFirst) {
+  // live. cum: distanza all'inizio del nodo i0-1 (già emesso dal corpo).
+  /** @param {number} i0 @param {number} cum */
+  _resample(i0, cum) {
     const s = this.snap, r = this._rec, n = this._recN;
     const D = this._D, la = this._laX, lb = this._lbX;
     const th0 = this._th0, th1 = this._th1;
@@ -1257,7 +1254,6 @@ export class StrokeEngine {
       this._emitNow(x, y, m);
       ex = x; ey = y; em = m;
     };
-    if (emitFirst) this._emitNow(ex, ey, em);
     let gapLeft = Math.max(REPLAY_MIN_GAP_PX,
       s.spacing * 2 * Math.max(0.25, s.baseR * em));
     for (let i = i0; i < n; i++) {
@@ -1287,11 +1283,11 @@ export class StrokeEngine {
   // cambiare: i dab della punta finale col loro VECCHIO ingombro — il nuovo
   // è un sottoinsieme, il cono riduce soltanto. Il chiamante svuota i soli
   // chunk intersecati e clippa il replay lì: il corpo del tratto non si
-  // ridisegna mai. null = si rifà il tratto intero (drop di tutto il buffer).
+  // ridisegna mai. null (niente snap/registro, difensivo) = drop di tutto.
   /** @returns {{x0: number, y0: number, x1: number, y1: number}|null} */
   endPassRect() {
     const s = this.snap, r = this._rec, n = this._recN;
-    if (!s || n === 0 || this._full) return null;
+    if (!s || n === 0) return null;
     // ingombro massimo di un'emissione oltre il centro: nuvola scatter
     // (offset + raggio particella), jitter di posizione, bordo morbido dello
     // stamp e arrotondamenti; il riquadro di una shape ruotata arriva a r·√2
